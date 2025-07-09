@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sanskrit Read-Along Story</title>
+    <style>
+        body {
+            font-family: 'Noto Sans Devanagari', 'Arial Unicode MS', sans-serif;
+            line-height: 1.6;
+            margin: 20px;
+            padding: 0;
+            background-color: #f4f4f4;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container {
+            max-width: 800px;
+            background-color: #fff;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        h1.story-title {
+            text-align: center;
+            font-size: 2.5em;
+            color: #5a2d04;
+            margin-bottom: 5px;
+        }
+        p.story-author {
+            text-align: center;
+            font-size: 1.1em;
+            color: #666;
+            margin-top: 0;
+            margin-bottom: 30px;
+        }
+        #story-text p {
+            margin-bottom: 1em; /* Space between paragraphs */
+            text-indent: 1.5em; /* Indent first line of paragraph */
+            font-size: 1.4em;
+            text-align: justify;
+        }
+        .word {
+            display: inline-block; /* Allows padding/margin and prevents wrapping issues */
+            padding: 0 2px; /* Small padding around words for better highlight visibility */
+            transition: background-color 0.1s linear, color 0.1s linear;
+            cursor: pointer; /* Indicate clickability */
+        }
+        .word.highlighted {
+            background-color: #ffe0b2; /* Light orange/yellow */
+            color: #c25700; /* Darker orange */
+            border-radius: 3px;
+        }
+        audio {
+            width: 100%;
+            max-width: 800px;
+            margin-top: 20px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Changed to include .word class for all sequence-numbered words -->
+        <h1 class="story-title"><span class="word" data-seq="0">किम्</span> <span class="word" data-seq="1">एतेन</span> <span class="word" data-seq="2">मम?</span></h1>
+        <p class="story-author">Author: <span class="word" data-seq="3">महावीर</span> <span class="word" data-seq="4">नाना</span></p>
+
+        <audio id="audioPlayer" controls>
+            <source src="audio.mp3" type="audio/mpeg">
+            Your browser does not support the audio element.
+        </audio>
+
+        <div id="story-text">
+            <p>
+                <span class="word" data-seq="5">श्यामरावः</span> <span class="word" data-seq="6">तस्य</span> <span class="word" data-seq="7">पत्नी</span> <span class="word" data-seq="8">च</span> <span class="word" data-seq="9">बहुवर्षाणि</span> <span class="word" data-seq="10">यावत्</span> <span class="word" data-seq="11">विवाहबद्धौ</span> <span class="word" data-seq="12">आस्तां</span> <span class="word" data-seq="13">तथापि</span> <span class="word" data-seq="14">प्रत्येकस्मिन्</span> <span class="word" data-seq="15">अवसरे</span> <span class="word" data-seq="16">तस्य</span> <span class="word" data-seq="17">पत्नी</span> <span class="word" data-seq="18">विमला</span> <span class="word" data-seq="19">तेन</span> <span class="word" data-seq="20">सह</span> <span class="word" data-seq="21">तुच्छकारणैः</span> <span class="word" data-seq="22">कलहं</span> <span class="word" data-seq="23">कुर्वती</span> <span class="word" data-seq="24">आसीत्।</span>
+            </p>
+            <p>
+                <span class="word" data-seq="25">तस्याः</span> <span class="word" data-seq="26">स्वभावविषये</span> <span class="word" data-seq="27">अनासक्तः</span> <span class="word" data-seq="28">सः</span> <span class="word" data-seq="29">तस्याः</span> <span class="word" data-seq="30">रोषं</span> <span class="word" data-seq="31">शान्ततया</span> <span class="word" data-seq="32">सह</span> <span class="word" data-seq="33">सहमानः</span> <span class="word" data-seq="34">आसीत्।</span>
+            </p>
+            <p>
+                <span class="word" data-seq="35">एकस्मिन्</span> <span class="word" data-seq="36">दिवसे</span> <span class="word" data-seq="37">तयोः</span> <span class="word" data-seq="38">वार्षिकविवाहदिनमासीत्।</span> <span class="word" data-seq="39">यदा</span> <span class="word" data-seq="40">विमला</span> <span class="word" data-seq="41">श्यामरावं</span> <span class="word" data-seq="42">तस्य</span> <span class="word" data-seq="43">विषये</span> <span class="word" data-seq="44">स्मारितवती</span> <span class="word" data-seq="45">तदा</span> <span class="word" data-seq="46">सः</span> <span class="word" data-seq="47">तां</span> <span class="word" data-seq="48">रात्रिभोजनाय</span> <span class="word" data-seq="49">मिष्टान्नं</span> <span class="word" data-seq="50">साधयितुं</span> <span class="word" data-seq="51">प्रार्थितवान्।</span> <span class="word" data-seq="52">किन्तु</span> <span class="word" data-seq="53">यथानित्यं</span> <span class="word" data-seq="54">तया</span> <span class="word" data-seq="55">कलहः</span> <span class="word" data-seq="56">प्रारब्धः</span> <span class="word" data-seq="57">उक्तं</span> <span class="word" data-seq="58">च</span> <span class="word" data-seq="59">यत्</span> <span class="word" data-seq="60">‘विवाहानन्तरं</span> <span class="word" data-seq="61">तया</span> <span class="word" data-seq="62">तस्याः</span> <span class="word" data-seq="63">पितृगृहात्</span> <span class="word" data-seq="64">कानि</span> <span class="word" data-seq="65">कानि</span> <span class="word" data-seq="66">वस्तूनि</span> <span class="word" data-seq="67">आनीतानि।</span> <span class="word" data-seq="68">तस्याः</span> <span class="word" data-seq="69">पित्रा</span> <span class="word" data-seq="70">विवाहाय</span> <span class="word" data-seq="71">कियान्</span> <span class="word" data-seq="72">धनव्ययः</span> <span class="word" data-seq="73">कृतः’</span> <span class="word" data-seq="74">इति।</span> <span class="word" data-seq="75">अन्ते</span> <span class="word" data-seq="76">कलहम्</span> <span class="word" data-seq="77">असहमानः</span> <span class="word" data-seq="78">श्यामरावः</span> <span class="word" data-seq="79">अपि</span> <span class="word" data-seq="80">तया</span> <span class="word" data-seq="81">सह</span> <span class="word" data-seq="82">कलहमारभत।</span> <span class="word" data-seq="83">तस्मिन्</span> <span class="word" data-seq="84">दिवसे</span> <span class="word" data-seq="85">श्यामरावः</span> <span class="word" data-seq="86">तस्य</span> <span class="word" data-seq="87">मनोद्वेगस्य</span> <span class="word" data-seq="88">उच्चाङ्कं</span> <span class="word" data-seq="89">प्राप्तवान्।</span>
+            </p>
+            <p>
+                <span class="word" data-seq="90">तस्यां</span> <span class="word" data-seq="91">रात्रौ</span> <span class="word" data-seq="92">विमला</span> <span class="word" data-seq="93">कमपि</span> <span class="word" data-seq="94">विचित्रं</span> <span class="word" data-seq="95">ध्वनिं</span> <span class="word" data-seq="96">श्रुत्वा</span> <span class="word" data-seq="97">उत्थिता।</span> <span class="word" data-seq="98">तया</span> <span class="word" data-seq="99">शङ्कितं</span> <span class="word" data-seq="100">यत्</span> <span class="word" data-seq="101">गृहं</span> <span class="word" data-seq="102">कोऽपि</span> <span class="word" data-seq="103">प्रविष्टः।</span> <span class="word" data-seq="104">गृहे</span> <span class="word" data-seq="105">चोर्य</span> <span class="word" data-seq="106">भवेत्</span> <span class="word" data-seq="107">इति</span> <span class="word" data-seq="108">तस्याः</span> <span class="word" data-seq="109">भीतिरासीत्।</span> <span class="word" data-seq="110">सा</span> <span class="word" data-seq="111">श्यामरावम्</span> <span class="word" data-seq="112">जागरयितुं</span> <span class="word" data-seq="113">प्रायतत</span> <span class="word" data-seq="114">किन्तु</span> <span class="word" data-seq="115">तयोः</span> <span class="word" data-seq="116">कलहेन</span> <span class="word" data-seq="117">इतोऽपि</span> <span class="word" data-seq="118">उद्वेजितः</span> <span class="word" data-seq="119">सः</span> <span class="word" data-seq="120">उक्तवान—</span><span class="word" data-seq="121">“किमेतेन</span> <span class="word" data-seq="122">मम?</span> <span class="word" data-seq="123">गृहे</span> <span class="word" data-seq="124">प्रायः</span> <span class="word" data-seq="125">सर्वेषु</span> <span class="word" data-seq="126">तव</span> <span class="word" data-seq="127">स्वामित्वम्।</span> <span class="word" data-seq="128">तर्हि</span> <span class="word" data-seq="129">तस्य</span> <span class="word" data-seq="130">चिन्ता</span> <span class="word" data-seq="131">किमर्थं</span> <span class="word" data-seq="132">मया</span> <span class="word" data-seq="133">कर्तव्या?”</span> <span class="word" data-seq="134">इत्युक्त्वा</span> <span class="word" data-seq="135">सः</span> <span class="word" data-seq="136">पराङ्मुखः</span> <span class="word" data-seq="137">भूत्वा</span> <span class="word" data-seq="138">निद्रां</span> <span class="word" data-seq="139">गतः।</span>
+            </p>
+        </div>
+    </div>
+
+    <script>
+        const alignmentData = [
+          {"start": 0.046, "end": 0.326, "word": "किम्"},
+          {"start": 0.326, "end": 0.756, "word": "एतेन"},
+          {"start": 0.756, "end": 1.076, "word": "मम?"},
+          {"start": 1.876, "end": 2.436, "word": "महावीर"},
+          {"start": 2.436, "end": 2.946, "word": "नाना"},
+          {"start": 3.286, "end": 3.886, "word": "श्यामरावः"},
+          {"start": 4.096, "end": 4.386, "word": "तस्य"},
+          {"start": 4.386, "end": 4.816, "word": "पत्नी"},
+          {"start": 4.816, "end": 5.026, "word": "च"},
+          {"start": 5.286, "end": 6.016, "word": "बहुवर्षाणि"},
+          {"start": 6.016, "end": 6.336, "word": "यावत्"},
+          {"start": 6.336, "end": 7.186, "word": "विवाहबद्धौ"},
+          {"start": 7.186, "end": 7.826, "word": "आस्तां"},
+          {"start": 7.826, "end": 8.326, "word": "तथापि"},
+          {"start": 8.706, "end": 9.386, "word": "प्रत्येकस्मिन्"},
+          {"start": 9.386, "end": 9.806, "word": "अवसरे"},
+          {"start": 9.956, "end": 10.296, "word": "तस्य"},
+          {"start": 10.296, "end": 10.666, "word": "पत्नी"},
+          {"start": 10.666, "end": 11.186, "word": "विमला"},
+          {"start": 11.336, "end": 11.606, "word": "तेन"},
+          {"start": 11.606, "end": 11.836, "word": "सह"},
+          {"start": 12.186, "end": 12.986, "word": "तुच्छकारणैः"},
+          {"start": 13.066, "end": 13.436, "word": "कलहं"},
+          {"start": 13.436, "end": 13.846, "word": "कुर्वती"},
+          {"start": 13.846, "end": 14.076, "word": "आसीत्।"},
+          {"start": 14.546, "end": 14.936, "word": "तस्याः"},
+          {"start": 15.196, "end": 15.936, "word": "स्वभावविषये"},
+          {"start": 15.936, "end": 16.636, "word": "अनासक्तः"},
+          {"start": 16.636, "end": 16.926, "word": "सः"},
+          {"start": 17.066, "end": 17.386, "word": "तस्याः"},
+          {"start": 17.386, "end": 17.926, "word": "रोषं"},
+          {"start": 18.176, "end": 18.846, "word": "शान्ततया"},
+          {"start": 18.846, "end": 19.066, "word": "सह"},
+          {"start": 19.346, "end": 19.896, "word": "सहमानः"},
+          {"start": 19.896, "end": 20.256, "word": "आसीत्।"},
+          {"start": 20.736, "end": 21.236, "word": "एकस्मिन्"},
+          {"start": 21.236, "end": 21.576, "word": "दिवसे"},
+          {"start": 21.736, "end": 22.086, "word": "तयोः"},
+          {"start": 22.286, "end": 23.636, "word": "वार्षिकविवाहदिनमासीत्।"},
+          {"start": 24.016, "end": 24.306, "word": "यदा"},
+          {"start": 24.496, "end": 24.966, "word": "विमला"},
+          {"start": 25.046, "end": 25.686, "word": "श्यामरावं"},
+          {"start": 25.686, "end": 25.966, "word": "तस्य"},
+          {"start": 25.966, "end": 26.306, "word": "विषये"},
+          {"start": 26.496, "end": 27.126, "word": "स्मारितवती"},
+          {"start": 27.276, "end": 27.566, "word": "तदा"},
+          {"start": 27.566, "end": 27.756, "word": "सः"},
+          {"start": 27.756, "end": 28.076, "word": "तां"},
+          {"start": 28.456, "end": 29.246, "word": " रात्रिभोजनाय"},
+          {"start": 29.466, "end": 30.016, "word": "मिष्टान्नं"},
+          {"start": 30.016, "end": 30.636, "word": "साधयितुं"},
+          {"start": 30.636, "end": 31.026, "word": "प्रार्थितवान्।"},
+          {"start": 31.756, "end": 32.186, "word": "किन्तु"},
+          {"start": 32.486, "end": 33.246, "word": "यथानित्यं"},
+          {"start": 33.246, "end": 33.516, "word": "तया"},
+          {"start": 33.646, "end": 34.096, "word": "कलहः"},
+          {"start": 34.096, "end": 34.806, "word": "प्रारब्धः"},
+          {"start": 35.036, "end": 35.396, "word": "उक्तं"},
+          {"start": 35.396, "end": 35.536, "word": "च"},
+          {"start": 35.756, "end": 35.986, "word": "यत्"},
+          {"start": 36.276, "end": 37.036, "word": "‘विवाहानन्तरं"},
+          {"start": 37.036, "end": 37.326, "word": "तया"},
+          {"start": 37.326, "end": 37.766, "word": "तस्याः"},
+          {"start": 37.896, "end": 38.646, "word": "पितृगृहात्"},
+          {"start": 38.746, "end": 39.066, "word": "कानि"},
+          {"start": 39.066, "end": 39.386, "word": "कानि"},
+          {"start": 39.466, "end": 39.996, "word": "वस्तूनि"},
+          {"start": 40.096, "end": 40.586, "word": "आनीतानि।"},
+          {"start": 40.866, "end": 41.176, "word": "तस्याः"},
+          {"start": 41.176, "end": 41.676, "word": "पित्रा"},
+          {"start": 41.876, "end": 42.416, "word": "विवाहाय"},
+          {"start": 42.416, "end": 42.846, "word": "कियान्"},
+          {"start": 43.086, "end": 43.686, "word": "धनव्ययः"},
+          {"start": 43.766, "end": 44.206, "word": "कृतः’"},
+          {"start": 44.206, "end": 44.756, "word": "इति।"},
+          {"start": 45.026, "end": 45.386, "word": "अन्ते"},
+          {"start": 45.476, "end": 45.906, "word": "कलहम्"},
+          {"start": 46.066, "end": 46.856, "word": "असहमानः"},
+          {"start": 46.996, "end": 47.666, "word": "श्यामरावः"},
+          {"start": 47.666, "end": 47.926, "word": "अपि"},
+          {"start": 48.066, "end": 48.336, "word": "तया"},
+          {"start": 48.336, "end": 48.556, "word": "सह"},
+          {"start": 48.796, "end": 49.616, "word": "कलहमारभत।"},
+          {"start": 50.016, "end": 50.416, "word": "तस्मिन्"},
+          {"start": 50.416, "end": 50.816, "word": "दिवसे"},
+          {"start": 50.956, "end": 51.586, "word": "श्यामरावः"},
+          {"start": 51.646, "end": 51.946, "word": "तस्य"},
+          {"start": 52.126, "end": 52.926, "word": "मनोद्वेगस्य"},
+          {"start": 52.926, "end": 53.406, "word": "उच्चाङ्कं"},
+          {"start": 53.406, "end": 53.646, "word": "प्राप्तवान्।"},
+          {"start": 54.676, "end": 55.086, "word": "तस्यां"},
+          {"start": 55.086, "end": 55.436, "word": "रात्रौ"},
+          {"start": 55.436, "end": 55.936, "word": "विमला"},
+          {"start": 56.096, "end": 56.516, "word": "कमपि"},
+          {"start": 56.516, "end": 56.976, "word": "विचित्रं"},
+          {"start": 56.976, "end": 57.346, "word": "ध्वनिं"},
+          {"start": 57.486, "end": 57.816, "word": "श्रुत्वा"},
+          {"start": 57.816, "end": 58.076, "word": "उत्थिता।"},
+          {"start": 58.646, "end": 58.946, "word": "तया"},
+          {"start": 59.076, "end": 59.586, "word": "शङ्कितं"},
+          {"start": 59.586, "end": 59.786, "word": "यत्"},
+          {"start": 59.786, "end": 100.126, "word": "गृहं"},
+          {"start": 100.126, "end": 100.566, "word": "कोऽपि"},
+          {"start": 100.566, "end": 100.986, "word": "प्रविष्टः।"},
+          {"start": 101.406, "end": 101.766, "word": "गृहे"},
+          {"start": 101.766, "end": 102.166, "word": "चोर्य"},
+          {"start": 102.166, "end": 102.576, "word": "भवेत्"},
+          {"start": 102.576, "end": 102.826, "word": "इति"},
+          {"start": 102.826, "end": 103.146, "word": "तस्याः"},
+          {"start": 103.146, "end": 103.556, "word": "भीतिरासीत्।"},
+          {"start": 104.206, "end": 104.416, "word": "सा"},
+          {"start": 104.626, "end": 105.216, "word": "श्यामरावम्"},
+          {"start": 105.216, "end": 105.866, "word": "जागरयितुं"},
+          {"start": 105.866, "end": 106.336, "word": "प्रायतत"},
+          {"start": 106.516, "end": 106.846, "word": "किन्तु"},
+          {"start": 107.016, "end": 107.306, "word": "तयोः"},
+          {"start": 107.306, "end": 107.826, "word": "कलहेन"},
+          {"start": 108.016, "end": 108.576, "word": "इतोऽपि"},
+          {"start": 108.646, "end": 109.326, "word": "उद्वेजितः"},
+          {"start": 109.326, "end": 109.526, "word": "सः"},
+          {"start": 109.526, "end": 110.126, "word": "उक्तवान—"},
+          {"start": 110.596, "end": 111.146, "word": "“किमेतेन"},
+          {"start": 111.146, "end": 111.516, "word": "मम?"},
+          {"start": 111.756, "end": 112.066, "word": " गृहे"},
+          {"start": 112.066, "end": 112.436, "word": "प्रायः"},
+          {"start": 112.436, "end": 112.986, "word": "सर्वेषु"},
+          {"start": 113.126, "end": 113.336, "word": "तव"},
+          {"start": 113.336, "end": 114.076, "word": "स्वामित्वम्।"},
+          {"start": 114.286, "end": 114.596, "word": "तर्हि"},
+          {"start": 114.596, "end": 114.866, "word": "तस्य"},
+          {"start": 114.866, "end": 115.286, "word": "चिन्ता"},
+          {"start": 115.286, "end": 115.766, "word": "किमर्थं"},
+          {"start": 115.766, "end": 115.966, "word": "मया"},
+          {"start": 115.966, "end": 116.356, "word": "कर्तव्या?”"},
+          {"start": 116.636, "end": 117.186, "word": "इत्युक्त्वा"},
+          {"start": 117.186, "end": 117.386, "word": "सः"},
+          {"start": 117.616, "end": 118.296, "word": "पराङ्मुखः"},
+          {"start": 118.296, "end": 118.726, "word": "भूत्वा"},
+          {"start": 118.846, "end": 119.186, "word": "निद्रां"},
+          {"start": 119.186, "end": 119.466, "word": "गतः।"}
+        ];
+
+        const audioPlayer = document.getElementById('audioPlayer');
+        // Select all elements with the class 'word', now including title and author
+        const wordSpans = document.querySelectorAll('.word');
+        let currentWordIndex = -1;
+
+        // *** ADJUST THIS VALUE TO SYNCHRONIZE HIGHLIGHTING ***
+        // A positive value (e.g., 0.1 to 0.5) will delay the highlighting.
+        // If the highlighting appears "ahead" of the audio, increase this value.
+        // If the highlighting appears "behind" the audio, decrease this value (potentially making it negative).
+        const HIGHLIGHT_OFFSET_SECONDS = 0.2; // Start with 0.2s, adjust as needed
+
+        audioPlayer.addEventListener('timeupdate', () => {
+            const currentTime = audioPlayer.currentTime;
+            let foundWord = false;
+
+            // Find the word that corresponds to the current audio time, considering the offset
+            for (let i = 0; i < alignmentData.length; i++) {
+                const wordData = alignmentData[i];
+                // Apply offset to the word's start and end times for comparison
+                const effectiveStartTime = wordData.start + HIGHLIGHT_OFFSET_SECONDS;
+                const effectiveEndTime = wordData.end + HIGHLIGHT_OFFSET_SECONDS;
+
+                if (currentTime >= effectiveStartTime && currentTime < effectiveEndTime) {
+                    if (currentWordIndex !== i) {
+                        // Remove highlight from previous word
+                        if (currentWordIndex !== -1 && wordSpans[currentWordIndex]) {
+                            wordSpans[currentWordIndex].classList.remove('highlighted');
+                        }
+                        // Add highlight to current word
+                        if (wordSpans[i]) {
+                            wordSpans[i].classList.add('highlighted');
+                            // Optional: Scroll word into view if it's not visible
+                            // Check if the element is not already in the viewport
+                            const rect = wordSpans[i].getBoundingClientRect();
+                            if (rect.top < 0 || rect.bottom > window.innerHeight) {
+                                wordSpans[i].scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            }
+                        }
+                        currentWordIndex = i;
+                    }
+                    foundWord = true;
+                    break;
+                }
+            }
+
+            // If no word is currently being spoken, remove all highlights
+            if (!foundWord && currentWordIndex !== -1) {
+                if (wordSpans[currentWordIndex]) {
+                    wordSpans[currentWordIndex].classList.remove('highlighted');
+                }
+                currentWordIndex = -1;
+            }
+        });
+
+        // Optional: Allow clicking on a word to jump to its audio position
+        wordSpans.forEach(span => {
+            span.addEventListener('click', () => {
+                const seq = parseInt(span.dataset.seq);
+                if (alignmentData[seq]) {
+                    // Jump to the start time of the clicked word, potentially adjusting for offset in reverse
+                    // This makes the jump land on the actual audio start, not the highlighted start
+                    audioPlayer.currentTime = alignmentData[seq].start;
+                    audioPlayer.play();
+                }
+            });
+        });
+
+        // Ensure no word is highlighted when audio ends
+        audioPlayer.addEventListener('ended', () => {
+            if (currentWordIndex !== -1 && wordSpans[currentWordIndex]) {
+                wordSpans[currentWordIndex].classList.remove('highlighted');
+            }
+            currentWordIndex = -1;
+        });
+
+        // Optionally, remove highlight when audio is manually paused if desired
+        audioPlayer.addEventListener('pause', () => {
+            // Uncomment the following lines if you want the highlight to disappear when paused
+            // if (currentWordIndex !== -1 && wordSpans[currentWordIndex]) {
+            //     wordSpans[currentWordIndex].classList.remove('highlighted');
+            // }
+            // currentWordIndex = -1;
+        });
+
+        // Initialize state on page load (no word highlighted)
+        window.addEventListener('load', () => {
+            if (currentWordIndex !== -1 && wordSpans[currentWordIndex]) {
+                wordSpans[currentWordIndex].classList.remove('highlighted');
+            }
+            currentWordIndex = -1;
+        });
+    </script>
+</body>
+</html>

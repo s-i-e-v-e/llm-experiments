@@ -1,0 +1,8 @@
+Create a single html page containing the story, the CSS and any required JS to do a read-along that highlights each word as it is spoken.
+Be smart about it. Use sequence numbers on the word tags to index into the json array to pull out the alignment data instead of storing it as data-attributes on the element.
+
+Format everything so that we get a nice reading experience.
+
+The mp3 file will be placed beside the html file.
+
+The html will be served by the python http module.
