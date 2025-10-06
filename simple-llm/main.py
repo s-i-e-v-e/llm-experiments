@@ -10,8 +10,8 @@ import os
 # The rest of the code works with either one.
 
 # import pure_math as rnn_math
-import numpy_math as rnn_math
-#import wgpu_math as rnn_math
+#import numpy_math as rnn_math
+import wgpu_math as rnn_math
 
 # ==============================================================================
 # DATA PREPARATION & VOCABULARY
