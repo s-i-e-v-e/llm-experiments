@@ -6,14 +6,65 @@ import sys
 import os
 import time
 import numpy as np
+import importlib
 
-# --- CHOOSE YOUR BACKEND ---
-import pure_math as rnn_math
-#import numpy_math as rnn_math
-#import wgpu_math as rnn_math
+# --- CUSTOM TOKENIZER IMPORTS ---
+from bpe_tokenizer import BPETokenizer
 
 # ==============================================================================
-# DATA PREPARATION & VOCABULARY
+# TOKENIZER IMPLEMENTATIONS
+# ==============================================================================
+
+class CharTokenizer:
+    """A simple, pedagogical character-level tokenizer."""
+    def __init__(self):
+        self.char_to_int = {}
+        self.int_to_char = {}
+
+    @property
+    def vocab_size(self):
+        return len(self.char_to_int)
+
+    def train(self, text: str, **kwargs):
+        """Builds the vocabulary from the unique characters in the text."""
+        chars = sorted(list(set(text)))
+        self.char_to_int = {ch: i for i, ch in enumerate(chars)}
+        self.int_to_char = {i: ch for i, ch in enumerate(chars)}
+        print(f"INFO: Character tokenizer created with {self.vocab_size} unique characters.")
+
+    def encode(self, text: str) -> list[int]:
+        """Encodes a string into a list of character indices."""
+        return [self.char_to_int.get(ch, -1) for ch in text if ch in self.char_to_int]
+
+    def decode(self, ids: list[int]) -> str:
+        """Decodes a list of indices back into a string."""
+        return "".join([self.int_to_char.get(i, '') for i in ids])
+
+    def save(self, filepath: str):
+        """Saves the character-to-index map to a JSON file."""
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(self.char_to_int, f)
+        print(f"INFO: Character tokenizer vocabulary saved to '{filepath}'")
+
+    @classmethod
+    def load(cls, filepath: str):
+        """Loads a character tokenizer from a saved vocabulary file."""
+        tokenizer = cls()
+        with open(filepath, 'r', encoding='utf-8') as f:
+            tokenizer.char_to_int = json.load(f)
+        tokenizer.int_to_char = {i: ch for ch, i in tokenizer.char_to_int.items()}
+        print(f"INFO: Character tokenizer loaded from '{filepath}'")
+        return tokenizer
+
+
+# A dictionary to map the CLI choice to the correct tokenizer class
+TOKENIZER_CLASSES = {
+    'char': CharTokenizer,
+    'bpe': BPETokenizer
+}
+
+# ==============================================================================
+# DATA PREPARATION
 # ==============================================================================
 
 def load_corpus(filepath: str) -> str:
@@ -27,205 +78,186 @@ def load_corpus(filepath: str) -> str:
         sys.exit(1)
 
 
-def create_vocabulary(corpus: str) -> tuple[dict, dict]:
-    """Creates character-to-index and index-to-character mappings."""
-    chars = sorted(list(set(corpus)))
-    char_to_int = {ch: i for i, ch in enumerate(chars)}
-    int_to_char = {i: ch for i, ch in enumerate(chars)}
-    print(f"INFO: Created vocabulary with {len(chars)} unique characters.")
-    return char_to_int, int_to_char
-
-
-def save_debug_files(char_to_int: dict, model_config: dict, output_dir: str):
-    """Saves vocabulary and model configuration for inspection and reuse."""
+def save_model_config(model_config: dict, output_dir: str):
+    """Saves model configuration for inspection and reuse."""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-
-    vocab_path = os.path.join(output_dir, "vocab.json")
-    with open(vocab_path, 'w') as f:
-        json.dump(char_to_int, f, indent=2)
-    print(f"INFO: Saved vocabulary mapping to '{vocab_path}'")
-
     config_path = os.path.join(output_dir, "model_config.json")
     with open(config_path, 'w') as f:
         json.dump(model_config, f, indent=2)
     print(f"INFO: Saved model configuration to '{config_path}'")
 
-
 # ==============================================================================
-# TRAINING PROCESS
+# SUB-COMMAND FUNCTIONS
 # ==============================================================================
 
-def train(args):
-    """Main training function."""
+def train_tokenizer_command(args):
+    """Trains a new tokenizer from a text file."""
+    if args.tokenizer == 'char':
+        print("INFO: The 'char' tokenizer does not require a separate training step.", file=sys.stderr)
+        print("It is built automatically during model training if a vocab file is not found.", file=sys.stderr)
+        return
+
     corpus = load_corpus(args.input_file)
-    char_to_int, _ = create_vocabulary(corpus)
-    vocab_size = len(char_to_int)
+    tokenizer = TOKENIZER_CLASSES[args.tokenizer]()
+    
+    print(f"\n--- Training {args.tokenizer.upper()} Tokenizer ---")
+    print(f"Target vocabulary size: {args.vocab_size}")
+    
+    # Pass vocab_size for BPE training
+    tokenizer.train(corpus, vocab_size=args.vocab_size, verbose=True)
+    tokenizer.save(args.tokenizer_path)
 
-    model_config = {
-        "vocab_size": vocab_size,
-        "hidden_size": args.hidden_size,
-        "embedding_dim": args.embedding_dim,
-        "context_length": args.context_length,
-        "learning_rate": args.learning_rate,
-        "epochs": args.epochs,
-    }
-
+def train_command(args, rnn_math):
+    """Main model training function."""
+    corpus = load_corpus(args.input_file)
     output_dir = os.path.dirname(args.model_path)
-    save_debug_files(char_to_int, model_config, output_dir)
+    
+    # --- Dynamically load or train the selected tokenizer ---
+    try:
+        tokenizer = TOKENIZER_CLASSES[args.tokenizer].load(args.tokenizer_path)
+    except FileNotFoundError:
+        print(f"INFO: Tokenizer file not found at '{args.tokenizer_path}'. Training a new one from the corpus.")
+        tokenizer = TOKENIZER_CLASSES[args.tokenizer]()
+        tokenizer.train(corpus, vocab_size=5000) # Default vocab size if not specified
+        if not os.path.exists(output_dir): os.makedirs(output_dir)
+        tokenizer.save(args.tokenizer_path)
+
+    vocab_size = tokenizer.vocab_size
+    model_config = {
+        "vocab_size": vocab_size, "hidden_size": args.hidden_size, "embedding_dim": args.embedding_dim,
+        "context_length": args.context_length, "learning_rate": args.learning_rate, "epochs": args.epochs,
+    }
+    save_model_config(model_config, output_dir)
 
     model = rnn_math.SimpleRNN(vocab_size, args.hidden_size, args.embedding_dim)
-
-    vectorized_corpus = np.array([char_to_int[ch] for ch in corpus], dtype=np.uint32)
-    corpus_gpu = model.device.create_buffer_with_data(
-        data=vectorized_corpus, usage=rnn_math.STORAGE_BUFFER_USAGE
-    )
+    vectorized_corpus = np.array(tokenizer.encode(corpus), dtype=np.uint32)
+    corpus_gpu = model.device.create_buffer_with_data(data=vectorized_corpus, usage=rnn_math.STORAGE_BUFFER_USAGE)
     data_size = len(vectorized_corpus)
 
-    print("\n--- Starting Training ---")
-    print(f"Using math backend: {rnn_math.__name__}")
+    print("\n--- Starting Model Training ---")
+    print(f"Using math backend: {args.backend}_math")
+    print(f"Using tokenizer: {args.tokenizer}")
+    print(f"Corpus tokenized into {data_size} tokens.")
 
     smooth_loss = -math.log(1.0 / vocab_size) * args.context_length
     h_state_gpu = model.get_initial_hidden_state_gpu()
-
-    # Performance monitoring
     last_log_time = time.time()
     steps_since_log = 0
 
     for epoch in range(args.epochs):
-        model.zero_buffer(h_state_gpu)  # Reset hidden state at the start of each epoch
+        model.zero_buffer(h_state_gpu)
         p = 0
         steps_in_epoch = (data_size - 1) // args.context_length
-
         for step in range(steps_in_epoch):
-            if p + args.context_length + 1 >= data_size:
-                break
-
+            if p + args.context_length + 1 >= data_size: break
             target_idx = vectorized_corpus[p + args.context_length]
-
-            # --- Forward, Backward, Update ---
-            # These operations are now sent to the GPU without blocking the CPU
-            logits_gpu, h_history_gpu = model.forward_sequence(
-                corpus_gpu, h_state_gpu, p, args.context_length
-            )
-
-            model.backward_sequence(
-                corpus_gpu, p, args.context_length, target_idx, logits_gpu, h_history_gpu
-            )
+            logits_gpu, h_history_gpu = model.forward_sequence(corpus_gpu, h_state_gpu, p, args.context_length)
+            model.backward_sequence(corpus_gpu, p, args.context_length, target_idx, logits_gpu, h_history_gpu)
             model.update_weights(args.learning_rate)
             model.update_hidden_state(h_source=h_history_gpu, h_dest=h_state_gpu)
-
             p += args.context_length
             steps_since_log += 1
-
-            # Log performance and loss periodically instead of every step
-            # This avoids frequent, slow CPU-GPU synchronization.
             current_time = time.time()
             if current_time - last_log_time >= 1.0:
-                # This is our only sync-point, where we read back the loss from the GPU.
                 loss = model.calculate_loss_gpu(logits_gpu, target_idx)
                 smooth_loss = smooth_loss * 0.999 + loss * 0.001
-
                 elapsed_time = current_time - last_log_time
                 steps_per_second = steps_since_log / elapsed_time
-
-                # Logging progress
-                progress_bar = f"Epoch {epoch + 1}/{args.epochs}, Step {step}/{steps_in_epoch}"
-                loss_info = f"Smooth Loss: {smooth_loss:.4f}"
-                sps_info = f"SPS: {steps_per_second:.2f}"
-                sys.stdout.write(f"\r{progress_bar} | {loss_info} | {sps_info}   ")
+                progress = f"Epoch {epoch+1}/{args.epochs}, Step {step}/{steps_in_epoch}"
+                sys.stdout.write(f"\r{progress} | Smooth Loss: {smooth_loss:.4f} | SPS: {steps_per_second:.2f}   ")
                 sys.stdout.flush()
-
                 last_log_time = current_time
                 steps_since_log = 0
 
     print("\n--- Training Finished ---")
     model.save_model(args.model_path)
 
-
-# ==============================================================================
-# INFERENCE & GENERATION
-# ==============================================================================
-
-def generate(args):
+def generate_command(args, rnn_math):
     """Main generation function."""
-    model_dir = os.path.dirname(args.model_path)
-    vocab_path = os.path.join(model_dir, "vocab.json")
-
     try:
-        with open(vocab_path, 'r') as f:
-            char_to_int = json.load(f)
-        int_to_char = {i: str(ch) for ch, i in char_to_int.items()}
-        # Ensure keys are integers for direct lookup
-        int_to_char = {int(k): v for k, v in int_to_char.items()}
+        tokenizer = TOKENIZER_CLASSES[args.tokenizer].load(args.tokenizer_path)
     except FileNotFoundError:
-        print(f"ERROR: vocab.json not found in '{model_dir}'. Train a model first.", file=sys.stderr)
+        print(f"ERROR: Tokenizer file not found at '{args.tokenizer_path}'.", file=sys.stderr)
         sys.exit(1)
 
     model = rnn_math.SimpleRNN.load_model(args.model_path)
-
-    print(f"--- Generating {args.length} characters from seed: '{args.prompt}' ---")
+    print(f"--- Generating {args.length} tokens from seed: '{args.prompt}' ---")
 
     h_gpu = model.get_initial_hidden_state_gpu()
-    generated_text = args.prompt
+    input_ids = tokenizer.encode(args.prompt)
+    for token_id in input_ids:
+        model.forward_step(token_id, h_gpu)
 
-    # "Warm up" the hidden state with the prompt on the GPU
-    # This loop is now much more efficient as forward_step reuses GPU resources.
-    for char in args.prompt:
-        if char not in char_to_int:
-            print(f"Warning: Character '{char}' not in vocabulary. Skipping.", file=sys.stderr)
-            continue
-        char_idx = char_to_int[char]
-        model.forward_step(char_idx, h_gpu)
-
-    # Use the last character of the prompt to start generation
-    last_char = args.prompt[-1] if args.prompt and args.prompt[-1] in char_to_int else ' '
-    input_idx = char_to_int.get(last_char, 0)
-
+    input_idx = input_ids[-1] if input_ids else 0
+    generated_ids = list(input_ids)
     for _ in range(args.length):
-        # The entire generation step (forward, softmax, sample) happens on the GPU
-        # in a single, efficient command buffer submission.
         next_idx = model.generate_step(input_idx, h_gpu)
-
-        next_char = int_to_char[next_idx]
-        generated_text += next_char
+        generated_ids.append(next_idx)
         input_idx = next_idx
 
+    generated_text = tokenizer.decode(generated_ids)
     print("\n" + generated_text)
-
 
 # ==============================================================================
 # CLI ORCHESTRATION
 # ==============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="A tiny, wgpu-accelerated character-level RNN for text generation.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
+    # Main parser
+    parser = argparse.ArgumentParser(description="A pedagogical, modular RNN for text generation.",
+                                     formatter_class=argparse.RawTextHelpFormatter)
+    
+    # Global arguments applicable to all sub-commands
+    parser.add_argument("--backend", choices=['pure', 'numpy', 'wgpu'], default='numpy',
+                        help="The math backend to use for computation.")
+    parser.add_argument("--tokenizer", choices=['char', 'bpe'], default='char',
+                        help="The type of tokenizer to use.")
+
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Training Sub-command
+    # --- "train-tokenizer" command ---
+    tt_parser = subparsers.add_parser("train-tokenizer", help="Train a BPE tokenizer from a text file.")
+    tt_parser.add_argument("input_file", type=str, help="Path to the training text file.")
+    tt_parser.add_argument("--tokenizer-path", type=str, default="out/tokenizer.json", help="Path to save the trained tokenizer.")
+    tt_parser.add_argument("--vocab-size", type=int, default=1000, help="Target vocabulary size (for BPE).")
+    tt_parser.set_defaults(func=train_tokenizer_command)
+
+    # --- "train" command ---
     train_parser = subparsers.add_parser("train", help="Train a new model on a text file.")
-    train_parser.add_argument("input_file", type=str, help="Path to the training text file (e.g., sherlock.txt).")
+    train_parser.add_argument("input_file", type=str, help="Path to the training text file.")
+    train_parser.add_argument("--tokenizer-path", type=str, default="out/tokenizer.json", help="Path to the tokenizer file.")
     train_parser.add_argument("--model-path", type=str, default="out/model.json", help="Path to save the trained model.")
     train_parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs.")
     train_parser.add_argument("--hidden-size", type=int, default=100, help="Number of neurons in the hidden layer.")
-    train_parser.add_argument("--embedding-dim", type=int, default=30, help="Dimension of character embeddings.")
+    train_parser.add_argument("--embedding-dim", type=int, default=30, help="Dimension of token embeddings.")
     train_parser.add_argument("--context-length", type=int, default=25, help="Length of the sequence for backpropagation.")
     train_parser.add_argument("--learning-rate", type=float, default=0.01, help="Learning rate for the optimizer.")
-    train_parser.set_defaults(func=train)
 
-    # Generation Sub-command
+    # --- "generate" command ---
     gen_parser = subparsers.add_parser("generate", help="Generate text using a trained model.")
     gen_parser.add_argument("prompt", type=str, help="The initial string to start generation.")
+    gen_parser.add_argument("--tokenizer-path", type=str, default="out/tokenizer.json", help="Path to the tokenizer file.")
     gen_parser.add_argument("--model-path", type=str, default="out/model.json", help="Path to the trained model file.")
-    gen_parser.add_argument("--length", type=int, default=500, help="Number of characters to generate.")
-    gen_parser.set_defaults(func=generate)
+    gen_parser.add_argument("--length", type=int, default=100, help="Number of new tokens to generate.")
 
     args = parser.parse_args()
-    args.func(args)
 
+    # --- DYNAMICALLY LOAD THE MATH BACKEND ---
+    try:
+        backend_module_name = f"{args.backend}_math"
+        rnn_math = importlib.import_module(backend_module_name)
+    except ImportError:
+        print(f"ERROR: Could not import the math backend '{backend_module_name}'.", file=sys.stderr)
+        sys.exit(1)
+
+    # --- ROUTE TO THE CORRECT SUB-COMMAND FUNCTION ---
+    if args.command == 'train-tokenizer':
+        args.func(args)
+    elif args.command == 'train':
+        train_command(args, rnn_math)
+    elif args.command == 'generate':
+        generate_command(args, rnn_math)
 
 if __name__ == "__main__":
     main()
