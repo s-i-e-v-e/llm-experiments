@@ -2,3 +2,4 @@
 .venv/
 out/
 __pycache__/
+bpe_tokenizer

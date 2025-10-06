@@ -10,7 +10,7 @@ import time
 import numpy as np
 
 # --- CUSTOM TOKENIZER IMPORTS ---
-from bpe_tokenizer import BPETokenizer
+from bpe_tokenizer_fast import BPETokenizer
 
 # ==============================================================================
 # TOKENIZER IMPLEMENTATIONS
@@ -116,8 +116,9 @@ def train_tokenizer_command(args):
     print(f"Target vocabulary size: {args.vocab_size}")
 
     # Pass vocab_size for BPE training
-    tokenizer.train(corpus, vocab_size=args.vocab_size, verbose=True)
-    tokenizer.save(args.tokenizer_path)
+    tokenizer.train(
+        corpus, vocab_size=args.vocab_size, verbose=True, token_file=args.tokenizer_path
+    )
 
 
 def train_command(args, rnn_math):
@@ -134,10 +135,9 @@ def train_command(args, rnn_math):
                 f"INFO: Tokenizer file not found at '{args.tokenizer_path}'. Training a new 'char' tokenizer from the corpus."
             )
             tokenizer = CharTokenizer()
-            tokenizer.train(corpus)
+            tokenizer.train(corpus, args.tokenizer_path)
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir)
-            tokenizer.save(args.tokenizer_path)
         else:
             print(
                 f"ERROR: Tokenizer file not found at '{args.tokenizer_path}'.",
@@ -185,8 +185,10 @@ def train_command(args, rnn_math):
             )
         print("\n--- Starting New Model Training ---")
         model = rnn_math.SimpleRNN(vocab_size, args.hidden_size, args.embedding_dim)
+    vectorized_corpus = np.array(
+        tokenizer.encode(corpus, token_file=args.tokenizer_path), dtype=np.uint32
+    )
 
-    vectorized_corpus = np.array(tokenizer.encode(corpus), dtype=np.uint32)
     corpus_gpu = model.device.create_buffer_with_data(
         data=vectorized_corpus, usage=rnn_math.STORAGE_BUFFER_USAGE
     )
@@ -259,7 +261,7 @@ def generate_command(args, rnn_math):
     print(f"--- Generating {args.length} tokens from seed: '{args.prompt}' ---")
 
     h_gpu = model.get_initial_hidden_state_gpu()
-    input_ids = tokenizer.encode(args.prompt)
+    input_ids = tokenizer.encode(args.prompt, args.tokenizer_path)
     for token_id in input_ids:
         model.forward_step(token_id, h_gpu)
 
@@ -343,27 +345,27 @@ def main():
         help="Path to save the trained model.",
     )
     train_parser.add_argument(
-        "--epochs", type=int, default=1, help="Number of training epochs."
+        "--epochs", type=int, default=5, help="Number of training epochs."
     )
     train_parser.add_argument(
         "--hidden-size",
         type=int,
-        default=100,
+        default=256,
         help="Number of neurons in the hidden layer.",
     )
     train_parser.add_argument(
-        "--embedding-dim", type=int, default=30, help="Dimension of token embeddings."
+        "--embedding-dim", type=int, default=128, help="Dimension of token embeddings."
     )
     train_parser.add_argument(
         "--context-length",
         type=int,
-        default=25,
+        default=256,
         help="Length of the sequence for backpropagation.",
     )
     train_parser.add_argument(
         "--learning-rate",
         type=float,
-        default=0.01,
+        default=0.001,
         help="Learning rate for the optimizer.",
     )
     # --- THIS IS THE NEW ARGUMENT ---

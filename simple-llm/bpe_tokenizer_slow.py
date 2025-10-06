@@ -51,7 +51,7 @@ class BPETokenizer:
         """Returns the total size of the vocabulary."""
         return len(self.vocab)
 
-    def train(self, text: str, vocab_size: int, verbose: bool = False):
+    def train(self, text: str, vocab_size: int, token_file: str, verbose: bool = False):
         """
         Trains the tokenizer on a given text to achieve a specific vocabulary size.
         """
@@ -91,8 +91,9 @@ class BPETokenizer:
                 print(
                     f"Merge {i + 1}/{num_merges}: Merging ('{p0}', '{p1}') -> '{new_tok_str}' (ID: {new_idx})"
                 )
+        self._save_merges_to_file(token_file)
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str, token_file: str) -> list[int]:
         """
         Encodes a string into a list of token IDs.
         """
@@ -128,7 +129,7 @@ class BPETokenizer:
         text = tokens_bytes.decode("utf-8", errors="replace")
         return text
 
-    def save(self, filepath: str):
+    def _save_merges_to_file(self, filepath: str):
         """Saves the tokenizer's merge rules to a file."""
         # We only need to save the merges. The vocab can be reconstructed from them.
         # We convert tuple keys to strings for JSON compatibility.
