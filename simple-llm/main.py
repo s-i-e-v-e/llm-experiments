@@ -4,11 +4,13 @@ import json
 import math
 import sys
 import os
+import time
 import numpy as np
 
 # --- CHOOSE YOUR BACKEND ---
-# The code is now optimized for the wgpu_math backend.
-import wgpu_math as rnn_math
+import pure_math as rnn_math
+#import numpy_math as rnn_math
+#import wgpu_math as rnn_math
 
 # ==============================================================================
 # DATA PREPARATION & VOCABULARY
@@ -76,7 +78,7 @@ def train(args):
 
     vectorized_corpus = np.array([char_to_int[ch] for ch in corpus], dtype=np.uint32)
     corpus_gpu = model.device.create_buffer_with_data(
-        data=vectorized_corpus, usage=rnn_math.wgpu.BufferUsage.STORAGE
+        data=vectorized_corpus, usage=rnn_math.STORAGE_BUFFER_USAGE
     )
     data_size = len(vectorized_corpus)
 
@@ -85,6 +87,10 @@ def train(args):
 
     smooth_loss = -math.log(1.0 / vocab_size) * args.context_length
     h_state_gpu = model.get_initial_hidden_state_gpu()
+
+    # Performance monitoring
+    last_log_time = time.time()
+    steps_since_log = 0
 
     for epoch in range(args.epochs):
         model.zero_buffer(h_state_gpu)  # Reset hidden state at the start of each epoch
@@ -95,33 +101,43 @@ def train(args):
             if p + args.context_length + 1 >= data_size:
                 break
 
-            # The target is the last character of the output sequence
             target_idx = vectorized_corpus[p + args.context_length]
 
             # --- Forward, Backward, Update ---
-            # All operations happen on the GPU
+            # These operations are now sent to the GPU without blocking the CPU
             logits_gpu, h_history_gpu = model.forward_sequence(
                 corpus_gpu, h_state_gpu, p, args.context_length
             )
-
-            loss = model.calculate_loss_gpu(logits_gpu, target_idx)
-            smooth_loss = smooth_loss * 0.999 + loss * 0.001
 
             model.backward_sequence(
                 corpus_gpu, p, args.context_length, target_idx, logits_gpu, h_history_gpu
             )
             model.update_weights(args.learning_rate)
-
-            # Update the rolling hidden state for the next sequence
             model.update_hidden_state(h_source=h_history_gpu, h_dest=h_state_gpu)
 
-            # Logging progress
-            progress_bar = f"Epoch {epoch + 1}/{args.epochs}, Step {step}/{steps_in_epoch}"
-            loss_info = f"Smooth Loss: {smooth_loss:.4f}"
-            sys.stdout.write(f"\r{progress_bar} | {loss_info}")
-            sys.stdout.flush()
-
             p += args.context_length
+            steps_since_log += 1
+
+            # Log performance and loss periodically instead of every step
+            # This avoids frequent, slow CPU-GPU synchronization.
+            current_time = time.time()
+            if current_time - last_log_time >= 1.0:
+                # This is our only sync-point, where we read back the loss from the GPU.
+                loss = model.calculate_loss_gpu(logits_gpu, target_idx)
+                smooth_loss = smooth_loss * 0.999 + loss * 0.001
+
+                elapsed_time = current_time - last_log_time
+                steps_per_second = steps_since_log / elapsed_time
+
+                # Logging progress
+                progress_bar = f"Epoch {epoch + 1}/{args.epochs}, Step {step}/{steps_in_epoch}"
+                loss_info = f"Smooth Loss: {smooth_loss:.4f}"
+                sps_info = f"SPS: {steps_per_second:.2f}"
+                sys.stdout.write(f"\r{progress_bar} | {loss_info} | {sps_info}   ")
+                sys.stdout.flush()
+
+                last_log_time = current_time
+                steps_since_log = 0
 
     print("\n--- Training Finished ---")
     model.save_model(args.model_path)

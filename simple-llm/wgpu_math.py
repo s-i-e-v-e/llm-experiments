@@ -5,6 +5,8 @@ import json
 import math
 import random
 
+STORAGE_BUFFER_USAGE = wgpu.BufferUsage.STORAGE
+
 # ==============================================================================
 # WGPU INITIALIZATION
 # ==============================================================================
@@ -644,7 +646,8 @@ class SimpleRNN:
     def forward_sequence(self, corpus_gpu, h_prev_gpu, offset, seq_length):
         S, H, E, V = seq_length, self.hidden_size, self.embedding_dim, self.vocab_size
         
-        # FIX: The h_history_gpu buffer is a destination for copies, so it needs COPY_DST.
+        # FIX: The h_history_gpu buffer is a destination for `copy_buffer_to_buffer`, so it needs COPY_DST.
+        # See: https://wgpu-py.readthedocs.io/en/stable/wgpu.flags.html#wgpu.BufferUsage
         h_history_gpu = device.create_buffer(
             size=(S + 1) * H * 4,
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST
@@ -975,8 +978,4 @@ class SimpleRNN:
         
         # === 6. Read Result Directly from GPU Source Buffer ===
         idx_data = device.queue.read_buffer(out_idx_gpu).cast("I")
-        return idx_data[0]
-        
-        # === 7. Read Result Back to CPU ===
-        idx_data = device.queue.read_buffer(staging_buffer).cast("I")
         return idx_data[0]
