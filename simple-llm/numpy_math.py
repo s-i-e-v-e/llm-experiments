@@ -1,23 +1,28 @@
-import numpy as np
 import json
-import random
+
+import numpy as np
 
 # ==============================================================================
 # MATH PRIMITIVES & HELPERS
 # ==============================================================================
 
+
 def tanh(x):
     return np.tanh(x)
 
+
 def dtanh(y):
     return 1.0 - y**2
+
 
 def softmax(logits):
     exps = np.exp(logits - np.max(logits))
     return exps / np.sum(exps)
 
+
 def sample_from_dist(probs):
     return np.random.choice(len(probs), p=probs)
+
 
 # ==============================================================================
 # DUMMY DEVICE & CONSTANT FOR API COMPATIBILITY
@@ -26,15 +31,19 @@ def sample_from_dist(probs):
 # Add a constant for the buffer usage flag, set to None for the CPU backend.
 STORAGE_BUFFER_USAGE = None
 
+
 class DummyDevice:
     """A dummy class to mimic the wgpu device API for compatibility."""
+
     def create_buffer_with_data(self, data, usage):
         # In the numpy version, we just pass the data (numpy array) through.
         return data
 
+
 # ==============================================================================
 # MODEL CLASS
 # ==============================================================================
+
 
 class SimpleRNN:
     def __init__(self, vocab_size, hidden_size, embedding_dim):
@@ -42,10 +51,18 @@ class SimpleRNN:
         self.hidden_size = hidden_size
         self.embedding_dim = embedding_dim
         # Initialize with NumPy arrays
-        self.W_embed = np.random.uniform(-0.01, 0.01, (embedding_dim, vocab_size)).astype(np.float32)
-        self.W_xh = np.random.uniform(-0.01, 0.01, (hidden_size, embedding_dim)).astype(np.float32)
-        self.W_hh = np.random.uniform(-0.01, 0.01, (hidden_size, hidden_size)).astype(np.float32)
-        self.W_hy = np.random.uniform(-0.01, 0.01, (vocab_size, hidden_size)).astype(np.float32)
+        self.W_embed = np.random.uniform(
+            -0.01, 0.01, (embedding_dim, vocab_size)
+        ).astype(np.float32)
+        self.W_xh = np.random.uniform(-0.01, 0.01, (hidden_size, embedding_dim)).astype(
+            np.float32
+        )
+        self.W_hh = np.random.uniform(-0.01, 0.01, (hidden_size, hidden_size)).astype(
+            np.float32
+        )
+        self.W_hy = np.random.uniform(-0.01, 0.01, (vocab_size, hidden_size)).astype(
+            np.float32
+        )
         self.b_h = np.zeros(hidden_size, dtype=np.float32)
         self.b_y = np.zeros(vocab_size, dtype=np.float32)
 
@@ -54,6 +71,19 @@ class SimpleRNN:
         self.cache = {}
         self.grads = {}
 
+        # Create gradient arrays for compatibility with GPU version
+        self.grads_gpu = {
+            "dW_embed": np.zeros_like(self.W_embed),
+            "dW_xh": np.zeros_like(self.W_xh),
+            "dW_hh": np.zeros_like(self.W_hh),
+            "dW_hy": np.zeros_like(self.W_hy),
+            "db_h": np.zeros_like(self.b_h),
+            "db_y": np.zeros_like(self.b_y),
+        }
+
+        # NEW: List of gradient buffers for the GPU reset function
+        self.gradient_buffers = list(self.grads_gpu.values())
+        # --- END GRADIENT BUFFER CREATION ---
 
     def get_initial_hidden_state_gpu(self):
         """Returns a zeroed hidden state vector (API compatibility)."""
@@ -71,84 +101,130 @@ class SimpleRNN:
         log_prob = (logits[target_idx] - max_logit) - log_sum_exp
         return -log_prob
 
+    def calculate_sequence_loss(self, corpus, h_prev, offset, seq_length):
+        """Calculate average cross-entropy loss over entire sequence"""
+        total_loss = 0.0
+        h = np.copy(h_prev)
+
+        for t in range(seq_length):
+            # Current input and target (next token)
+            x_idx = corpus[offset + t]
+            target_idx = corpus[offset + t + 1]
+
+            # Forward step
+            x_embed = self.W_embed[:, x_idx]
+            h = tanh(self.W_xh @ x_embed + self.W_hh @ h + self.b_h)
+            logits = self.W_hy @ h + self.b_y
+
+            # Calculate loss for this step
+            loss = self.calculate_loss_gpu(logits, target_idx)
+            total_loss += loss
+
+        return total_loss / seq_length
+
     def update_hidden_state(self, h_source, h_dest):
         """Copies the last hidden state from a history list to the destination."""
         np.copyto(h_dest, h_source[-1])
 
     def _get_params(self):
         # Convert numpy arrays to lists for JSON serialization
-        return {'W_embed': self.W_embed.tolist(), 'W_xh': self.W_xh.tolist(), 'W_hh': self.W_hh.tolist(),
-                'W_hy': self.W_hy.tolist(), 'b_h': self.b_h.tolist(), 'b_y': self.b_y.tolist()}
+        return {
+            "W_embed": self.W_embed.tolist(),
+            "W_xh": self.W_xh.tolist(),
+            "W_hh": self.W_hh.tolist(),
+            "W_hy": self.W_hy.tolist(),
+            "b_h": self.b_h.tolist(),
+            "b_y": self.b_y.tolist(),
+        }
 
     def _set_params(self, params):
         # Convert lists back to numpy arrays
-        self.W_embed = np.array(params['W_embed'], dtype=np.float32); self.W_xh = np.array(params['W_xh'], dtype=np.float32)
-        self.W_hh = np.array(params['W_hh'], dtype=np.float32); self.W_hy = np.array(params['W_hy'], dtype=np.float32)
-        self.b_h = np.array(params['b_h'], dtype=np.float32); self.b_y = np.array(params['b_y'], dtype=np.float32)
-        
+        self.W_embed = np.array(params["W_embed"], dtype=np.float32)
+        self.W_xh = np.array(params["W_xh"], dtype=np.float32)
+        self.W_hh = np.array(params["W_hh"], dtype=np.float32)
+        self.W_hy = np.array(params["W_hy"], dtype=np.float32)
+        self.b_h = np.array(params["b_h"], dtype=np.float32)
+        self.b_y = np.array(params["b_y"], dtype=np.float32)
+
     def save_model(self, filepath: str):
         model_data = {
-            'config': {'vocab_size': self.vocab_size, 'hidden_size': self.hidden_size, 'embedding_dim': self.embedding_dim},
-            'params': self._get_params()
+            "config": {
+                "vocab_size": self.vocab_size,
+                "hidden_size": self.hidden_size,
+                "embedding_dim": self.embedding_dim,
+            },
+            "params": self._get_params(),
         }
-        with open(filepath, 'w') as f: json.dump(model_data, f)
+        with open(filepath, "w") as f:
+            json.dump(model_data, f)
         print(f"INFO: Model saved to '{filepath}'")
 
     @classmethod
     def load_model(cls, filepath: str):
         print(f"INFO: Loading model from '{filepath}'...")
-        with open(filepath, 'r') as f: model_data = json.load(f)
-        config = model_data['config']
-        model = cls(config['vocab_size'], config['hidden_size'], config['embedding_dim'])
-        model._set_params(model_data['params'])
+        with open(filepath, "r") as f:
+            model_data = json.load(f)
+        config = model_data["config"]
+        model = cls(
+            config["vocab_size"], config["hidden_size"], config["embedding_dim"]
+        )
+        model._set_params(model_data["params"])
         return model
 
     def forward_sequence(self, corpus, h_prev, offset, seq_length):
         """Performs a full forward pass and caches intermediate values."""
         inputs = corpus[offset : offset + seq_length]
-        self.cache = {'h': {-1: h_prev}, 'x_embed': {}}
+        self.cache = {"h": {-1: h_prev}, "x_embed": {}}
         h = np.copy(h_prev)
         for t, x_idx in enumerate(inputs):
             x_embed = self.W_embed[:, x_idx]
-            self.cache['x_embed'][t] = x_embed
+            self.cache["x_embed"][t] = x_embed
             h = tanh(self.W_xh @ x_embed + self.W_hh @ h + self.b_h)
-            self.cache['h'][t] = h
+            self.cache["h"][t] = h
         logits = self.W_hy @ h + self.b_y
-        
-        h_history = [self.cache['h'][t] for t in sorted(self.cache['h'].keys())]
+
+        h_history = [self.cache["h"][t] for t in sorted(self.cache["h"].keys())]
         return logits, h_history
 
-    def backward_sequence(self, corpus, offset, seq_length, target_idx, logits, h_history):
+    def backward_sequence(
+        self, corpus, offset, seq_length, target_idx, logits, h_history
+    ):
         """Performs a full backward pass (BPTT) and stores gradients."""
         inputs = corpus[offset : offset + seq_length]
-        cache = self.cache # Use cache from the forward pass
+        cache = self.cache  # Use cache from the forward pass
 
-        grads = {'W_embed': np.zeros_like(self.W_embed), 'W_xh': np.zeros_like(self.W_xh),
-                 'W_hh': np.zeros_like(self.W_hh), 'W_hy': np.zeros_like(self.W_hy),
-                 'b_h': np.zeros_like(self.b_h), 'b_y': np.zeros_like(self.b_y)}
-        
+        grads = {
+            "W_embed": np.zeros_like(self.W_embed),
+            "W_xh": np.zeros_like(self.W_xh),
+            "W_hh": np.zeros_like(self.W_hh),
+            "W_hy": np.zeros_like(self.W_hy),
+            "b_h": np.zeros_like(self.b_h),
+            "b_y": np.zeros_like(self.b_y),
+        }
+
         probs = softmax(logits)
-        dy = np.copy(probs); dy[target_idx] -= 1
+        dy = np.copy(probs)
+        dy[target_idx] -= 1
 
-        h_final = cache['h'][len(inputs) - 1]
-        grads['W_hy'] = np.outer(dy, h_final)
-        grads['b_y'] = dy
-        
+        h_final = cache["h"][len(inputs) - 1]
+        grads["W_hy"] = np.outer(dy, h_final)
+        grads["b_y"] = dy
+
         dh = self.W_hy.T @ dy
         for t in reversed(range(len(inputs))):
-            h_t, h_prev, x_embed = cache['h'][t], cache['h'][t-1], cache['x_embed'][t]
-            
+            h_t, h_prev, x_embed = cache["h"][t], cache["h"][t - 1], cache["x_embed"][t]
+
             dh_raw = dtanh(h_t) * dh
-            
-            grads['b_h'] += dh_raw
-            grads['W_xh'] += np.outer(dh_raw, x_embed)
-            grads['W_hh'] += np.outer(dh_raw, h_prev)
-            
+
+            grads["b_h"] += dh_raw
+            grads["W_xh"] += np.outer(dh_raw, x_embed)
+            grads["W_hh"] += np.outer(dh_raw, h_prev)
+
             dx_embed = self.W_xh.T @ dh_raw
-            grads['W_embed'][:, inputs[t]] += dx_embed
-            
+            grads["W_embed"][:, inputs[t]] += dx_embed
+
             dh = self.W_hh.T @ dh_raw
-        
+
         self.grads = grads
 
     def update_weights(self, learning_rate):
@@ -170,3 +246,14 @@ class SimpleRNN:
         logits = self.W_hy @ h_new + self.b_y
         probs = softmax(logits)
         return sample_from_dist(probs)
+
+    def reset_gradients_gpu(self, grad_buffers_to_reset):
+        """
+        Efficiently resets all gradient buffers to 0.0 using numpy.
+        This is the numpy equivalent of the GPU gradient reset function.
+
+        :param grad_buffers_to_reset: A list of gradient numpy arrays to reset
+        """
+        for grad_buffer in grad_buffers_to_reset:
+            # For numpy arrays, we can simply fill with zeros
+            grad_buffer.fill(0.0)

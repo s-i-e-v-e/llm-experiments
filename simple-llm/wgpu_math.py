@@ -1,4 +1,3 @@
-# FILE: wgpu_math.py
 import json
 import math
 import random
@@ -7,365 +6,178 @@ import numpy as np
 import wgpu
 import wgpu.backends.wgpu_native
 
+from wgpu_kernel import (
+    BACKWARD_HY_SHADER,
+    BPTT_STEP_SHADER,
+    DX_EMBED_AND_UPDATE_SHADER,
+    FINAL_LOGITS_SHADER,
+    GRADIENT_RESET_SHADER,
+    INITIAL_DH_SHADER,
+    LOSS_SHADER,
+    RNN_STEP_SHADER,
+    SAMPLING_SHADER,
+    SOFTMAX_DY_SHADER,
+    SOFTMAX_SHADER,
+    UPDATE_WEIGHTS_SHADER,
+    create_compute_pipeline,
+    device,
+)
+
 STORAGE_BUFFER_USAGE = wgpu.BufferUsage.STORAGE
 
-# = an=============================================================================
-# WGPU INITIALIZATION
 # ==============================================================================
-
-try:
-    adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
-    device = adapter.request_device_sync()
-    print(f"INFO: wgpu_math backend using GPU: {adapter.info.device}")
-except Exception as e:
-    print(f"FATAL: Could not initialize WGPU device: {e}")
-    print("Please ensure you have working Vulkan drivers.")
-    exit(1)
-
-# ==============================================================================
-# OPTIMIZED COMPUTE SHADERS
-# ==============================================================================
-
-# --- KERNEL 1: Forward pass RNN step (Unchanged) ---
-RNN_STEP_SHADER = """
-@group(0) @binding(0) var<storage, read> w_embed: array<f32>;
-@group(0) @binding(1) var<storage, read> w_xh: array<f32>;
-@group(0) @binding(2) var<storage, read> w_hh: array<f32>;
-@group(0) @binding(3) var<storage, read> b_h: array<f32>;
-@group(0) @binding(4) var<storage, read> h_in: array<f32>;
-@group(0) @binding(5) var<storage, read_write> h_out: array<f32>;
-@group(0) @binding(6) var<storage, read> corpus: array<u32>;
-
-struct Uniforms {
-    hidden_size: u32,
-    embedding_dim: u32,
-    vocab_size: u32,
-    input_offset: u32,
-};
-@group(0) @binding(7) var<uniform> uniforms: Uniforms;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let H = uniforms.hidden_size;
-    let E = uniforms.embedding_dim;
-    let i = global_id.x;
-    if (i >= H) { return; }
-
-    let input_idx = corpus[uniforms.input_offset];
-
-    var xh_dot = 0.0;
-    for (var j = 0u; j < E; j = j + 1u) {
-        xh_dot += w_xh[i * E + j] * w_embed[j * uniforms.vocab_size + input_idx];
-    }
-
-    var hh_dot = 0.0;
-    for (var j = 0u; j < H; j = j + 1u) {
-        hh_dot += w_hh[i * H + j] * h_in[j];
-    }
-
-    h_out[i] = tanh(xh_dot + hh_dot + b_h[i]);
-}
-"""
-
-# --- KERNEL 2: Final logits calculation (Unchanged) ---
-FINAL_LOGITS_SHADER = """
-@group(0) @binding(0) var<storage, read> w_hy: array<f32>;
-@group(0) @binding(1) var<storage, read> b_y: array<f32>;
-@group(0) @binding(2) var<storage, read> h_final: array<f32>;
-@group(0) @binding(3) var<storage, read_write> logits_out: array<f32>;
-
-struct Uniforms { hidden_size: u32, vocab_size: u32 };
-@group(0) @binding(4) var<uniform> uniforms: Uniforms;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let H = uniforms.hidden_size;
-    let V = uniforms.vocab_size;
-    let i = global_id.x;
-    if (i >= V) { return; }
-
-    var sum = 0.0;
-    for (var j = 0u; j < H; j = j + 1u) {
-        sum += w_hy[i * H + j] * h_final[j];
-    }
-    logits_out[i] = sum + b_y[i];
-}
-"""
-
-# --- KERNEL 3: Softmax and dy calculation (Unchanged) ---
-SOFTMAX_DY_SHADER = """
-@group(0) @binding(0) var<storage, read> logits: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dy: array<f32>;
-@group(0) @binding(2) var<storage, read_write> temp_storage: array<f32>;
-
-struct Uniforms { vocab_size: u32, target_idx: u32 };
-@group(0) @binding(3) var<uniform> uniforms: Uniforms;
-
-@compute @workgroup_size(1, 1, 1)
-fn compute_reductions() {
-    var max_val = -3.4e38;
-    for (var i = 0u; i < uniforms.vocab_size; i = i + 1u) { max_val = max(max_val, logits[i]); }
-    var sum_val = 0.0;
-    for (var i = 0u; i < uniforms.vocab_size; i = i + 1u) { sum_val += exp(logits[i] - max_val); }
-    temp_storage[0] = max_val;
-    temp_storage[1] = sum_val;
-}
-
-@compute @workgroup_size(256, 1, 1)
-fn compute_dy(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= uniforms.vocab_size) { return; }
-    let max_val = temp_storage[0];
-    let sum_val = temp_storage[1];
-    let prob = exp(logits[i] - max_val) / sum_val;
-    dy[i] = prob;
-    if (i == uniforms.target_idx) { dy[i] = dy[i] - 1.0; }
-}
-"""
-
-# --- KERNEL 4: Backward pass - output layer (Unchanged) ---
-BACKWARD_HY_SHADER = """
-@group(0) @binding(0) var<storage, read> dy: array<f32>;
-@group(0) @binding(1) var<storage, read> h_final: array<f32>;
-@group(0) @binding(2) var<storage, read_write> dW_hy: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read_write> db_y: array<atomic<u32>>;
-
-struct Uniforms { hidden_size: u32, vocab_size: u32 };
-@group(0) @binding(4) var<uniform> uniforms: Uniforms;
-
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let V = uniforms.vocab_size; let H = uniforms.hidden_size;
-    let v = global_id.x; let h = global_id.y;
-    if (v >= V || h >= H) { return; }
-    let dW_hy_val = dy[v] * h_final[h];
-    var old_val: u32; loop { old_val = atomicLoad(&dW_hy[v * H + h]); let new_f32 = bitcast<f32>(old_val) + dW_hy_val; let new_val = bitcast<u32>(new_f32); let result = atomicCompareExchangeWeak(&dW_hy[v * H + h], old_val, new_val); if (result.exchanged) { break; } }
-    if (h == 0u) { loop { old_val = atomicLoad(&db_y[v]); let new_f32 = bitcast<f32>(old_val) + dy[v]; let new_val = bitcast<u32>(new_f32); let result = atomicCompareExchangeWeak(&db_y[v], old_val, new_val); if (result.exchanged) { break; } } }
-}
-"""
-
-# --- KERNEL 5: Initial dh calculation for BPTT (Unchanged) ---
-INITIAL_DH_SHADER = """
-@group(0) @binding(0) var<storage, read> W_hy: array<f32>;
-@group(0) @binding(1) var<storage, read> dy: array<f32>;
-@group(0) @binding(2) var<storage, read_write> dh_out: array<f32>;
-
-struct Uniforms { hidden_size: u32, vocab_size: u32 };
-@group(0) @binding(3) var<uniform> uniforms: Uniforms;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let H = uniforms.hidden_size; let V = uniforms.vocab_size;
-    let i = global_id.x; if (i >= H) { return; }
-    var dh_from_y = 0.0;
-    for (var j = 0u; j < V; j = j + 1u) { dh_from_y += W_hy[j * H + i] * dy[j]; }
-    dh_out[i] = dh_from_y;
-}
-"""
-
-# --- KERNEL 6: Backward pass - one step of BPTT (MODIFIED) ---
-BPTT_STEP_SHADER = """
-@group(0) @binding(0) var<storage, read> W_hh: array<f32>;
-@group(0) @binding(1) var<storage, read> W_embed: array<f32>;
-@group(0) @binding(2) var<storage, read> dh_next_in: array<f32>;
-@group(0) @binding(3) var<storage, read> h_history: array<f32>;
-@group(0) @binding(4) var<storage, read_write> dW_xh: array<atomic<u32>>;
-@group(0) @binding(5) var<storage, read_write> dW_hh: array<atomic<u32>>;
-@group(0) @binding(6) var<storage, read_write> db_h: array<atomic<u32>>;
-@group(0) @binding(7) var<storage, read_write> dh_next_out: array<f32>;
-@group(0) @binding(8) var<storage, read_write> dh_raw_out: array<f32>;
-@group(0) @binding(9) var<storage, read> corpus: array<u32>;
-
-struct Uniforms {
-    hidden_size: u32,
-    embedding_dim: u32,
-    vocab_size: u32,
-    t: u32,
-    input_offset: u32,
-    padded_h_size_bytes: u32, // <<< NEW: Add padded size
-};
-@group(0) @binding(10) var<uniform> uniforms: Uniforms;
-
-fn dtanh(y: f32) -> f32 { return 1.0 - y * y; }
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let H = uniforms.hidden_size; let E = uniforms.embedding_dim; let V = uniforms.vocab_size;
-    let t = uniforms.t; let i = global_id.x; if (i >= H) { return; }
-
-    // <<< FIX: Use padded size to calculate offsets
-    // The offset is in bytes, so we divide by 4 (sizeof(f32)) to get the f32 array index
-    let h_t_offset = ((t + 1u) * uniforms.padded_h_size_bytes) / 4u;
-    let h_prev_offset = (t * uniforms.padded_h_size_bytes) / 4u;
-    let input_idx = corpus[uniforms.input_offset + t];
-
-    let dh = dh_next_in[i];
-    let dh_raw = dtanh(h_history[h_t_offset + i]) * dh;
-
-    var old_val: u32;
-    loop { old_val = atomicLoad(&db_h[i]); let new_f32 = bitcast<f32>(old_val) + dh_raw; let new_val = bitcast<u32>(new_f32); let result = atomicCompareExchangeWeak(&db_h[i], old_val, new_val); if (result.exchanged) { break; } }
-    for (var j = 0u; j < E; j = j + 1u) { let x_embed_t_j = W_embed[j * V + input_idx]; loop { old_val = atomicLoad(&dW_xh[i * E + j]); let new_f32 = bitcast<f32>(old_val) + dh_raw * x_embed_t_j; let new_val = bitcast<u32>(new_f32); let result = atomicCompareExchangeWeak(&dW_xh[i * E + j], old_val, new_val); if (result.exchanged) { break; } } }
-    for (var j = 0u; j < H; j = j + 1u) { loop { old_val = atomicLoad(&dW_hh[i * H + j]); let new_f32 = bitcast<f32>(old_val) + dh_raw * h_history[h_prev_offset + j]; let new_val = bitcast<u32>(new_f32); let result = atomicCompareExchangeWeak(&dW_hh[i * H + j], old_val, new_val); if (result.exchanged) { break; } } }
-
-    var dh_next_val = 0.0;
-    for (var j = 0u; j < H; j = j + 1u) { dh_next_val += W_hh[j * H + i] * dh_raw; }
-    dh_next_out[i] = dh_next_val;
-    dh_raw_out[i] = dh_raw;
-}
-"""
-
-# --- KERNEL 7: Calculates dx_embed and updates dW_embed ---
-DX_EMBED_AND_UPDATE_SHADER = """
-@group(0) @binding(0) var<storage, read> W_xh: array<f32>;
-@group(0) @binding(1) var<storage, read> dh_raw: array<f32>;
-@group(0) @binding(2) var<storage, read_write> dW_embed: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read> corpus: array<u32>;
-
-struct Uniforms { hidden_size: u32, embedding_dim: u32, vocab_size: u32, input_offset: u32 };
-@group(0) @binding(4) var<uniform> uniforms: Uniforms;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let H = uniforms.hidden_size; let E = uniforms.embedding_dim; let V = uniforms.vocab_size;
-    let j = global_id.x; if (j >= E) { return; }
-    let input_idx = corpus[uniforms.input_offset];
-    var dx_embed_j = 0.0;
-    for (var i = 0u; i < H; i = i + 1u) { dx_embed_j += W_xh[i * E + j] * dh_raw[i]; }
-    var old_val: u32; loop { old_val = atomicLoad(&dW_embed[j * V + input_idx]); let new_f32 = bitcast<f32>(old_val) + dx_embed_j; let new_val = bitcast<u32>(new_f32); let result = atomicCompareExchangeWeak(&dW_embed[j * V + input_idx], old_val, new_val); if (result.exchanged) { break; } }
-}
-"""
-# --- KERNEL 8: Update weights using calculated gradients (Corrected for atomics) ---
-UPDATE_WEIGHTS_SHADER = """
-@group(0) @binding(0) var<storage, read_write> param: array<f32>;
-@group(0) @binding(1) var<storage, read> grad: array<atomic<u32>>;
-
-struct Uniforms { learning_rate: f32 };
-@group(0) @binding(2) var<uniform> uniforms: Uniforms;
-
-fn clip(val: f32, min_val: f32, max_val: f32) -> f32 {
-    return max(min_val, min(val, max_val));
-}
-
-@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= arrayLength(&param)) { return; }
-
-    let grad_f32 = bitcast<f32>(atomicLoad(&grad[i]));
-    let clipped_grad = clip(grad_f32, -5.0, 5.0);
-    param[i] = param[i] - uniforms.learning_rate * clipped_grad;
-}
-"""
-
-# --- KERNEL 9: Calculate Cross-Entropy Loss (NEW) ---
-LOSS_SHADER = """
-@group(0) @binding(0) var<storage, read> logits: array<f32>;
-@group(0) @binding(1) var<storage, read_write> loss_out: array<f32>;
-
-struct Uniforms { vocab_size: u32, target_idx: u32 };
-@group(0) @binding(2) var<uniform> uniforms: Uniforms;
-
-@compute @workgroup_size(1, 1, 1)
-fn main() {
-    var max_val = -3.4e38; // -inf
-    for (var i = 0u; i < uniforms.vocab_size; i = i + 1u) {
-        max_val = max(max_val, logits[i]);
-    }
-
-    var sum_val = 0.0;
-    for (var i = 0u; i < uniforms.vocab_size; i = i + 1u) {
-        sum_val += exp(logits[i] - max_val);
-    }
-
-    let log_prob = (logits[uniforms.target_idx] - max_val) - log(sum_val);
-    loss_out[0] = -log_prob;
-}
-"""
-
-# --- KERNEL 10: Full Softmax for generation (NEW) ---
-SOFTMAX_SHADER = """
-@group(0) @binding(0) var<storage, read> logits: array<f32>;
-@group(0) @binding(1) var<storage, read_write> probs_out: array<f32>;
-@group(0) @binding(2) var<storage, read_write> temp_storage: array<f32>; // size 2: [max, sum]
-
-struct Uniforms { vocab_size: u32 };
-@group(0) @binding(3) var<uniform> uniforms: Uniforms;
-
-@compute @workgroup_size(1, 1, 1)
-fn compute_reductions() {
-    var max_val = -3.4e38;
-    for (var i = 0u; i < uniforms.vocab_size; i = i + 1u) {
-        max_val = max(max_val, logits[i]);
-    }
-
-    var sum_val = 0.0;
-    for (var i = 0u; i < uniforms.vocab_size; i = i + 1u) {
-        sum_val += exp(logits[i] - max_val);
-    }
-
-    temp_storage[0] = max_val;
-    temp_storage[1] = sum_val;
-}
-
-@compute @workgroup_size(256, 1, 1)
-fn compute_probs(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    if (i >= uniforms.vocab_size) { return; }
-
-    let max_val = temp_storage[0];
-    let sum_val = temp_storage[1];
-
-    probs_out[i] = exp(logits[i] - max_val) / sum_val;
-}
-"""
-
-# --- KERNEL 11: GPU Sampling (NEW) ---
-SAMPLING_SHADER = """
-@group(0) @binding(0) var<storage, read> probs: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out_idx: array<u32>;
-
-struct Uniforms { vocab_size: u32, rand_u: f32 };
-@group(0) @binding(2) var<uniform> uniforms: Uniforms;
-
-@compute @workgroup_size(1, 1, 1)
-fn main() {
-    var cum_prob = 0.0;
-    for (var i = 0u; i < uniforms.vocab_size; i = i + 1u) {
-        cum_prob += probs[i];
-        if (uniforms.rand_u < cum_prob) {
-            out_idx[0] = i;
-            return;
-        }
-    }
-    out_idx[0] = uniforms.vocab_size - 1u;
-}
-"""
-
-
-def create_compute_pipeline(shader_code, bind_group_layouts, entry_point="main"):
-    shader_module = device.create_shader_module(code=shader_code)
-    pipeline_layout = device.create_pipeline_layout(
-        bind_group_layouts=bind_group_layouts
-    )
-    return device.create_compute_pipeline(
-        layout=pipeline_layout,
-        compute={"module": shader_module, "entry_point": entry_point},
-    )
-
-
-# ==============================================================================
-# OPTIMIZED MODEL CLASS
+# OPTIMIZED MODEL CLASS (REFRACTORED AND CORRECTED)
 # ==============================================================================
 
 
 class SimpleRNN:
+    # ----------------------------------------------------------------------
+    # 1. CENTRALIZED BINDING CONFIGURATION (REFACTORED: Added resource type)
+    # Maps (binding_index, buffer_resource_name, resource_type)
+    # resource_type: 'ro' (read-only storage), 'rw' (read/write storage/atomic)
+    # The last entry is always the uniform buffer if present.
+    # The resource names must map to keys in self._resources or be passed
+    # as overrides/specials (e.g., 'corpus_gpu', 'h_history_gpu').
+    # ----------------------------------------------------------------------
+    KERNEL_BINDINGS = {
+        "rnn_step": {
+            "shader": RNN_STEP_SHADER,
+            "uniform": "rnn_step",
+            "bindings": [
+                (0, "W_embed", "ro"),
+                (1, "W_xh", "ro"),
+                (2, "W_hh", "ro"),
+                (3, "b_h", "ro"),
+                (4, "h_in", "ro"),
+                (5, "h_out", "rw"),
+                (6, "corpus_gpu", "ro"),
+            ],
+        },
+        "final_logits": {
+            "shader": FINAL_LOGITS_SHADER,
+            "uniform": "final_logits",
+            "bindings": [
+                (0, "W_hy", "ro"),
+                (1, "b_y", "ro"),
+                (2, "h_in", "ro"),
+                (3, "logits_out", "rw"),
+            ],
+        },
+        "softmax_dy": {
+            "shader": SOFTMAX_DY_SHADER,
+            "uniform": "softmax_dy",
+            "bindings": [
+                (0, "logits_gpu", "ro"),
+                (1, "dy_gpu", "rw"),
+                (2, "temp_softmax_gpu", "rw"),
+            ],
+        },
+        "backward_hy": {
+            "shader": BACKWARD_HY_SHADER,
+            "uniform": "backward_hy",
+            "bindings": [
+                (0, "dy_gpu", "ro"),
+                (1, "h_final", "ro"),
+                (2, "dW_hy", "rw"),
+                (3, "db_y", "rw"),
+            ],
+        },
+        "initial_dh": {
+            "shader": INITIAL_DH_SHADER,
+            "uniform": "backward_hy",  # Reuse uniform buffer
+            "bindings": [
+                (0, "W_hy", "ro"),
+                (1, "dy_gpu", "ro"),
+                (2, "dh_out", "rw"),
+            ],
+        },
+        "bptt_step": {
+            "shader": BPTT_STEP_SHADER,
+            "uniform": "bptt_step",
+            "bindings": [
+                (0, "W_hh", "ro"),
+                (1, "W_embed", "ro"),
+                (2, "dh_next_in", "ro"),
+                (3, "h_history_gpu", "ro"),
+                (4, "dW_xh", "rw"),
+                (5, "dW_hh", "rw"),
+                (6, "db_h", "rw"),
+                (7, "dh_next_out", "rw"),
+                (8, "dh_raw_gpu", "rw"),
+                (9, "corpus_gpu", "ro"),
+            ],
+        },
+        "dx_embed_update": {
+            "shader": DX_EMBED_AND_UPDATE_SHADER,
+            "uniform": "dx_embed_update",
+            "bindings": [
+                (0, "W_xh", "ro"),
+                (1, "dh_raw_gpu", "ro"),
+                (2, "dW_embed", "rw"),
+                (3, "corpus_gpu", "ro"),
+            ],
+        },
+        "update_weights": {
+            "shader": UPDATE_WEIGHTS_SHADER,
+            "uniform": "update_weights",
+            "bindings": [
+                (0, "param_buf", "rw"),
+                (1, "grad_buf", "ro"),
+            ],
+        },
+        "loss": {
+            "shader": LOSS_SHADER,
+            "uniform": "loss",
+            "bindings": [
+                (0, "logits_gpu", "ro"),
+                (1, "loss_out_gpu", "rw"),
+                (
+                    2,
+                    "temp_storage_gpu_loss",
+                    "rw",
+                ),
+            ],
+        },
+        "softmax": {
+            "shader": SOFTMAX_SHADER,
+            "uniform": "softmax",
+            "bindings": [
+                (0, "logits_gpu", "ro"),
+                (
+                    1,
+                    "probs_gpu",
+                    "rw",
+                ),  # FIX: Changed from 'probs_out' to 'probs_gpu' for consistency with self._resources
+                (2, "temp_softmax_gpu", "rw"),
+            ],
+        },
+        "sampling": {
+            "shader": SAMPLING_SHADER,
+            "uniform": "sampling",
+            "bindings": [
+                (0, "probs_gpu", "ro"),
+                (1, "out_idx_gpu", "rw"),
+            ],
+        },
+        "gradient_reset": {
+            "shader": GRADIENT_RESET_SHADER,
+            "uniform": None,  # No uniform needed
+            "bindings": [
+                # This binding will be replaced for each gradient buffer:
+                # dW_xh_atomic_gpu, dW_hh_atomic_gpu, dW_hy_atomic_gpu, etc.
+                (0, "grad_buffer", "rw"),
+            ],
+        },
+    }
+
     def __init__(self, vocab_size, hidden_size, embedding_dim):
         self.device = device
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.embedding_dim = embedding_dim
+        H, V, E = hidden_size, vocab_size, embedding_dim
 
-        # --- NEW: Get alignment and calculate padded size ---
+        # Alignment and padding logic (Unchanged)
         self.alignment = device.limits["min-storage-buffer-offset-alignment"]
         unpadded_h_size = self.hidden_size * 4  # size in bytes
         self.padded_h_size = (
@@ -376,21 +188,14 @@ class SimpleRNN:
             f"INFO: Hidden state size padded from {unpadded_h_size} to {self.padded_h_size} bytes."
         )
 
+        # Parameter Initialization (Unchanged structure)
         self.params = {
-            "W_embed": np.random.uniform(
-                -0.01, 0.01, (embedding_dim, vocab_size)
-            ).astype(np.float32),
-            "W_xh": np.random.uniform(-0.01, 0.01, (hidden_size, embedding_dim)).astype(
-                np.float32
-            ),
-            "W_hh": np.random.uniform(-0.01, 0.01, (hidden_size, hidden_size)).astype(
-                np.float32
-            ),
-            "W_hy": np.random.uniform(-0.01, 0.01, (vocab_size, hidden_size)).astype(
-                np.float32
-            ),
-            "b_h": np.zeros(hidden_size, dtype=np.float32),
-            "b_y": np.zeros(vocab_size, dtype=np.float32),
+            "W_embed": np.random.uniform(-0.01, 0.01, (E, V)).astype(np.float32),
+            "W_xh": np.random.uniform(-0.01, 0.01, (H, E)).astype(np.float32),
+            "W_hh": np.random.uniform(-0.01, 0.01, (H, H)).astype(np.float32),
+            "W_hy": np.random.uniform(-0.01, 0.01, (V, H)).astype(np.float32),
+            "b_h": np.zeros(H, dtype=np.float32),
+            "b_y": np.zeros(V, dtype=np.float32),
         }
 
         self.params_gpu = {}
@@ -406,136 +211,156 @@ class SimpleRNN:
             | wgpu.BufferUsage.COPY_SRC
         )
 
+        # --- CORRECTED GRADIENT BUFFER CREATION ---
+        GRAD_MAP = {
+            "W_embed": "dW_embed",
+            "W_xh": "dW_xh",
+            "W_hh": "dW_hh",
+            "W_hy": "dW_hy",
+            "b_h": "db_h",
+            "b_y": "db_y",
+        }
+
         for name, arr in self.params.items():
             self.params_gpu[name] = device.create_buffer_with_data(
                 data=arr, usage=param_usage
             )
-            self.grads_gpu[name] = device.create_buffer(
-                size=arr.nbytes, usage=grad_usage
+            grad_size = (arr.nbytes + 3) // 4 * 4
+
+            # Use the explicit map to ensure correct keys (e.g., dW_hy, db_y) are created
+            grad_name = GRAD_MAP[name]
+            self.grads_gpu[grad_name] = device.create_buffer(
+                size=grad_size, usage=grad_usage
             )
 
+        # NEW: List of gradient buffers for the GPU reset function
+        self.gradient_buffers = list(self.grads_gpu.values())
+        # --- END GRADIENT BUFFER CREATION ---
+
+        # Temporary/Shared Buffers (UNCHANGED)
+        shared_usage = (
+            wgpu.BufferUsage.STORAGE
+            | wgpu.BufferUsage.COPY_SRC
+            | wgpu.BufferUsage.COPY_DST
+        )
+        dh_usage = shared_usage
+
+        self.h_fwd_ping = device.create_buffer(size=H * 4, usage=shared_usage)
+        self.h_fwd_pong = device.create_buffer(size=H * 4, usage=shared_usage)
+        self.zero_buffer(self.h_fwd_ping)
+        self.zero_buffer(self.h_fwd_pong)
+
         self.gen_h_out = device.create_buffer(
-            size=hidden_size * 4,
-            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
+            size=H * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
         )
         self.gen_input = device.create_buffer(
             size=4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST
         )
+        self.logits_gpu = device.create_buffer(size=V * 4, usage=shared_usage)
+
+        self.dy_gpu = device.create_buffer(size=V * 4, usage=shared_usage)
+        self.temp_softmax_gpu = device.create_buffer(size=2 * 4, usage=shared_usage)
+
+        # NEW: Temporary buffer for the parallel LOSS calculation (Kernel 9)
+        self.temp_storage_gpu_loss = device.create_buffer(
+            size=2 * 4, usage=shared_usage
+        )
+
+        self.dh_ping = device.create_buffer(size=H * 4, usage=dh_usage)
+        self.dh_pong = device.create_buffer(size=H * 4, usage=dh_usage)
+
+        self.dh_raw_gpu = device.create_buffer(size=H * 4, usage=shared_usage)
+        self.probs_gpu = device.create_buffer(size=V * 4, usage=shared_usage)
+        self.out_idx_gpu = device.create_buffer(size=4, usage=shared_usage)
+
+        # --- NEW: Resource Mapping for all buffers (Coupling reduction) ---
+        self._resources = {}
+        self._resources.update(self.params_gpu)
+        self._resources.update(self.grads_gpu)
+        self._resources.update(
+            {
+                "h_fwd_ping": self.h_fwd_ping,
+                "h_fwd_pong": self.h_fwd_pong,
+                "gen_h_out": self.gen_h_out,
+                "gen_input": self.gen_input,
+                "logits_gpu": self.logits_gpu,
+                "dy_gpu": self.dy_gpu,
+                "temp_softmax_gpu": self.temp_softmax_gpu,
+                "temp_storage_gpu_loss": self.temp_storage_gpu_loss,  # NEW BINDING
+                "dh_ping": self.dh_ping,
+                "dh_pong": self.dh_pong,
+                "dh_raw_gpu": self.dh_raw_gpu,
+                "probs_gpu": self.probs_gpu,
+                "out_idx_gpu": self.out_idx_gpu,
+            }
+        )
+        # --- END NEW: Resource Mapping ---
+
+        # Uniform Buffers (Unchanged structure)
+        self.uniform_buffers = {}
+        uniform_specs = {
+            "rnn_step": 4 * 4,
+            "final_logits": 2 * 4,
+            "softmax_dy": 2 * 4,
+            "backward_hy": 2 * 4,
+            "bptt_step": 6 * 4,
+            "dx_embed_update": 4 * 4,
+            "update_weights": 4,
+            "loss": 2 * 4,
+            "softmax": 4,
+            "sampling": 8,
+        }
+        uniform_usage = wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
+        for name, size in uniform_specs.items():
+            self.uniform_buffers[name] = device.create_buffer(
+                size=size, usage=uniform_usage
+            )
 
         self._create_pipelines()
 
     def _create_pipelines(self):
-        b, s, ro, rw, u = (
-            wgpu.BufferBindingType,
-            wgpu.ShaderStage,
+        s = wgpu.ShaderStage
+        ro, rw, u = (
             {"type": "read-only-storage"},
             {"type": "storage"},
             {"type": "uniform"},
         )
-        self.bgls = {
-            "rnn_step": device.create_bind_group_layout(
-                entries=[
-                    {"binding": i, "visibility": s.COMPUTE, "buffer": ro}
-                    for i in range(5)
-                ]
-                + [
-                    {"binding": 5, "visibility": s.COMPUTE, "buffer": rw},
-                    {"binding": 6, "visibility": s.COMPUTE, "buffer": ro},
-                    {"binding": 7, "visibility": s.COMPUTE, "buffer": u},
-                ]
-            ),
-            "final_logits": device.create_bind_group_layout(
-                entries=[
-                    {"binding": i, "visibility": s.COMPUTE, "buffer": ro}
-                    for i in range(3)
-                ]
-                + [
-                    {"binding": 3, "visibility": s.COMPUTE, "buffer": rw},
-                    {"binding": 4, "visibility": s.COMPUTE, "buffer": u},
-                ]
-            ),
-            "softmax_dy": device.create_bind_group_layout(
-                entries=[{"binding": 0, "visibility": s.COMPUTE, "buffer": ro}]
-                + [
-                    {"binding": i, "visibility": s.COMPUTE, "buffer": rw}
-                    for i in range(1, 3)
-                ]
-                + [{"binding": 3, "visibility": s.COMPUTE, "buffer": u}]
-            ),
-            "backward_hy": device.create_bind_group_layout(
-                entries=[
-                    {"binding": i, "visibility": s.COMPUTE, "buffer": ro}
-                    for i in range(2)
-                ]
-                + [
-                    {"binding": i, "visibility": s.COMPUTE, "buffer": rw}
-                    for i in range(2, 4)
-                ]
-                + [{"binding": 4, "visibility": s.COMPUTE, "buffer": u}]
-            ),
-            "initial_dh": device.create_bind_group_layout(
-                entries=[
-                    {"binding": i, "visibility": s.COMPUTE, "buffer": ro}
-                    for i in range(2)
-                ]
-                + [
-                    {"binding": 2, "visibility": s.COMPUTE, "buffer": rw},
-                    {"binding": 3, "visibility": s.COMPUTE, "buffer": u},
-                ]
-            ),
-            "bptt_step": device.create_bind_group_layout(
-                entries=[
-                    {"binding": i, "visibility": s.COMPUTE, "buffer": ro}
-                    for i in range(4)
-                ]
-                + [
-                    {"binding": i, "visibility": s.COMPUTE, "buffer": rw}
-                    for i in range(4, 9)
-                ]
-                + [
-                    {"binding": 9, "visibility": s.COMPUTE, "buffer": ro},
-                    {"binding": 10, "visibility": s.COMPUTE, "buffer": u},
-                ]
-            ),
-            "dx_embed_update": device.create_bind_group_layout(
-                entries=[
-                    {"binding": 0, "visibility": s.COMPUTE, "buffer": ro},
-                    {"binding": 1, "visibility": s.COMPUTE, "buffer": ro},
-                    {"binding": 2, "visibility": s.COMPUTE, "buffer": rw},
-                    {"binding": 3, "visibility": s.COMPUTE, "buffer": ro},
-                    {"binding": 4, "visibility": s.COMPUTE, "buffer": u},
-                ]
-            ),
-            "update_weights": device.create_bind_group_layout(
-                entries=[
-                    {"binding": 0, "visibility": s.COMPUTE, "buffer": rw},
-                    {"binding": 1, "visibility": s.COMPUTE, "buffer": ro},
-                    {"binding": 2, "visibility": s.COMPUTE, "buffer": u},
-                ]
-            ),
-            "loss": device.create_bind_group_layout(
-                entries=[
-                    {"binding": 0, "visibility": s.COMPUTE, "buffer": ro},
-                    {"binding": 1, "visibility": s.COMPUTE, "buffer": rw},
-                    {"binding": 2, "visibility": s.COMPUTE, "buffer": u},
-                ]
-            ),
-            "softmax": device.create_bind_group_layout(
-                entries=[{"binding": 0, "visibility": s.COMPUTE, "buffer": ro}]
-                + [
-                    {"binding": i, "visibility": s.COMPUTE, "buffer": rw}
-                    for i in range(1, 3)
-                ]
-                + [{"binding": 3, "visibility": s.COMPUTE, "buffer": u}]
-            ),
-            "sampling": device.create_bind_group_layout(
-                entries=[
-                    {"binding": 0, "visibility": s.COMPUTE, "buffer": ro},
-                    {"binding": 1, "visibility": s.COMPUTE, "buffer": rw},
-                    {"binding": 2, "visibility": s.COMPUTE, "buffer": u},
-                ]
-            ),
-        }
+        # Map the shorthand 'ro'/'rw'/'u' from KERNEL_BINDINGS to the wgpu resource dictionary
+        buffer_type_map = {"ro": ro, "rw": rw, "u": u}
+
+        self.bgls = {}
+        for name, config in self.KERNEL_BINDINGS.items():
+            entries = []
+
+            # Use the unified binding config to automatically build BGL entries
+            for binding_idx, _, resource_type_key in config["bindings"]:
+                buffer_type = buffer_type_map.get(resource_type_key)
+                if not buffer_type:
+                    raise ValueError(f"Unknown resource type key: {resource_type_key}")
+                entries.append(
+                    {
+                        "binding": binding_idx,
+                        "visibility": s.COMPUTE,
+                        "buffer": buffer_type,
+                    }
+                )
+
+            # Append the uniform binding ONLY IF a uniform name is provided
+            uniform_name = config.get("uniform")  # FIX: Get the uniform name
+            if uniform_name is not None:  # FIX: Check if the uniform name is not None
+                entries.append(
+                    {
+                        "binding": len(
+                            config["bindings"]
+                        ),  # Uniform is always the binding immediately after the storage buffers
+                        "visibility": s.COMPUTE,
+                        "buffer": u,
+                    }
+                )
+
+            self.bgls[name] = self.device.create_bind_group_layout(entries=entries)
+
+        # Pipeline creation remains the same (just mapping kernel names to pipelines)
         self.pipelines = {
             "rnn_step": create_compute_pipeline(
                 RNN_STEP_SHADER, [self.bgls["rnn_step"]]
@@ -574,8 +399,109 @@ class SimpleRNN:
             "sampling": create_compute_pipeline(
                 SAMPLING_SHADER, [self.bgls["sampling"]]
             ),
+            "gradient_reset": create_compute_pipeline(
+                GRADIENT_RESET_SHADER, [self.bgls["gradient_reset"]]
+            ),
         }
 
+    # ----------------------------------------------------------------------
+    # 2. BIND GROUP HELPER
+    # Uses KERNEL_BINDINGS and _resources to create the BindGroup
+    # ----------------------------------------------------------------------
+    def _create_bind_group(self, pipeline_name, overrides=None):
+        """Creates a BindGroup for a given pipeline using KERNEL_BINDINGS and overrides."""
+        config = self.KERNEL_BINDINGS[pipeline_name]
+        bgl = self.bgls[pipeline_name]
+        overrides = overrides or {}
+        entries = []
+
+        # Resolve all storage buffer bindings
+        # Unpack the 3-element tuple (idx, name, type), ignoring type for the BindGroup
+        for binding_idx, resource_name, _ in config["bindings"]:
+            # Priority: 1. Overrides (runtime buffers) 2. self._resources (params/grads/temps)
+            buffer_resource = overrides.get(
+                resource_name, self._resources.get(resource_name)
+            )
+
+            if isinstance(buffer_resource, tuple):
+                # Handle (gpu_buffer, offset, size) tuple for manual offsets
+                buf, offset, size = buffer_resource
+                entries.append(
+                    {
+                        "binding": binding_idx,
+                        "resource": {"buffer": buf, "offset": offset, "size": size},
+                    }
+                )
+            elif buffer_resource is not None:
+                entries.append(
+                    {
+                        "binding": binding_idx,
+                        "resource": {"buffer": buffer_resource},
+                    }
+                )
+            else:
+                raise ValueError(
+                    f"Resource '{resource_name}' for pipeline '{pipeline_name}' not found in resources or overrides."
+                )
+
+        # Resolve Uniform buffer binding
+        if "uniform" in config:
+            uniform_name = config["uniform"]
+            if uniform_name is not None:
+                entries.append(
+                    {
+                        "binding": len(config["bindings"]),
+                        "resource": {"buffer": self.uniform_buffers[uniform_name]},
+                    }
+                )
+
+        return self.device.create_bind_group(layout=bgl, entries=entries)
+
+    # ----------------------------------------------------------------------
+    # 3. DISPATCH HELPER (REDUCED COUPLING)
+    # ----------------------------------------------------------------------
+    def _dispatch_compute_job(
+        self,
+        command_encoder,
+        pipeline_name,
+        uniform_data=None,
+        workgroups_x=1,
+        workgroups_y=1,
+        overrides=None,
+        pre_created_bind_group=None,
+        dynamic_offsets=None,
+    ):
+        """
+        Helper function to handle the boilerplate. Uses the new _create_bind_group
+        for single-shot dispatches.
+        """
+
+        config = self.KERNEL_BINDINGS[pipeline_name]
+
+        if "uniform" in config and uniform_data is not None:
+            # Write uniform data first
+            uniform_name = config["uniform"]
+            self.device.queue.write_buffer(
+                self.uniform_buffers[uniform_name], 0, uniform_data.tobytes()
+            )
+
+        compute_pass = command_encoder.begin_compute_pass()
+        compute_pass.set_pipeline(self.pipelines[pipeline_name])
+
+        if pre_created_bind_group:
+            # Case 1: BindGroup is pre-created outside a loop
+            compute_pass.set_bind_group(
+                0, pre_created_bind_group, dynamic_offsets_data=dynamic_offsets or []
+            )
+        else:
+            # Case 2: BindGroup must be created for a single, non-loop dispatch
+            bind_group = self._create_bind_group(pipeline_name, overrides)
+            compute_pass.set_bind_group(0, bind_group)
+
+        compute_pass.dispatch_workgroups(workgroups_x, workgroups_y)
+        compute_pass.end()
+
+    # --- Utility methods (Mostly Unchanged) ---
     def get_initial_hidden_state_gpu(self):
         usage = (
             wgpu.BufferUsage.STORAGE
@@ -586,17 +512,16 @@ class SimpleRNN:
         self.zero_buffer(h_buffer)
         return h_buffer
 
-    def zero_buffer(self, buffer):
+    def zero_buffer(self, buffer, offset=0, size=None):
+        if size is None:
+            size = buffer.size - offset
         command_encoder = device.create_command_encoder()
-        command_encoder.clear_buffer(buffer, 0, buffer.size)
+        command_encoder.clear_buffer(buffer, offset, size)
         device.queue.submit([command_encoder.finish()])
 
     def update_hidden_state(self, h_source, h_dest):
-        # <<< FIX: Use padded size to calculate the number of states (S)
         S = (h_source.size // self.padded_h_size) - 1
-
         command_encoder = device.create_command_encoder()
-        # <<< FIX: The source offset must use the padded size
         command_encoder.copy_buffer_to_buffer(
             h_source, S * self.padded_h_size, h_dest, 0, h_dest.size
         )
@@ -641,142 +566,160 @@ class SimpleRNN:
         model._set_params(model_data["params"])
         return model
 
+    # ----------------------------------------------------------------------
+    # 4. FORWARD SEQUENCE (CLEANED LOOPS - UNCHANGED FROM PREVIOUS REFACTOR)
+    # ----------------------------------------------------------------------
     def forward_sequence(self, corpus_gpu, h_prev_gpu, offset, seq_length):
-        S, H, E, V = seq_length, self.hidden_size, self.embedding_dim, self.vocab_size
+        S, H, V = seq_length, self.hidden_size, self.vocab_size
+        H_bytes = H * 4
 
-        # <<< FIX: The h_history_gpu buffer size must use the padded size
-        h_history_gpu = device.create_buffer(
+        h_history_gpu = self.device.create_buffer(
             size=(S + 1) * self.padded_h_size,
             usage=wgpu.BufferUsage.STORAGE
             | wgpu.BufferUsage.COPY_SRC
             | wgpu.BufferUsage.COPY_DST,
         )
-        h_ping = h_prev_gpu
-        h_pong = device.create_buffer(
-            size=H * 4,
-            usage=wgpu.BufferUsage.STORAGE
-            | wgpu.BufferUsage.COPY_SRC
-            | wgpu.BufferUsage.COPY_DST,
+
+        h_ping = self.h_fwd_ping
+        h_pong = self.h_fwd_pong
+
+        command_encoder = self.device.create_command_encoder()
+        command_encoder.copy_buffer_to_buffer(h_prev_gpu, 0, h_ping, 0, H_bytes)
+        command_encoder.copy_buffer_to_buffer(h_ping, 0, h_history_gpu, 0, H_bytes)
+
+        # --- OPTIMIZATION: Pre-create BindGroups (Ping->Pong and Pong->Ping) ---
+        # Use the abstract helper, passing runtime/loop-specific buffers as overrides.
+        bg_rnn_a = self._create_bind_group(
+            "rnn_step",
+            overrides={"h_in": h_ping, "h_out": h_pong, "corpus_gpu": corpus_gpu},
+        )
+        bg_rnn_b = self._create_bind_group(
+            "rnn_step",
+            overrides={"h_in": h_pong, "h_out": h_ping, "corpus_gpu": corpus_gpu},
         )
 
-        command_encoder = device.create_command_encoder()
-        command_encoder.copy_buffer_to_buffer(h_ping, 0, h_history_gpu, 0, h_ping.size)
+        current_bg = bg_rnn_a
+        # --- END OPTIMIZATION ---
 
         for t in range(seq_length):
-            uniform_data = np.array([H, E, V, offset + t], dtype=np.uint32)
-            uniform_buffer = device.create_buffer_with_data(
-                data=uniform_data, usage=wgpu.BufferUsage.UNIFORM
+            uniform_data = np.array(
+                [H, self.embedding_dim, V, offset + t], dtype=np.uint32
             )
 
-            bind_group = device.create_bind_group(
-                layout=self.bgls["rnn_step"],
-                entries=[
-                    {"binding": 0, "resource": {"buffer": self.params_gpu["W_embed"]}},
-                    {"binding": 1, "resource": {"buffer": self.params_gpu["W_xh"]}},
-                    {"binding": 2, "resource": {"buffer": self.params_gpu["W_hh"]}},
-                    {"binding": 3, "resource": {"buffer": self.params_gpu["b_h"]}},
-                    {"binding": 4, "resource": {"buffer": h_ping}},
-                    {"binding": 5, "resource": {"buffer": h_pong}},
-                    {"binding": 6, "resource": {"buffer": corpus_gpu}},
-                    {"binding": 7, "resource": {"buffer": uniform_buffer}},
-                ],
+            self._dispatch_compute_job(
+                command_encoder,
+                "rnn_step",
+                uniform_data=uniform_data,
+                workgroups_x=math.ceil(H / 64),
+                pre_created_bind_group=current_bg,
             )
 
-            compute_pass = command_encoder.begin_compute_pass()
-            compute_pass.set_pipeline(self.pipelines["rnn_step"])
-            compute_pass.set_bind_group(0, bind_group)
-            compute_pass.dispatch_workgroups(math.ceil(H / 64))
-            compute_pass.end()
+            h_out_buf = h_pong if current_bg == bg_rnn_a else h_ping
 
-            # <<< FIX: Use padded size for the destination offset
             command_encoder.copy_buffer_to_buffer(
-                h_pong, 0, h_history_gpu, (t + 1) * self.padded_h_size, h_pong.size
+                h_out_buf,
+                0,
+                h_history_gpu,
+                (t + 1) * self.padded_h_size,
+                H_bytes,
             )
-            h_ping, h_pong = h_pong, h_ping
 
-        final_h_gpu = h_ping
-        logits_gpu = device.create_buffer(
-            size=V * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
-        )
-        uniform_data_logits = np.array([H, V], dtype=np.uint32)
-        uniform_buffer_logits = device.create_buffer_with_data(
-            data=uniform_data_logits, usage=wgpu.BufferUsage.UNIFORM
-        )
+            current_bg = bg_rnn_b if current_bg == bg_rnn_a else bg_rnn_a
 
-        bind_group_logits = device.create_bind_group(
-            layout=self.bgls["final_logits"],
-            entries=[
-                {"binding": 0, "resource": {"buffer": self.params_gpu["W_hy"]}},
-                {"binding": 1, "resource": {"buffer": self.params_gpu["b_y"]}},
-                {"binding": 2, "resource": {"buffer": final_h_gpu}},
-                {"binding": 3, "resource": {"buffer": logits_gpu}},
-                {"binding": 4, "resource": {"buffer": uniform_buffer_logits}},
-            ],
+        final_h_gpu = h_ping if current_bg == bg_rnn_b else h_pong
+
+        # Final logits calculation
+        self._dispatch_compute_job(
+            command_encoder,
+            "final_logits",
+            uniform_data=np.array([H, V], dtype=np.uint32),
+            workgroups_x=math.ceil(V / 64),
+            overrides={"h_in": final_h_gpu, "logits_out": self.logits_gpu},
         )
 
-        compute_pass = command_encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self.pipelines["final_logits"])
-        compute_pass.set_bind_group(0, bind_group_logits)
-        compute_pass.dispatch_workgroups(math.ceil(V / 64))
-        compute_pass.end()
-        device.queue.submit([command_encoder.finish()])
+        self.device.queue.submit([command_encoder.finish()])
 
-        return logits_gpu, h_history_gpu
+        return self.logits_gpu, h_history_gpu
 
+    # ----------------------------------------------------------------------
+    # 5. BACKWARD SEQUENCE (FIXED: Removed redundant explicit grad lookups)
+    # ----------------------------------------------------------------------
     def calculate_loss_gpu(self, logits_gpu, target_idx):
         V = self.vocab_size
-        loss_out_gpu = device.create_buffer(
+
+        # New: Temporary storage for parallel reduction (2 floats: max_val, sum_val)
+        temp_storage_gpu_loss = self.device.create_buffer(
+            size=8, usage=wgpu.BufferUsage.STORAGE
+        )
+
+        loss_out_gpu = self.device.create_buffer(
             size=4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
         )
-        uniform_data = np.array([V, target_idx], dtype=np.uint32)
-        uniform_buffer = device.create_buffer_with_data(
-            data=uniform_data, usage=wgpu.BufferUsage.UNIFORM
+        command_encoder = self.device.create_command_encoder()
+
+        # Workgroup size is 256. Need V / 256 + 1 workgroup for full coverage.
+        # Since the new LOSS_SHADER performs a parallel reduction where one workgroup
+        # covers the entire V, we only dispatch a single workgroup (WG_SIZE=256)
+        # to ensure local memory is shared correctly.
+        # NOTE: This assumes V is large enough to warrant parallel reduction.
+        # If V > 256, it still only needs one workgroup.
+        workgroups_x = 1
+
+        self._dispatch_compute_job(
+            command_encoder,
+            "loss",
+            uniform_data=np.array([V, target_idx], dtype=np.uint32),
+            workgroups_x=workgroups_x,
+            overrides={
+                "logits_gpu": logits_gpu,
+                "loss_out_gpu": loss_out_gpu,
+                "temp_storage_gpu_loss": temp_storage_gpu_loss,  # NEW binding
+            },
         )
+        self.device.queue.submit([command_encoder.finish()])
+        return self.device.queue.read_buffer(loss_out_gpu).cast("f")[0]
 
-        bind_group = device.create_bind_group(
-            layout=self.bgls["loss"],
-            entries=[
-                {"binding": 0, "resource": {"buffer": logits_gpu}},
-                {"binding": 1, "resource": {"buffer": loss_out_gpu}},
-                {"binding": 2, "resource": {"buffer": uniform_buffer}},
-            ],
-        )
+    def reset_gradients_gpu(self, grad_buffers_to_reset):
+        """
+        Efficiently resets all atomic gradient buffers to 0.0 using the GPU.
+        :param grad_buffers_to_reset: A list of WGPU Buffer objects to reset.
+        """
+        command_encoder = self.device.create_command_encoder()
 
-        command_encoder = device.create_command_encoder()
-        compute_pass = command_encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self.pipelines["loss"])
-        compute_pass.set_bind_group(0, bind_group)
-        compute_pass.dispatch_workgroups(1)
-        compute_pass.end()
-        device.queue.submit([command_encoder.finish()])
+        for grad_buffer in grad_buffers_to_reset:
+            buffer_size_floats = grad_buffer.size // 4
+            # Workgroup size is 256.
+            workgroups_x = (buffer_size_floats + 255) // 256
 
-        return device.queue.read_buffer(loss_out_gpu).cast("f")[0]
+            self._dispatch_compute_job(
+                command_encoder,
+                "gradient_reset",
+                uniform_data=None,  # No uniforms for this kernel
+                workgroups_x=workgroups_x,
+                overrides={"grad_buffer": grad_buffer},
+            )
+
+        self.device.queue.submit([command_encoder.finish()])
+        # NOTE: If this is called once per training step, it should be fast.
 
     def backward_sequence(
         self, corpus_gpu, offset, seq_length, target_idx, logits_gpu, h_history_gpu
     ):
-        S, H, E, V = seq_length, self.hidden_size, self.embedding_dim, self.vocab_size
+        S, H, V = seq_length, self.hidden_size, self.vocab_size
+        H_bytes = H * 4
 
-        command_encoder = device.create_command_encoder()
+        command_encoder = self.device.create_command_encoder()
         for grad_buf in self.grads_gpu.values():
             command_encoder.clear_buffer(grad_buf)
 
-        dy_gpu = device.create_buffer(size=V * 4, usage=wgpu.BufferUsage.STORAGE)
-        temp_softmax_gpu = device.create_buffer(
-            size=2 * 4, usage=wgpu.BufferUsage.STORAGE
-        )
+        # Softmax dy calculation
         uniform_data_softmax = np.array([V, target_idx], dtype=np.uint32)
-        uniform_buffer_softmax = device.create_buffer_with_data(
-            data=uniform_data_softmax, usage=wgpu.BufferUsage.UNIFORM
+        bg_softmax = self._create_bind_group(
+            "softmax_dy", overrides={"logits_gpu": logits_gpu}
         )
-        bg_softmax = device.create_bind_group(
-            layout=self.bgls["softmax_dy"],
-            entries=[
-                {"binding": 0, "resource": {"buffer": logits_gpu}},
-                {"binding": 1, "resource": {"buffer": dy_gpu}},
-                {"binding": 2, "resource": {"buffer": temp_softmax_gpu}},
-                {"binding": 3, "resource": {"buffer": uniform_buffer_softmax}},
-            ],
+
+        self.device.queue.write_buffer(
+            self.uniform_buffers["softmax_dy"], 0, uniform_data_softmax.tobytes()
         )
 
         compute_pass = command_encoder.begin_compute_pass()
@@ -788,245 +731,195 @@ class SimpleRNN:
         compute_pass.dispatch_workgroups(math.ceil(V / 256))
         compute_pass.end()
 
+        # Backward HY (FIXED: Removed dW_hy, db_y overrides)
         uniform_data_hy = np.array([H, V], dtype=np.uint32)
-        uniform_buffer_hy = device.create_buffer_with_data(
-            data=uniform_data_hy, usage=wgpu.BufferUsage.UNIFORM
-        )
-
-        # <<< FIX: Use padded size to calculate the offset for the final hidden state
         final_h_offset = S * self.padded_h_size
+        h_final_res = (h_history_gpu, final_h_offset, H_bytes)
 
-        bg_hy = device.create_bind_group(
-            layout=self.bgls["backward_hy"],
-            entries=[
-                {"binding": 0, "resource": {"buffer": dy_gpu}},
-                {
-                    "binding": 1,
-                    "resource": {
-                        "buffer": h_history_gpu,
-                        "offset": final_h_offset,
-                        "size": H * 4,
-                    },
-                },
-                {"binding": 2, "resource": {"buffer": self.grads_gpu["W_hy"]}},
-                {"binding": 3, "resource": {"buffer": self.grads_gpu["b_y"]}},
-                {"binding": 4, "resource": {"buffer": uniform_buffer_hy}},
-            ],
+        self._dispatch_compute_job(
+            command_encoder,
+            "backward_hy",
+            uniform_data=uniform_data_hy,
+            workgroups_x=math.ceil(V / 8),
+            workgroups_y=math.ceil(H / 8),
+            overrides={
+                "h_final": h_final_res
+            },  # Only h_final needs overriding (due to offset)
         )
 
-        compute_pass = command_encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self.pipelines["backward_hy"])
-        compute_pass.set_bind_group(0, bg_hy)
-        compute_pass.dispatch_workgroups(math.ceil(V / 8), math.ceil(H / 8))
-        compute_pass.end()
+        # Initial DH
+        dh_ping = self.dh_ping
+        dh_pong = self.dh_pong
+        command_encoder.clear_buffer(dh_ping, 0, H_bytes)
 
-        dh_usage = (
-            wgpu.BufferUsage.STORAGE
-            | wgpu.BufferUsage.COPY_SRC
-            | wgpu.BufferUsage.COPY_DST
-        )
-        dh_ping, dh_pong = (
-            device.create_buffer(size=H * 4, usage=dh_usage),
-            device.create_buffer(size=H * 4, usage=dh_usage),
+        self._dispatch_compute_job(
+            command_encoder,
+            "initial_dh",
+            workgroups_x=math.ceil(H / 64),
+            pre_created_bind_group=self._create_bind_group(
+                "initial_dh", overrides={"dh_out": dh_ping}
+            ),
+            uniform_data=uniform_data_hy,  # Re-uses backward_hy uniform
         )
 
-        bg_initial_dh = device.create_bind_group(
-            layout=self.bgls["initial_dh"],
-            entries=[
-                {"binding": 0, "resource": {"buffer": self.params_gpu["W_hy"]}},
-                {"binding": 1, "resource": {"buffer": dy_gpu}},
-                {"binding": 2, "resource": {"buffer": dh_ping}},
-                {"binding": 3, "resource": {"buffer": uniform_buffer_hy}},
-            ],
+        # BPTT Loop Setup
+        bg_bptt_a = self._create_bind_group(
+            "bptt_step",
+            overrides={
+                "dh_next_in": dh_ping,
+                "dh_next_out": dh_pong,
+                "h_history_gpu": h_history_gpu,
+                "corpus_gpu": corpus_gpu,
+            },
         )
-        compute_pass = command_encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self.pipelines["initial_dh"])
-        compute_pass.set_bind_group(0, bg_initial_dh)
-        compute_pass.dispatch_workgroups(math.ceil(H / 64))
-        compute_pass.end()
+        bg_bptt_b = self._create_bind_group(
+            "bptt_step",
+            overrides={
+                "dh_next_in": dh_pong,
+                "dh_next_out": dh_ping,
+                "h_history_gpu": h_history_gpu,
+                "corpus_gpu": corpus_gpu,
+            },
+        )
+        current_bg = bg_bptt_a
 
-        dh_raw_gpu = device.create_buffer(size=H * 4, usage=wgpu.BufferUsage.STORAGE)
         for t in reversed(range(seq_length)):
-            # <<< FIX: Add padded_h_size to the uniform data for the shader
             uniform_data_bptt = np.array(
-                [H, E, V, t, offset, self.padded_h_size], dtype=np.uint32
-            )
-            uniform_buffer_bptt = device.create_buffer_with_data(
-                data=uniform_data_bptt, usage=wgpu.BufferUsage.UNIFORM
+                [H, self.embedding_dim, V, t, offset, self.padded_h_size],
+                dtype=np.uint32,
             )
 
-            bg_bptt = device.create_bind_group(
-                layout=self.bgls["bptt_step"],
-                entries=[
-                    {"binding": 0, "resource": {"buffer": self.params_gpu["W_hh"]}},
-                    {"binding": 1, "resource": {"buffer": self.params_gpu["W_embed"]}},
-                    {"binding": 2, "resource": {"buffer": dh_ping}},
-                    {"binding": 3, "resource": {"buffer": h_history_gpu}},
-                    {"binding": 4, "resource": {"buffer": self.grads_gpu["W_xh"]}},
-                    {"binding": 5, "resource": {"buffer": self.grads_gpu["W_hh"]}},
-                    {"binding": 6, "resource": {"buffer": self.grads_gpu["b_h"]}},
-                    {"binding": 7, "resource": {"buffer": dh_pong}},
-                    {"binding": 8, "resource": {"buffer": dh_raw_gpu}},
-                    {"binding": 9, "resource": {"buffer": corpus_gpu}},
-                    {"binding": 10, "resource": {"buffer": uniform_buffer_bptt}},
-                ],
+            # BPTT Step
+            self._dispatch_compute_job(
+                command_encoder,
+                "bptt_step",
+                uniform_data=uniform_data_bptt,
+                workgroups_x=math.ceil(H / 64),
+                pre_created_bind_group=current_bg,
             )
 
-            compute_pass = command_encoder.begin_compute_pass()
-            compute_pass.set_pipeline(self.pipelines["bptt_step"])
-            compute_pass.set_bind_group(0, bg_bptt)
-            compute_pass.dispatch_workgroups(math.ceil(H / 64))
-            compute_pass.end()
-
-            uniform_data_embed = np.array([H, E, V, offset + t], dtype=np.uint32)
-            uniform_buffer_embed = device.create_buffer_with_data(
-                data=uniform_data_embed, usage=wgpu.BufferUsage.UNIFORM
+            # DX_EMBED_UPDATE Step
+            self._dispatch_compute_job(
+                command_encoder,
+                "dx_embed_update",
+                uniform_data=np.array(
+                    [H, self.embedding_dim, V, offset + t], dtype=np.uint32
+                ),
+                workgroups_x=math.ceil(self.embedding_dim / 64),
+                overrides={"corpus_gpu": corpus_gpu},
             )
-            bg_embed = device.create_bind_group(
-                layout=self.bgls["dx_embed_update"],
-                entries=[
-                    {"binding": 0, "resource": {"buffer": self.params_gpu["W_xh"]}},
-                    {"binding": 1, "resource": {"buffer": dh_raw_gpu}},
-                    {"binding": 2, "resource": {"buffer": self.grads_gpu["W_embed"]}},
-                    {"binding": 3, "resource": {"buffer": corpus_gpu}},
-                    {"binding": 4, "resource": {"buffer": uniform_buffer_embed}},
-                ],
-            )
-            compute_pass = command_encoder.begin_compute_pass()
-            compute_pass.set_pipeline(self.pipelines["dx_embed_update"])
-            compute_pass.set_bind_group(0, bg_embed)
-            compute_pass.dispatch_workgroups(math.ceil(E / 64))
-            compute_pass.end()
 
-            dh_ping, dh_pong = dh_pong, dh_ping
+            current_bg = bg_bptt_b if current_bg == bg_bptt_a else bg_bptt_a
 
-        device.queue.submit([command_encoder.finish()])
+        self.device.queue.submit([command_encoder.finish()])
+
+    # ----------------------------------------------------------------------
+    # 6. UPDATE WEIGHTS (CLEANED LOOP)
+    # ----------------------------------------------------------------------
 
     def update_weights(self, learning_rate):
-        command_encoder = device.create_command_encoder()
+        command_encoder = self.device.create_command_encoder()
+
         uniform_data = np.array([learning_rate], dtype=np.float32)
-        uniform_buffer = device.create_buffer_with_data(
-            data=uniform_data, usage=wgpu.BufferUsage.UNIFORM
+        update_weights_uniform_buffer = self.uniform_buffers["update_weights"]
+        self.device.queue.write_buffer(
+            update_weights_uniform_buffer, 0, uniform_data.tobytes()
         )
 
-        for name, param_buf in self.params_gpu.items():
-            grad_buf = self.grads_gpu[name]
-            bind_group = device.create_bind_group(
-                layout=self.bgls["update_weights"],
-                entries=[
-                    {"binding": 0, "resource": {"buffer": param_buf}},
-                    {"binding": 1, "resource": {"buffer": grad_buf}},
-                    {"binding": 2, "resource": {"buffer": uniform_buffer}},
-                ],
-            )
-            compute_pass = command_encoder.begin_compute_pass()
-            compute_pass.set_pipeline(self.pipelines["update_weights"])
-            compute_pass.set_bind_group(0, bind_group)
-            compute_pass.dispatch_workgroups(math.ceil(param_buf.size / 4 / 256))
-            compute_pass.end()
-        device.queue.submit([command_encoder.finish()])
+        # The GRAD_MAP must be replicated or the gradient names used must be derived
+        # based on the static names. Since the params are fixed, we use a simple list
+        # based on the fixed keys (W_embed, dW_embed, W_xh, dW_xh, etc.).
+        GRAD_MAP = {
+            "W_embed": "dW_embed",
+            "W_xh": "dW_xh",
+            "W_hh": "dW_hh",
+            "W_hy": "dW_hy",
+            "b_h": "db_h",
+            "b_y": "db_y",
+        }
 
+        for name in self.params:
+            param_buf = self.params_gpu[name]
+
+            # Use the explicit map from __init__
+            grad_name = GRAD_MAP[name]
+            grad_buf = self.grads_gpu[grad_name]
+
+            self._dispatch_compute_job(
+                command_encoder,
+                "update_weights",
+                uniform_data=None,
+                workgroups_x=math.ceil(param_buf.size / 4 / 256),
+                overrides={"param_buf": param_buf, "grad_buf": grad_buf},
+            )
+
+        self.device.queue.submit([command_encoder.finish()])
+
+    # ----------------------------------------------------------------------
+    # 7. GENERATE STEP (CLEANED LOOPS - UNCHANGED FROM PREVIOUS REFACTOR)
+    # ----------------------------------------------------------------------
     def forward_step(self, input_idx, h_gpu):
         H, E, V = self.hidden_size, self.embedding_dim, self.vocab_size
-        device.queue.write_buffer(
+        self.device.queue.write_buffer(
             self.gen_input, 0, np.array([input_idx], dtype=np.uint32)
         )
-        command_encoder = device.create_command_encoder()
-        uniform_data = np.array([H, E, V, 0], dtype=np.uint32)
-        uniform_buffer = device.create_buffer_with_data(
-            data=uniform_data, usage=wgpu.BufferUsage.UNIFORM
+        command_encoder = self.device.create_command_encoder()
+
+        # 1. Forward Pass RNN Step
+        self._dispatch_compute_job(
+            command_encoder,
+            "rnn_step",
+            uniform_data=np.array([H, E, V, 0], dtype=np.uint32),
+            workgroups_x=math.ceil(H / 64),
+            overrides={
+                "h_in": h_gpu,
+                "h_out": self.gen_h_out,
+                "corpus_gpu": self.gen_input,
+            },
         )
-        bind_group = device.create_bind_group(
-            layout=self.bgls["rnn_step"],
-            entries=[
-                {"binding": 0, "resource": {"buffer": self.params_gpu["W_embed"]}},
-                {"binding": 1, "resource": {"buffer": self.params_gpu["W_xh"]}},
-                {"binding": 2, "resource": {"buffer": self.params_gpu["W_hh"]}},
-                {"binding": 3, "resource": {"buffer": self.params_gpu["b_h"]}},
-                {"binding": 4, "resource": {"buffer": h_gpu}},
-                {"binding": 5, "resource": {"buffer": self.gen_h_out}},
-                {"binding": 6, "resource": {"buffer": self.gen_input}},
-                {"binding": 7, "resource": {"buffer": uniform_buffer}},
-            ],
-        )
-        compute_pass = command_encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self.pipelines["rnn_step"])
-        compute_pass.set_bind_group(0, bind_group)
-        compute_pass.dispatch_workgroups(math.ceil(H / 64))
-        compute_pass.end()
+
         command_encoder.copy_buffer_to_buffer(self.gen_h_out, 0, h_gpu, 0, h_gpu.size)
-        device.queue.submit([command_encoder.finish()])
+        self.device.queue.submit([command_encoder.finish()])
         return h_gpu
 
     def generate_step(self, input_idx, h_gpu):
         H, V = self.hidden_size, self.vocab_size
-        device.queue.write_buffer(
+        self.device.queue.write_buffer(
             self.gen_input, 0, np.array([input_idx], dtype=np.uint32)
         )
-        command_encoder = device.create_command_encoder()
+        command_encoder = self.device.create_command_encoder()
 
-        uniform_fwd_data = np.array([H, self.embedding_dim, V, 0], dtype=np.uint32)
-        uniform_fwd_buf = device.create_buffer_with_data(
-            data=uniform_fwd_data, usage=wgpu.BufferUsage.UNIFORM
+        # 1. Forward Pass RNN Step
+        self._dispatch_compute_job(
+            command_encoder,
+            "rnn_step",
+            uniform_data=np.array([H, self.embedding_dim, V, 0], dtype=np.uint32),
+            workgroups_x=math.ceil(H / 64),
+            overrides={
+                "h_in": h_gpu,
+                "h_out": self.gen_h_out,
+                "corpus_gpu": self.gen_input,
+            },
         )
-        bg_fwd = device.create_bind_group(
-            layout=self.bgls["rnn_step"],
-            entries=[
-                {"binding": 0, "resource": {"buffer": self.params_gpu["W_embed"]}},
-                {"binding": 1, "resource": {"buffer": self.params_gpu["W_xh"]}},
-                {"binding": 2, "resource": {"buffer": self.params_gpu["W_hh"]}},
-                {"binding": 3, "resource": {"buffer": self.params_gpu["b_h"]}},
-                {"binding": 4, "resource": {"buffer": h_gpu}},
-                {"binding": 5, "resource": {"buffer": self.gen_h_out}},
-                {"binding": 6, "resource": {"buffer": self.gen_input}},
-                {"binding": 7, "resource": {"buffer": uniform_fwd_buf}},
-            ],
-        )
-        compute_pass = command_encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self.pipelines["rnn_step"])
-        compute_pass.set_bind_group(0, bg_fwd)
-        compute_pass.dispatch_workgroups(math.ceil(H / 64))
-        compute_pass.end()
         command_encoder.copy_buffer_to_buffer(self.gen_h_out, 0, h_gpu, 0, h_gpu.size)
 
-        logits_gpu = device.create_buffer(size=V * 4, usage=wgpu.BufferUsage.STORAGE)
-        uniform_logits_data = np.array([H, V], dtype=np.uint32)
-        uniform_logits_buf = device.create_buffer_with_data(
-            data=uniform_logits_data, usage=wgpu.BufferUsage.UNIFORM
+        # 2. Final Logits
+        self._dispatch_compute_job(
+            command_encoder,
+            "final_logits",
+            uniform_data=np.array([H, V], dtype=np.uint32),
+            workgroups_x=math.ceil(V / 64),
+            overrides={"h_in": h_gpu, "logits_out": self.logits_gpu},
         )
-        bg_logits = device.create_bind_group(
-            layout=self.bgls["final_logits"],
-            entries=[
-                {"binding": 0, "resource": {"buffer": self.params_gpu["W_hy"]}},
-                {"binding": 1, "resource": {"buffer": self.params_gpu["b_y"]}},
-                {"binding": 2, "resource": {"buffer": h_gpu}},
-                {"binding": 3, "resource": {"buffer": logits_gpu}},
-                {"binding": 4, "resource": {"buffer": uniform_logits_buf}},
-            ],
-        )
-        compute_pass = command_encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self.pipelines["final_logits"])
-        compute_pass.set_bind_group(0, bg_logits)
-        compute_pass.dispatch_workgroups(math.ceil(V / 64))
-        compute_pass.end()
 
-        probs_gpu = device.create_buffer(size=V * 4, usage=wgpu.BufferUsage.STORAGE)
-        temp_softmax_gpu = device.create_buffer(
-            size=2 * 4, usage=wgpu.BufferUsage.STORAGE
-        )
+        # 3. Softmax
         uniform_softmax_data = np.array([V], dtype=np.uint32)
-        uniform_softmax_buf = device.create_buffer_with_data(
-            data=uniform_softmax_data, usage=wgpu.BufferUsage.UNIFORM
+        bg_softmax = self._create_bind_group("softmax")
+
+        self.device.queue.write_buffer(
+            self.uniform_buffers["softmax"], 0, uniform_softmax_data.tobytes()
         )
-        bg_softmax = device.create_bind_group(
-            layout=self.bgls["softmax"],
-            entries=[
-                {"binding": 0, "resource": {"buffer": logits_gpu}},
-                {"binding": 1, "resource": {"buffer": probs_gpu}},
-                {"binding": 2, "resource": {"buffer": temp_softmax_gpu}},
-                {"binding": 3, "resource": {"buffer": uniform_softmax_buf}},
-            ],
-        )
+
         compute_pass = command_encoder.begin_compute_pass()
         compute_pass.set_pipeline(self.pipelines["softmax_reductions"])
         compute_pass.set_bind_group(0, bg_softmax)
@@ -1036,30 +929,20 @@ class SimpleRNN:
         compute_pass.dispatch_workgroups(math.ceil(V / 256))
         compute_pass.end()
 
+        # 4. Sampling
         rand_u = random.random()
-        out_idx_gpu = device.create_buffer(
-            size=4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
-        )
         uniform_data_sample = np.zeros(2, dtype=np.uint32)
         uniform_data_sample[0] = V
         uniform_data_sample.view(np.float32)[1] = rand_u
-        uniform_sample_buf = device.create_buffer_with_data(
-            data=uniform_data_sample, usage=wgpu.BufferUsage.UNIFORM
-        )
-        bg_sample = device.create_bind_group(
-            layout=self.bgls["sampling"],
-            entries=[
-                {"binding": 0, "resource": {"buffer": probs_gpu}},
-                {"binding": 1, "resource": {"buffer": out_idx_gpu}},
-                {"binding": 2, "resource": {"buffer": uniform_sample_buf}},
-            ],
-        )
-        compute_pass = command_encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self.pipelines["sampling"])
-        compute_pass.set_bind_group(0, bg_sample)
-        compute_pass.dispatch_workgroups(1)
-        compute_pass.end()
 
-        device.queue.submit([command_encoder.finish()])
+        self._dispatch_compute_job(
+            command_encoder,
+            "sampling",
+            uniform_data=uniform_data_sample,
+            workgroups_x=1,
+            overrides={"probs_gpu": self.probs_gpu, "out_idx_gpu": self.out_idx_gpu},
+        )
 
-        return device.queue.read_buffer(out_idx_gpu).cast("I")[0]
+        self.device.queue.submit([command_encoder.finish()])
+
+        return self.device.queue.read_buffer(self.out_idx_gpu).cast("I")[0]

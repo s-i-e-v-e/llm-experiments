@@ -11,65 +11,14 @@ import numpy as np
 
 # --- CUSTOM TOKENIZER IMPORTS ---
 from bpe_tokenizer_fast import BPETokenizer
+from char_tokenizer import CharTokenizer
 
-# ==============================================================================
-# TOKENIZER IMPLEMENTATIONS
-# ==============================================================================
-
-
-class CharTokenizer:
-    """A simple, pedagogical character-level tokenizer."""
-
-    def __init__(self):
-        self.char_to_int = {}
-        self.int_to_char = {}
-
-    @property
-    def vocab_size(self):
-        return len(self.char_to_int)
-
-    def train(self, text: str, **kwargs):
-        """Builds the vocabulary from the unique characters in the text."""
-        chars = sorted(list(set(text)))
-        self.char_to_int = {ch: i for i, ch in enumerate(chars)}
-        self.int_to_char = {i: ch for i, ch in enumerate(chars)}
-        print(
-            f"INFO: Character tokenizer created with {self.vocab_size} unique characters."
-        )
-
-    def encode(self, text: str) -> list[int]:
-        """Encodes a string into a list of character indices."""
-        return [self.char_to_int.get(ch, -1) for ch in text if ch in self.char_to_int]
-
-    def decode(self, ids: list[int]) -> str:
-        """Decodes a list of indices back into a string."""
-        return "".join([self.int_to_char.get(i, "") for i in ids])
-
-    def save(self, filepath: str):
-        """Saves the character-to-index map to a JSON file."""
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(self.char_to_int, f)
-        print(f"INFO: Character tokenizer vocabulary saved to '{filepath}'")
-
-    @classmethod
-    def load(cls, filepath: str):
-        """Loads a character tokenizer from a saved vocabulary file."""
-        tokenizer = cls()
-        with open(filepath, "r", encoding="utf-8") as f:
-            tokenizer.char_to_int = json.load(f)
-        tokenizer.int_to_char = {i: ch for ch, i in tokenizer.char_to_int.items()}
-        print(f"INFO: Character tokenizer loaded from '{filepath}'")
-        return tokenizer
-
-
-# A dictionary to map the CLI choice to the correct tokenizer class
 TOKENIZER_CLASSES = {"char": CharTokenizer, "bpe": BPETokenizer}
+
 
 # ==============================================================================
 # DATA PREPARATION
 # ==============================================================================
-
-
 def load_corpus(filepath: str) -> str:
     """Reads the entire text content from a file."""
     print(f"INFO: Loading corpus from '{filepath}'...")
@@ -198,7 +147,7 @@ def train_command(args, rnn_math):
     print(f"Using tokenizer: {args.tokenizer}")
     print(f"Corpus tokenized into {data_size} tokens.")
 
-    smooth_loss = -math.log(1.0 / vocab_size) * args.context_length
+    smooth_loss = -math.log(1.0 / vocab_size)
     h_state_gpu = model.get_initial_hidden_state_gpu()
     last_log_time = time.time()
     steps_since_log = 0
@@ -210,6 +159,7 @@ def train_command(args, rnn_math):
         for step in range(steps_in_epoch):
             if p + args.context_length + 1 >= data_size:
                 break
+            model.reset_gradients_gpu(model.gradient_buffers)
             target_idx = vectorized_corpus[p + args.context_length]
             logits_gpu, h_history_gpu = model.forward_sequence(
                 corpus_gpu, h_state_gpu, p, args.context_length
@@ -222,14 +172,22 @@ def train_command(args, rnn_math):
                 logits_gpu,
                 h_history_gpu,
             )
+
             model.update_weights(args.learning_rate)
             model.update_hidden_state(h_source=h_history_gpu, h_dest=h_state_gpu)
             p += args.context_length
             steps_since_log += 1
             current_time = time.time()
             if current_time - last_log_time >= 1.0:
-                loss = model.calculate_loss_gpu(logits_gpu, target_idx)
+                # single token loss
+                # loss = model.calculate_loss_gpu(logits_gpu, target_idx)
+
+                # Calculate average loss over the entire sequence
+                loss = model.calculate_sequence_loss(
+                    corpus_gpu, h_state_gpu, p, args.context_length
+                )
                 smooth_loss = smooth_loss * 0.999 + loss * 0.001
+
                 elapsed_time = current_time - last_log_time
                 steps_per_second = steps_since_log / elapsed_time
                 progress = (

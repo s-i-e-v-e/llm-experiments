@@ -1,0 +1,10 @@
+#!/bin/sh
+BACKEND=numpy
+TOKENIZER=bpe
+EPOCHS=1
+EMBEDDING_DIM=32
+CONTEXT_LENGTH=8
+HIDDEN_SIZE=32
+LEARNING_RATE=0.1
+
+uv run main.py --backend $BACKEND --tokenizer $TOKENIZER train data/sherlock.txt --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --context-length $CONTEXT_LENGTH --hidden-size $HIDDEN_SIZE --learning-rate $LEARNING_RATE
