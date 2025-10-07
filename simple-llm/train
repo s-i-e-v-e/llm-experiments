@@ -1,10 +1,12 @@
 #!/bin/sh
+export OPENBLAS_NUM_THREADS=12
 BACKEND=numpy
-TOKENIZER=bpe
 EPOCHS=1
-EMBEDDING_DIM=32
-CONTEXT_LENGTH=8
-HIDDEN_SIZE=32
-LEARNING_RATE=0.1
+EMBEDDING_DIM=256
+CONTEXT_LENGTH=512
+HEADS=16
+LAYERS=8
+BATCH_SIZE=16
+LEARNING_RATE=0.00005
 
-uv run main.py --backend $BACKEND --tokenizer $TOKENIZER train data/sherlock.txt --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --context-length $CONTEXT_LENGTH --hidden-size $HIDDEN_SIZE --learning-rate $LEARNING_RATE
+uv run main.py --backend $BACKEND --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE data/sherlock.txt

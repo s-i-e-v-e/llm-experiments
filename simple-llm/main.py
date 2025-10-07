@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-import argparse
-import importlib
 import json
 import math
 import os
@@ -9,374 +7,255 @@ import time
 
 import numpy as np
 
-# --- CUSTOM TOKENIZER IMPORTS ---
 from bpe_tokenizer_fast import BPETokenizer
-from char_tokenizer import CharTokenizer
-
-TOKENIZER_CLASSES = {"char": CharTokenizer, "bpe": BPETokenizer}
+from transformer import numpy_math
 
 
-# ==============================================================================
-# DATA PREPARATION
-# ==============================================================================
-def load_corpus(filepath: str) -> str:
-    """Reads the entire text content from a file."""
-    print(f"INFO: Loading corpus from '{filepath}'...")
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        print(f"ERROR: File not found at '{filepath}'", file=sys.stderr)
-        sys.exit(1)
+def load_corpus(file_path):
+    """Load text corpus from file"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
-def save_model_config(model_config: dict, output_dir: str):
-    """Saves model configuration for inspection and reuse."""
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+def save_model_config(config, output_dir):
+    """Save model configuration"""
     config_path = os.path.join(output_dir, "model_config.json")
     with open(config_path, "w") as f:
-        json.dump(model_config, f, indent=2)
-    print(f"INFO: Saved model configuration to '{config_path}'")
+        json.dump(config, f, indent=2)
 
 
-# ==============================================================================
-# SUB-COMMAND FUNCTIONS
-# ==============================================================================
+def train_command(args):
+    """Main training function for transformer"""
 
+    # Create output directory
+    os.makedirs("out", exist_ok=True)
 
-def train_tokenizer_command(args):
-    """Trains a new tokenizer from a text file."""
-    if args.tokenizer == "char":
-        print(
-            "INFO: The 'char' tokenizer does not require a separate training step.",
-            file=sys.stderr,
-        )
-        print(
-            "It is built automatically during model training if a vocab file is not found.",
-            file=sys.stderr,
-        )
-        return
+    # Load or train tokenizer
+    corpus_text = load_corpus(args.input_file)
+    print(f"Loaded corpus: {len(corpus_text)} characters")
 
-    corpus = load_corpus(args.input_file)
-    tokenizer = TOKENIZER_CLASSES[args.tokenizer]()
+    tokenizer = BPETokenizer()
 
-    print(f"\n--- Training {args.tokenizer.upper()} Tokenizer ---")
-    print(f"Target vocabulary size: {args.vocab_size}")
-
-    # Pass vocab_size for BPE training
-    tokenizer.train(
-        corpus, vocab_size=args.vocab_size, verbose=True, token_file=args.tokenizer_path
-    )
-
-
-def train_command(args, rnn_math):
-    """Main model training function."""
-    corpus = load_corpus(args.input_file)
-    output_dir = os.path.dirname(args.model_path)
-
-    # --- Dynamically load or train the selected tokenizer ---
-    try:
-        tokenizer = TOKENIZER_CLASSES[args.tokenizer].load(args.tokenizer_path)
-    except FileNotFoundError:
-        if args.tokenizer == "char":
-            print(
-                f"INFO: Tokenizer file not found at '{args.tokenizer_path}'. Training a new 'char' tokenizer from the corpus."
-            )
-            tokenizer = CharTokenizer()
-            tokenizer.train(corpus, args.tokenizer_path)
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-        else:
-            print(
-                f"ERROR: Tokenizer file not found at '{args.tokenizer_path}'.",
-                file=sys.stderr,
-            )
-            print(
-                f"Please train a '{args.tokenizer}' tokenizer first using the 'train-tokenizer' command.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    if os.path.exists(args.tokenizer_path):
+        print(f"Loading tokenizer from {args.tokenizer_path}")
+        tokenizer = BPETokenizer.load(args.tokenizer_path)
+    else:
+        print(f"Training new BPE tokenizer with vocab_size {args.vocab_size}")
+        tokenizer.train(corpus_text, args.vocab_size, args.tokenizer_path, verbose=True)
 
     vocab_size = tokenizer.vocab_size
+    print(f"Tokenizer vocab size: {vocab_size}")
+
+    # Encode corpus
+    print("Encoding corpus...")
+    corpus_tokens = np.array(
+        tokenizer.encode(corpus_text, args.tokenizer_path), dtype=np.uint32
+    )
+    print(f"Tokenized corpus: {len(corpus_tokens)} tokens")
+
+    # Model configuration
     model_config = {
         "vocab_size": vocab_size,
-        "hidden_size": args.hidden_size,
-        "embedding_dim": args.embedding_dim,
-        "context_length": args.context_length,
+        "d_model": args.embedding_dim,
+        "n_heads": args.n_heads,
+        "n_layers": args.n_layers,
+        "max_seq_len": args.context_length,
         "learning_rate": args.learning_rate,
         "epochs": args.epochs,
     }
-    save_model_config(model_config, output_dir)
 
-    # --- LOGIC TO RESUME OR CREATE A NEW MODEL ---
+    save_model_config(model_config, "out")
+
+    # Initialize model
     if args.resume and os.path.exists(args.model_path):
-        print(f"\n--- Resuming Training from '{args.model_path}' ---")
-        model = rnn_math.SimpleRNN.load_model(args.model_path)
-        # Verify that the loaded model config matches the current settings
-        if (
-            model.vocab_size != vocab_size
-            or model.hidden_size != args.hidden_size
-            or model.embedding_dim != args.embedding_dim
-        ):
-            print(
-                "WARNING: Model architecture in the saved file does not match current settings.",
-                file=sys.stderr,
-            )
-            print(
-                "         This may lead to errors or unexpected behavior.",
-                file=sys.stderr,
-            )
+        print(f"Resuming training from {args.model_path}")
+        model = numpy_math.NumpyTransformer.load_model(args.model_path)
     else:
-        if args.resume:
-            print(
-                f"INFO: --resume flag was given, but no model found at '{args.model_path}'."
-            )
-        print("\n--- Starting New Model Training ---")
-        model = rnn_math.SimpleRNN(vocab_size, args.hidden_size, args.embedding_dim)
-    vectorized_corpus = np.array(
-        tokenizer.encode(corpus, token_file=args.tokenizer_path), dtype=np.uint32
-    )
+        print("Initializing new transformer model")
+        model = numpy_math.NumpyTransformer(
+            vocab_size=vocab_size,
+            d_model=args.embedding_dim,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            max_seq_len=args.context_length,
+        )
 
-    corpus_gpu = model.device.create_buffer_with_data(
-        data=vectorized_corpus, usage=rnn_math.STORAGE_BUFFER_USAGE
-    )
-    data_size = len(vectorized_corpus)
+    batch_size = args.batch_size  # e.g., 32, 64, 128
 
-    print(f"Using math backend: {args.backend}_math")
-    print(f"Using tokenizer: {args.tokenizer}")
-    print(f"Corpus tokenized into {data_size} tokens.")
+    # Training parameters
+    data_size = len(corpus_tokens)
+    seq_length = args.context_length
+    total_steps = (data_size - 1) // seq_length // args.batch_size
+    steps_per_epoch = total_steps // args.epochs if args.epochs > 0 else total_steps
 
+    warmup_steps = 1000
+    max_lr = args.learning_rate
+
+    print("\nTraining parameters:")
+    print(f"  Sequence length: {seq_length}")
+    print(f"  Total tokens: {data_size}")
+    print(f"  Total steps: {total_steps}")
+    print(f"  Steps per epoch: {steps_per_epoch}")
+    print(f"  Model dimensions: {args.embedding_dim}")
+    print(f"  Number of heads: {args.n_heads}")
+    print(f"  Number of layers: {args.n_layers}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Learning rate: {args.learning_rate}")
+
+    # Initialize smooth loss
     smooth_loss = -math.log(1.0 / vocab_size)
-    h_state_gpu = model.get_initial_hidden_state_gpu()
-    last_log_time = time.time()
-    steps_since_log = 0
+    start_time = time.time()
+    global_step = 0
 
     for epoch in range(args.epochs):
-        model.zero_buffer(h_state_gpu)
-        p = 0
-        steps_in_epoch = (data_size - 1) // args.context_length
-        for step in range(steps_in_epoch):
-            if p + args.context_length + 1 >= data_size:
-                break
-            model.reset_gradients_gpu(model.gradient_buffers)
-            target_idx = vectorized_corpus[p + args.context_length]
-            logits_gpu, h_history_gpu = model.forward_sequence(
-                corpus_gpu, h_state_gpu, p, args.context_length
-            )
-            model.backward_sequence(
-                corpus_gpu,
-                p,
-                args.context_length,
-                target_idx,
-                logits_gpu,
-                h_history_gpu,
-            )
+        epoch_loss = 0
+        steps_in_epoch = 0
 
-            model.update_weights(args.learning_rate)
-            model.update_hidden_state(h_source=h_history_gpu, h_dest=h_state_gpu)
-            p += args.context_length
-            steps_since_log += 1
-            current_time = time.time()
-            if current_time - last_log_time >= 1.0:
-                # single token loss
-                # loss = model.calculate_loss_gpu(logits_gpu, target_idx)
+        for step in range(steps_per_epoch):
+            # Create batch of sequences
+            batch_tokens = []
+            batch_targets = []
 
-                # Calculate average loss over the entire sequence
-                loss = model.calculate_sequence_loss(
-                    corpus_gpu, h_state_gpu, p, args.context_length
-                )
-                smooth_loss = smooth_loss * 0.999 + loss * 0.001
+            for i in range(batch_size):
+                offset = (step * batch_size + i) * seq_length
 
-                elapsed_time = current_time - last_log_time
-                steps_per_second = steps_since_log / elapsed_time
-                progress = (
-                    f"Epoch {epoch + 1}/{args.epochs}, Step {step}/{steps_in_epoch}"
-                )
+                if offset + seq_length + 1 >= data_size:
+                    # If we run out of data, wrap around or break
+                    offset = (i * seq_length) % (data_size - seq_length - 1)
+
+                tokens = corpus_tokens[offset : offset + seq_length]
+                targets = corpus_tokens[offset + 1 : offset + seq_length + 1]
+
+                batch_tokens.append(tokens)
+                batch_targets.append(targets)
+
+            # Convert to numpy arrays
+            batch_tokens = np.array(
+                batch_tokens, dtype=np.uint32
+            )  # [batch_size, seq_len]
+            batch_targets = np.array(
+                batch_targets, dtype=np.uint32
+            )  # [batch_size, seq_len]
+
+            # Forward pass (now with batch)
+            logits = model.forward(batch_tokens)  # [batch_size, seq_len, vocab_size]
+
+            # Calculate loss (averaged over batch and sequence)
+            loss = model.calculate_loss(logits, batch_targets)
+            epoch_loss += loss
+            smooth_loss = smooth_loss * 0.999 + loss * 0.001
+
+            # Backward pass
+            d_logits = model.get_loss_gradient(logits, batch_targets)
+            model.backward(d_logits)
+
+            # Learning rate warmup
+            current_lr = max_lr * min(1.0, (global_step + 1) / warmup_steps)
+
+            # Update weights
+            model.update_weights(current_lr)
+
+            steps_in_epoch += 1
+            global_step += 1
+
+            # Progress reporting
+            if global_step % 2 == 0:
+                elapsed = time.time() - start_time
+                steps_per_sec = global_step / elapsed if elapsed > 0 else 0
+                tokens_per_sec = (batch_size * seq_length * global_step) / elapsed
+
                 sys.stdout.write(
-                    f"\r{progress} | Smooth Loss: {smooth_loss:.4f} | SPS: {steps_per_second:.2f}   "
+                    f"\rEpoch {epoch + 1}/{args.epochs}, Step {global_step} | "
+                    f"Loss: {loss:.4f} | Smooth: {smooth_loss:.4f} | "
+                    f"LR: {current_lr:.6f} | TPS: {tokens_per_sec:.0f}"
                 )
                 sys.stdout.flush()
-                last_log_time = current_time
-                steps_since_log = 0
 
-    print("\n--- Training Finished ---")
+        # End of epoch
+        avg_epoch_loss = epoch_loss / steps_in_epoch if steps_in_epoch > 0 else 0
+        print(f"\nEpoch {epoch + 1} completed. Average loss: {avg_epoch_loss:.4f}")
+
+        # Save checkpoint and generate sample
+        model.save_model(args.model_path)
+        generate_sample(model, tokenizer, "The mystery", length=50)
+
+    print("Training completed!")
     model.save_model(args.model_path)
 
 
-def generate_command(args, rnn_math):
-    """Main generation function."""
-    try:
-        tokenizer = TOKENIZER_CLASSES[args.tokenizer].load(args.tokenizer_path)
-    except FileNotFoundError:
-        print(
-            f"ERROR: Tokenizer file not found at '{args.tokenizer_path}'.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+def generate_sample(model, tokenizer, prompt_text, length=100):
+    """Generate text sample from model"""
+    # Encode prompt
+    prompt_tokens = tokenizer.encode(prompt_text)
+    current_tokens = np.array(prompt_tokens, dtype=np.uint32)
 
-    model = rnn_math.SimpleRNN.load_model(args.model_path)
-    print(f"--- Generating {args.length} tokens from seed: '{args.prompt}' ---")
+    generated_tokens = []
 
-    h_gpu = model.get_initial_hidden_state_gpu()
-    input_ids = tokenizer.encode(args.prompt, args.tokenizer_path)
-    for token_id in input_ids:
-        model.forward_step(token_id, h_gpu)
+    for i in range(length):
+        # Ensure we don't exceed max sequence length
+        if len(current_tokens) > model.max_seq_len:
+            current_tokens = current_tokens[-model.max_seq_len :]
 
-    input_idx = input_ids[-1] if input_ids else 0
-    generated_ids = list(input_ids)
-    for _ in range(args.length):
-        next_idx = model.generate_step(input_idx, h_gpu)
-        generated_ids.append(next_idx)
-        input_idx = next_idx
+        # Forward pass
+        batch_tokens = current_tokens.reshape(1, -1)
+        logits = model.forward(batch_tokens)
 
-    generated_text = tokenizer.decode(generated_ids)
-    print("\n" + generated_text)
+        # Get next token probabilities (last position)
+        next_logits = logits[0, -1, :]
+        probs = softmax(next_logits)
 
+        # Sample from distribution (you can use temperature sampling here)
+        next_token = np.random.choice(model.vocab_size, p=probs)
+        generated_tokens.append(next_token)
+        current_tokens = np.append(current_tokens, next_token)
 
-# ==============================================================================
-# CLI ORCHESTRATION
-# ==============================================================================
+    # Decode tokens back to text
+    generated_text = tokenizer.decode(generated_tokens)
+    return generated_text
 
 
-def main():
-    # Main parser
-    parser = argparse.ArgumentParser(
-        description="A pedagogical, modular RNN for text generation.",
-        formatter_class=argparse.RawTextHelpFormatter,
-    )
-
-    # Global arguments applicable to all sub-commands
-    parser.add_argument(
-        "--backend",
-        choices=["pure", "numpy", "wgpu"],
-        default="numpy",
-        help="The math backend to use for computation.",
-    )
-    parser.add_argument(
-        "--tokenizer",
-        choices=["char", "bpe"],
-        default="bpe",
-        help="The type of tokenizer to use.",
-    )
-
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # --- "train-tokenizer" command ---
-    tt_parser = subparsers.add_parser(
-        "train-tokenizer", help="Train a BPE tokenizer from a text file."
-    )
-    tt_parser.add_argument(
-        "input_file", type=str, help="Path to the training text file."
-    )
-    tt_parser.add_argument(
-        "--tokenizer-path",
-        type=str,
-        default="out/tokenizer.json",
-        help="Path to save the trained tokenizer.",
-    )
-    tt_parser.add_argument(
-        "--vocab-size",
-        type=int,
-        default=1000,
-        help="Target vocabulary size (for BPE).",
-    )
-    tt_parser.set_defaults(func=train_tokenizer_command)
-
-    # --- "train" command ---
-    train_parser = subparsers.add_parser(
-        "train", help="Train a new model on a text file."
-    )
-    train_parser.add_argument(
-        "input_file", type=str, help="Path to the training text file."
-    )
-    train_parser.add_argument(
-        "--tokenizer-path",
-        type=str,
-        default="out/tokenizer.json",
-        help="Path to the tokenizer file.",
-    )
-    train_parser.add_argument(
-        "--model-path",
-        type=str,
-        default="out/model.json",
-        help="Path to save the trained model.",
-    )
-    train_parser.add_argument(
-        "--epochs", type=int, default=5, help="Number of training epochs."
-    )
-    train_parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=256,
-        help="Number of neurons in the hidden layer.",
-    )
-    train_parser.add_argument(
-        "--embedding-dim", type=int, default=128, help="Dimension of token embeddings."
-    )
-    train_parser.add_argument(
-        "--context-length",
-        type=int,
-        default=256,
-        help="Length of the sequence for backpropagation.",
-    )
-    train_parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=0.001,
-        help="Learning rate for the optimizer.",
-    )
-    # --- THIS IS THE NEW ARGUMENT ---
-    train_parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume training from the model specified in --model-path.",
-    )
-
-    # --- "generate" command ---
-    gen_parser = subparsers.add_parser(
-        "generate", help="Generate text using a trained model."
-    )
-    gen_parser.add_argument(
-        "prompt", type=str, help="The initial string to start generation."
-    )
-    gen_parser.add_argument(
-        "--tokenizer-path",
-        type=str,
-        default="out/tokenizer.json",
-        help="Path to the tokenizer file.",
-    )
-    gen_parser.add_argument(
-        "--model-path",
-        type=str,
-        default="out/model.json",
-        help="Path to the trained model file.",
-    )
-    gen_parser.add_argument(
-        "--length", type=int, default=100, help="Number of new tokens to generate."
-    )
-
-    args = parser.parse_args()
-
-    # --- DYNAMICALLY LOAD THE MATH BACKEND ---
-    try:
-        backend_module_name = f"{args.backend}_math"
-        rnn_math = importlib.import_module(backend_module_name)
-    except ImportError:
-        print(
-            f"ERROR: Could not import the math backend '{backend_module_name}'.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # --- ROUTE TO THE CORRECT SUB-COMMAND FUNCTION ---
-    if args.command == "train-tokenizer":
-        train_tokenizer_command(args)
-    elif args.command == "train":
-        train_command(args, rnn_math)
-    elif args.command == "generate":
-        generate_command(args, rnn_math)
+def softmax(x):
+    """Softmax function"""
+    exp_x = np.exp(x - np.max(x))
+    return exp_x / np.sum(exp_x)
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train Transformer Model")
+    parser.add_argument("--backend", default="numpy", help="Backend to use")
+    parser.add_argument("train", action="store_true", help="Training mode")
+    parser.add_argument("input_file", help="Input text file")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
+    parser.add_argument(
+        "--embedding-dim", type=int, default=128, help="Embedding dimension"
+    )
+    parser.add_argument(
+        "--context-length", type=int, default=256, help="Context length"
+    )
+    parser.add_argument(
+        "--n-heads", type=int, default=8, help="Number of attention heads"
+    )
+    parser.add_argument(
+        "--n-layers", type=int, default=6, help="Number of transformer layers"
+    )
+    parser.add_argument(
+        "--learning-rate", type=float, default=0.001, help="Learning rate"
+    )
+    parser.add_argument(
+        "--vocab-size", type=int, default=5000, help="Vocabulary size for BPE"
+    )
+    parser.add_argument(
+        "--model-path", default="out/model.json", help="Model save path"
+    )
+    parser.add_argument(
+        "--tokenizer-path", default="out/tokenizer.json", help="Tokenizer path"
+    )
+    parser.add_argument("--resume", action="store_true", help="Resume training")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+
+    args = parser.parse_args()
+
+    if args.train:
+        train_command(args)
