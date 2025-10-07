@@ -7,6 +7,8 @@ CONTEXT_LENGTH=512
 HEADS=16
 LAYERS=8
 BATCH_SIZE=16
-LEARNING_RATE=0.00005
-
-uv run main.py --backend $BACKEND --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE data/sherlock.txt
+LEARNING_RATE=0.001
+VOCAB=1000
+RESUME=
+RESUME=--resume
+uv run main.py $RESUME --backend $BACKEND --vocab-size $VOCAB --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE data/sherlock_red.txt
