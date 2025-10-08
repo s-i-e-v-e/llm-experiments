@@ -16,3 +16,22 @@ def run_command_simple(cmd, input_text=None):
     )
 
     return result.stdout
+
+
+MODEL_CONFIG_FILE = "model_config.json"
+MODEL_WEIGHTS_FILE = "model.jax"
+TOKENIZER_FILE = "tokenizer.json"
+
+import os
+
+
+def get_tokenizer_path(model_path: str):
+    return os.path.join(model_path, TOKENIZER_FILE)
+
+
+def get_model_config_path(model_path: str):
+    return os.path.join(model_path, MODEL_CONFIG_FILE)
+
+
+def get_model_weights_path(model_path: str):
+    return os.path.join(model_path, MODEL_WEIGHTS_FILE)

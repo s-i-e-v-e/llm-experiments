@@ -10,4 +10,4 @@ BATCH_SIZE=16
 LEARNING_RATE=0.001
 VOCAB=1000
 RESUME=--resume
-uv run main.py train $RESUME --model-path out/m3 --backend $BACKEND --vocab-size $VOCAB --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE data/sherlock_red_2.txt
+uv run main.py train $RESUME --model-path out/$1 --backend $BACKEND --vocab-size $VOCAB --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE data/sherlock_red_2.txt

@@ -1,10 +1,14 @@
+import os
 from functools import partial
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import optax
+from flax import serialization
 from jax import jit, lax, random, value_and_grad
+
+from util import get_model_weights_path
 
 # --- UTILITY FUNCTIONS ---
 
@@ -13,6 +17,47 @@ def get_causal_mask(seq_len):
     """Create causal mask for decoder, compatible with JAX einsum/where."""
     mask = jnp.triu(jnp.ones((seq_len, seq_len)), k=1)
     return mask * -1e9
+
+
+def model_save(params, model_path):
+    """Save model using Flax's efficient binary format"""
+    try:
+        file = get_model_weights_path(model_path)
+        os.makedirs(os.path.dirname(file), exist_ok=True)
+        with open(file, "wb") as f:
+            f.write(serialization.to_bytes(params))
+        print(f"Model saved to {file}")
+    except Exception as e:
+        print(f"Error saving JAX model: {e}")
+
+
+def model_load(model_path):
+    """Load model using Flax's binary format"""
+    try:
+        file = get_model_weights_path(model_path)
+        with open(file, "rb") as f:
+            return serialization.msgpack_restore(f.read())
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"Error loading JAX model: {e}")
+        return None
+
+
+# Create a function to generate batches
+def get_batch(key, X, Y, batch_size, seq_length):
+    key, subkey = random.split(key)
+    """Generate a random batch of data"""
+    # Generate random starting indices
+    start_idxs = random.randint(
+        subkey, shape=(batch_size,), minval=0, maxval=len(X) - seq_length
+    )
+
+    # Create batches
+    batch_X = jnp.stack([X[i : i + seq_length] for i in start_idxs])
+    batch_Y = jnp.stack([Y[i : i + seq_length] for i in start_idxs])
+
+    return key, batch_X, batch_Y
 
 
 # --- JAX/FLAX TRANSFORMER COMPONENTS ---
@@ -175,7 +220,6 @@ def train_step(
     targets,
     model,
     optimizer,  # This is the 5th argument (index 5)
-    learning_rate,
 ):
     """
     Performs one full training step.
@@ -187,7 +231,7 @@ def train_step(
     updates, new_opt_state = optimizer.update(grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
 
-    return new_params, new_opt_state, loss, learning_rate
+    return new_params, new_opt_state, loss
 
 
 @partial(jit, static_argnums=(1, 3, 4, 5, 6, 7, 8, 9))
@@ -304,3 +348,48 @@ def apply_repetition_penalty(logits, use_repetition_penalty, repetition_penalty)
         return logits  # Implement proper repetition penalty based on token history
 
     return lax.cond(use_repetition_penalty, _apply, lambda x: x, logits)
+
+
+import dataclasses
+
+
+@dataclasses.dataclass
+class JaxModel:
+    model: JAXTransformer
+    optimizer: optax.GradientTransformation
+
+
+def model_init(model_config, learning_rate=None):
+    if learning_rate:
+        optimizer = create_optimizer(learning_rate)
+    else:
+        optimizer = None
+
+    model = JAXTransformer(
+        vocab_size=model_config["vocab_size"],
+        d_model=model_config["d_model"],
+        n_heads=model_config["n_heads"],
+        n_layers=model_config["n_layers"],
+        max_seq_len=model_config["max_seq_len"],
+    )
+
+    return JaxModel(model, optimizer)
+
+
+def model_init_2(
+    model_config, model_params, resume, learning_rate, context_length, model_key
+):
+    x_model = model_init(model_config, learning_rate)
+    if resume and model_params is not None:
+        print("Resuming training")
+    else:
+        print("Initializing new JAX/Flax transformer model")
+        dummy_input = jnp.ones((1, context_length), dtype=jnp.int32)
+        initial_vars = x_model.model.init(model_key, dummy_input)
+        model_params = initial_vars["params"]  # Extract params from the variables dict
+    opt_state = x_model.optimizer.init(model_params)
+    return x_model, opt_state, model_params
+
+
+def int_array(xs):
+    return jnp.array(xs, dtype=jnp.int32)

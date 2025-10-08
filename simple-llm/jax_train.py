@@ -4,28 +4,20 @@ import os
 import sys
 import time
 
-import jax.numpy as jnp
-from flax import serialization
 from jax import random
 
 from bpe_tokenizer import BPETokenizer
-from jax_math import JAXTransformer, create_optimizer, generate, train_step
-
-MODEL_CONFIG_FILE = "model_config.json"
-MODEL_WEIGHTS_FILE = "model.jax"
-TOKENIZER_FILE = "tokenizer.json"
-
-
-def get_tokenizer_path(model_path: str):
-    return os.path.join(model_path, TOKENIZER_FILE)
-
-
-def get_model_config_path(model_path: str):
-    return os.path.join(model_path, MODEL_CONFIG_FILE)
-
-
-def get_model_weights_path(model_path: str):
-    return os.path.join(model_path, MODEL_WEIGHTS_FILE)
+from jax_math import (
+    generate,
+    get_batch,
+    int_array,
+    model_init,
+    model_init_2,
+    model_load,
+    model_save,
+    train_step,
+)
+from util import get_model_config_path, get_tokenizer_path
 
 
 def load_corpus(file):
@@ -56,31 +48,6 @@ def save_model_config(config, model_path):
     file = get_model_config_path(model_path)
     with open(file, "w") as f:
         json.dump(config, f, indent=2)
-
-
-def save_jax_model(params, model_path):
-    """Save model using Flax's efficient binary format"""
-    try:
-        file = get_model_weights_path(model_path)
-        os.makedirs(os.path.dirname(file), exist_ok=True)
-        with open(file, "wb") as f:
-            f.write(serialization.to_bytes(params))
-        print(f"Model saved to {file}")
-    except Exception as e:
-        print(f"Error saving JAX model: {e}")
-
-
-def load_jax_model(model_path):
-    """Load model using Flax's binary format"""
-    try:
-        file = get_model_weights_path(model_path)
-        with open(file, "rb") as f:
-            return serialization.msgpack_restore(f.read())
-    except FileNotFoundError:
-        return None
-    except Exception as e:
-        print(f"Error loading JAX model: {e}")
-        return None
 
 
 def load_tokenizer(model_path: str, vocab_size: int = 0, corpus_text: str = ""):
@@ -114,39 +81,23 @@ def train_command_jax(args):
 
     # Encode corpus
     print("Encoding corpus...")
-    corpus_tokens = jnp.array(
-        tokenizer.encode(corpus_text, tokenizer_path), dtype=jnp.int32
-    )
+    corpus_tokens = int_array(tokenizer.encode(corpus_text, tokenizer_path))
     print(f"Tokenized corpus: {len(corpus_tokens)} tokens")
 
-    # JAX initialization
-    key = random.PRNGKey(42)
-    model_key, data_key = random.split(key)
-
-    # Create optimizer
-    optimizer = create_optimizer(args.learning_rate)
+    # Load or initialize model parameters
+    loaded_params = model_load(args.model_path)
 
     model_config = load_model_config(args.model_path, vocab_size, args)
-    model = JAXTransformer(
-        vocab_size=model_config["vocab_size"],
-        d_model=model_config["d_model"],
-        n_heads=model_config["n_heads"],
-        n_layers=model_config["n_layers"],
-        max_seq_len=model_config["max_seq_len"],
+    key = random.PRNGKey(42)
+    model_key, data_key = random.split(key)
+    x_model, opt_state, model_params = model_init_2(
+        model_config,
+        loaded_params,
+        args.resume,
+        args.learning_rate,
+        args.context_length,
+        model_key,
     )
-
-    # Load or initialize model parameters
-    loaded_params = load_jax_model(args.model_path)
-    if args.resume and loaded_params is not None:
-        model_params = loaded_params
-        print(f"Resuming training from {args.model_path}")
-        opt_state = optimizer.init(model_params)
-    else:
-        print("Initializing new JAX/Flax transformer model")
-        dummy_input = jnp.ones((1, args.context_length), dtype=jnp.int32)
-        initial_vars = model.init(model_key, dummy_input)
-        model_params = initial_vars["params"]  # Extract params from the variables dict
-        opt_state = optimizer.init(model_params)
 
     batch_size = args.batch_size
     seq_length = args.context_length
@@ -155,20 +106,6 @@ def train_command_jax(args):
     print("Preparing training data...")
     X = corpus_tokens[:-1]
     Y = corpus_tokens[1:]
-
-    # Create a function to generate batches
-    def get_batch(key, batch_size, seq_length):
-        """Generate a random batch of data"""
-        # Generate random starting indices
-        start_idxs = random.randint(
-            key, shape=(batch_size,), minval=0, maxval=len(X) - seq_length
-        )
-
-        # Create batches
-        batch_X = jnp.stack([X[i : i + seq_length] for i in start_idxs])
-        batch_Y = jnp.stack([Y[i : i + seq_length] for i in start_idxs])
-
-        return batch_X, batch_Y
 
     total_sequences = (len(X) - seq_length) // batch_size
     steps_in_epoch = min(
@@ -187,7 +124,7 @@ def train_command_jax(args):
     print(f"  Steps/Epoch: {steps_in_epoch}")
 
     # Training loop
-    smooth_loss = jnp.array(-math.log(1.0 / vocab_size), dtype=jnp.float32)
+    smooth_loss = -math.log(1.0 / vocab_size)
     start_time = time.time()
 
     global_step = 0
@@ -203,23 +140,22 @@ def train_command_jax(args):
 
         for step in range(steps_in_epoch):
             # Generate random batch
-            data_key, subkey = random.split(data_key)
-            batch_tokens, batch_targets = get_batch(subkey, batch_size, seq_length)
+            data_key, batch_tokens, batch_targets = get_batch(
+                data_key, X, Y, batch_size, seq_length
+            )
 
-            # JAX training step - FIXED: removed unnecessary parameters
-            model_params, opt_state, loss_v, current_lr = train_step(
+            model_params, opt_state, loss_v = train_step(
                 model_params,
                 opt_state,
                 batch_tokens,
                 batch_targets,
-                model,
-                optimizer,
-                args.learning_rate,
+                x_model.model,
+                x_model.optimizer,
             )
 
-            loss_py = loss_v.item()
-            epoch_loss += loss_py
-            smooth_loss = smooth_loss * 0.999 + loss_v * 0.001
+            loss = loss_v.item()
+            epoch_loss += loss
+            smooth_loss = smooth_loss * 0.999 + loss * 0.001
             global_step += 1
 
             # Progress reporting
@@ -229,12 +165,12 @@ def train_command_jax(args):
 
                 sys.stdout.write(
                     f"\rEpoch {epoch + 1}/{args.epochs}, Step {step}/{steps_in_epoch} | "
-                    f"Loss: {loss_py:.4f} | Smooth: {smooth_loss.item():.4f} | "
-                    f"LR: {current_lr:.6f} | TPS: {tokens_per_sec:.0f}"
+                    f"Loss: {loss:.4f} | Smooth: {smooth_loss:.4f} | "
+                    f"LR: {args.learning_rate:.6f} | TPS: {tokens_per_sec:.0f}"
                 )
                 if global_step % 20 == 0:
                     generation_output = generate_during_training(
-                        model=model,
+                        model=x_model.model,
                         params=model_params,
                         tokenizer=tokenizer,
                         tokenizer_path=tokenizer_path,
@@ -249,13 +185,13 @@ def train_command_jax(args):
         print(f"\nEpoch {epoch + 1} completed. Average loss: {avg_epoch_loss:.4f}")
 
         # Save checkpoint
-        save_jax_model(model_params, args.model_path)
+        model_save(model_params, args.model_path)
         model_config["epochs"].append(
             {
                 "epoch": global_epoch + epoch,
                 "steps": steps_in_epoch,
-                "smooth_loss": float(smooth_loss),
-                "learning_rate": float(current_lr),
+                "smooth_loss": smooth_loss,
+                "learning_rate": args.learning_rate,
                 "batch_size": batch_size,
             }
         )
@@ -263,7 +199,7 @@ def train_command_jax(args):
         print(f"Checkpoint saved to {args.model_path}")
 
     print("Training completed!")
-    save_jax_model(model_params, args.model_path)
+    model_save(model_params, args.model_path)
 
 
 def generate_sample_jax(
@@ -280,7 +216,7 @@ def generate_sample_jax(
     Generate text sample using the trained JAX model.
     """
     # Encode prompt
-    prompt_tokens = jnp.array(tokenizer.encode(prompt, tokenizer_path), dtype=jnp.int32)
+    prompt_tokens = int_array(tokenizer.encode(prompt, tokenizer_path))
 
     # Generate tokens
     generated_tokens = generate(
@@ -307,7 +243,7 @@ def generate_next(
     max_prompt_len = min(len(prompt_tokens_list), 20)
     prompt_tokens_list = prompt_tokens_list[:max_prompt_len]
 
-    prompt_tokens = jnp.array(prompt_tokens_list, dtype=jnp.int32)
+    prompt_tokens = int_array(prompt_tokens_list)
 
     # Generate
     generated_tokens = generate(
@@ -357,16 +293,10 @@ def interactive_generation(args):
     tokenizer, tokenizer_path = load_tokenizer(args.model_path)
 
     model_config = load_model_config(args.model_path, tokenizer.vocab_size, args)
-    model = JAXTransformer(
-        vocab_size=model_config["vocab_size"],
-        d_model=model_config["d_model"],
-        n_heads=model_config["n_heads"],
-        n_layers=model_config["n_layers"],
-        max_seq_len=model_config["max_seq_len"],
-    )
+    x_model = model_init(model_config)
 
     # Load trained parameters
-    params = load_jax_model(args.model_path)
+    params = model_load(args.model_path)
     if params is None:
         print("No trained model found!")
         return
@@ -374,7 +304,7 @@ def interactive_generation(args):
     print("Model loaded.")
 
     generated_text = generate_next(
-        tokenizer, tokenizer_path, params, model, 0.8, args.prompt
+        tokenizer, tokenizer_path, params, x_model.model, 0.8, args.prompt
     )
 
     print(f"Generated: {generated_text}")
