@@ -1,3 +1,4 @@
 #!/bin/sh
 export OPENBLAS_NUM_THREADS=12
-uv run app.py generate --model-path "out/$1" "$2"
+BACKEND=jax
+uv run app.py generate --backend=$BACKEND --model-path "out/$1" "$2"
