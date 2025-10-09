@@ -263,10 +263,11 @@ def generate_during_training(
 ):
     """Generate a sample during training."""
     prompts = [
-        "The future of",
-        "Once upon a time",
-        "In a world where",
-        "The secret to",
+        "when ",
+        "he ",
+        "I ",
+        "the ",
+        " of",
     ]
 
     # Use a different prompt each time

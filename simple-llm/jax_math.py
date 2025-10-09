@@ -10,6 +10,8 @@ from jax import jit, lax, random, value_and_grad
 
 from util import get_model_weights_path
 
+jax.config.update("jax_enable_x64", False)
+
 # --- UTILITY FUNCTIONS ---
 
 

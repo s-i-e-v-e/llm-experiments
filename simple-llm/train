@@ -1,13 +1,13 @@
 #!/bin/sh
 export OPENBLAS_NUM_THREADS=12
 BACKEND=numpy
-EPOCHS=5
-EMBEDDING_DIM=256
-CONTEXT_LENGTH=512
-HEADS=16
-LAYERS=8
+EPOCHS=10
+EMBEDDING_DIM=160
+CONTEXT_LENGTH=256
+HEADS=8
+LAYERS=6
 BATCH_SIZE=16
-LEARNING_RATE=0.001
-VOCAB=1000
+LEARNING_RATE=0.0008
+VOCAB=800
 RESUME=--resume
-uv run main.py train $RESUME --model-path out/$1 --backend $BACKEND --vocab-size $VOCAB --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE data/sherlock_red_2.txt
+uv run main.py train $RESUME --model-path out/$1 --backend $BACKEND --vocab-size $VOCAB --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE $2
