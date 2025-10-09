@@ -6,7 +6,10 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import struct
-from util import deserialize, get_model_file_names, serialize
+
+from common.util import deserialize, get_model_file_names, serialize
+
+jax.config.update("jax_enable_x64", False)
 
 
 # Positional encoding utility

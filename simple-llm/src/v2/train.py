@@ -2,27 +2,7 @@ import math
 import os
 import time
 
-from bpe_tokenizer import BPETokenizer
-from util import get_model_weights_path, get_tokenizer_path
-
-
-def load_corpus(file_path: str):
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def load_tokenizer(model_path: str, vocab_size: int = 0, corpus_text: str = ""):
-    tokenizer = BPETokenizer()
-    file = get_tokenizer_path(model_path)
-    if os.path.exists(file):
-        print(f"Loading tokenizer from {file}")
-        tokenizer = BPETokenizer.load(file)
-    else:
-        assert vocab_size > 0
-        assert corpus_text != ""
-        print(f"Training new BPE tokenizer with vocab_size {vocab_size}")
-        tokenizer.train(corpus_text, vocab_size, file, verbose=True)
-    return tokenizer, file
+from common.util import get_model_weights_path, load_corpus, load_tokenizer
 
 
 def train_command(args):
@@ -57,7 +37,7 @@ def train_command(args):
 
     # STEP 5: Backend/model selection
     if args.backend == "jax":
-        from jax_backend import (
+        from v2.jax_backend import (
             initialize_model,
             load_model,
             save_model,

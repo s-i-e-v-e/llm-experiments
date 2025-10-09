@@ -6,6 +6,8 @@ import sys
 import zstandard as zstd
 from flax import serialization
 
+from common.bpe_tokenizer import BPETokenizer
+
 
 def run_command_simple(cmd, input_text=None):
     """
@@ -71,3 +73,22 @@ def deserialize(cls, path: str):
         x = zstd.ZstdDecompressor()
         data = x.decompress(f.read())
     return serialization.from_bytes(cls, data)
+
+
+def load_corpus(file_path: str):
+    with open(file_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def load_tokenizer(model_path: str, vocab_size: int = 0, corpus_text: str = ""):
+    tokenizer = BPETokenizer()
+    file = get_tokenizer_path(model_path)
+    if os.path.exists(file):
+        print(f"Loading tokenizer from {file}")
+        tokenizer = BPETokenizer.load(file)
+    else:
+        assert vocab_size > 0
+        assert corpus_text != ""
+        print(f"Training new BPE tokenizer with vocab_size {vocab_size}")
+        tokenizer.train(corpus_text, vocab_size, file, verbose=True)
+    return tokenizer, file

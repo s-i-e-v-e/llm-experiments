@@ -1,8 +1,6 @@
 import json
 import os
 
-from util import run_command_simple
-
 # The path to our compiled C executable.
 # Assumes it's in the same directory as the script.
 BPE_EXECUTABLE = os.path.join(os.path.dirname(__file__), "bpe_tokenizer")
@@ -22,10 +20,8 @@ class BPETokenizer:
         return len(self.vocab)
 
     def train(self, text: str, vocab_size: int, token_file: str, verbose: bool = False):
-        """
-        Trains the tokenizer by calling the C binary.
-        Feeds the text via stdin and reads the resulting JSON merges from stdout.
-        """
+        from common.util import run_command_simple
+
         if not os.path.exists(BPE_EXECUTABLE):
             raise FileNotFoundError(
                 f"BPE executable not found at '{BPE_EXECUTABLE}'. Please compile it first."
@@ -46,10 +42,7 @@ class BPETokenizer:
         self._save_merges_to_file(token_file)
 
     def encode(self, text: str, token_file: str) -> list[int]:
-        """
-        Encodes text by calling the C binary.
-        Feeds the text via stdin and reads the token IDs from stdout.
-        """
+        from common.util import run_command_simple
 
         if not os.path.exists(BPE_EXECUTABLE):
             raise FileNotFoundError(

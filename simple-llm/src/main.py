@@ -1,10 +1,7 @@
 import argparse
 
-from generate import generate_command
-from train import train_command
 
-
-def parse():
+def main(train_command, generate_command):
     parser = argparse.ArgumentParser(description="Tooling for Transformer Models")
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
