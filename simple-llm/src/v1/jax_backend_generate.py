@@ -4,20 +4,49 @@ import jax
 import jax.numpy as jnp
 from jax import jit, lax, random
 
+from v1.jax_backend import int_array, jax_transformer
 
-@partial(jit, static_argnums=(1, 3, 4, 5, 6, 7, 8, 9))
+
+def main_generate(
+    params,
+    config,
+    xs,
+    max_length,
+):
+    # Generate tokens
+    generated_tokens = generate(
+        params=params,
+        vocab_size=config.vocab_size,
+        d_model=config.d_model,
+        n_heads=config.n_heads,
+        n_layers=config.n_layers,
+        max_seq_len=config.max_seq_len,
+        prompt_tokens=int_array(xs),
+        max_length=max_length,
+        top_k=40,
+    )
+
+    return generated_tokens.tolist()
+
+
+@partial(jit, static_argnums=(1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13))
 def generate(
     params,
-    model,
+    vocab_size,
+    d_model,
+    n_heads,
+    n_layers,
+    max_seq_len,
     prompt_tokens,
     max_length,
-    temperature=1.0,  # 1.0 = no temperature scaling
-    top_k=40,  # -1 = no top-k filtering
-    top_p=1.0,  # 1.0 = no top-p filtering
-    min_p=0.0,  # 0.0 = no min-p filtering
-    typical_p=1.0,  # 1.0 = no typical-p filtering
-    repetition_penalty=1.0,  # 1.0 = no repetition penalty
+    temperature=1.0,
+    top_k=-1,
+    top_p=1.0,
+    min_p=0.0,
+    typical_p=1.0,
+    repetition_penalty=1.0,
 ):
+    """Generate text using the transformer."""
     key = random.PRNGKey(42)
     tokens = prompt_tokens
 
@@ -31,7 +60,9 @@ def generate(
 
     for i in range(max_length - len(prompt_tokens)):
         # Get model predictions for current sequence
-        logits = model.apply({"params": params}, tokens[None, :])
+        logits = jax_transformer(
+            params, tokens[None, :], vocab_size, d_model, n_heads, n_layers, max_seq_len
+        )
         next_token_logits = logits[0, -1, :]
 
         # Apply all filters in sequence

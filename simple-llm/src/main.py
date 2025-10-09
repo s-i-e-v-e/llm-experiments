@@ -28,17 +28,26 @@ def main(train_command, generate_command):
     train_parser.add_argument(
         "--vocab-size", type=int, default=5000, help="Vocabulary size for BPE"
     )
-    train_parser.add_argument("--model-path", default="out/m0", help="Model save path")
+    train_parser.add_argument(
+        "--model-path", type=str, required=True, help="Model save path"
+    )
     train_parser.add_argument("--resume", action="store_true", help="Resume training")
     train_parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
 
+    # For generate command
     generate_parser = subparsers.add_parser(
-        "generate", help="Train a Transformer Model"
+        "generate", help="Generate text from trained model"
     )
-    generate_parser.add_argument(
-        "--model-path", default="out/m0", help="Model save path"
-    )
-    generate_parser.add_argument("prompt", help="Prompt")
+    generate_parser.add_argument("--model-path", type=str, required=True)
+    generate_parser.add_argument("--prompt", type=str, required=True)
+    generate_parser.add_argument("--max-tokens", type=int, default=100)
+    generate_parser.add_argument("--temperature", type=float, default=1.0)
+    generate_parser.add_argument("--top-k", type=int, default=0)
+    generate_parser.add_argument("--top-p", type=float, default=1.0)
+    generate_parser.add_argument("--min-p", type=float, default=0.0)
+    generate_parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    generate_parser.add_argument("--repetition-window", type=int, default=64)
+    generate_parser.add_argument("--learning-rate", type=float, default=0.001)
 
     args = parser.parse_args()
 

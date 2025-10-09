@@ -4,6 +4,7 @@ import sys
 import time
 
 from common.util import load_corpus, load_tokenizer
+from v1.generate import generate_during_training
 from v1.jax_backend import (
     int_array,
     load_model_config,
@@ -56,7 +57,7 @@ def train_command(args):
 
     # STEP 4:
     model_config = load_model_config(args.model_path, tokenizer.vocab_size, args)
-    data_key, x_model, opt_state, model_params = model_init(
+    data_key, config, optimizer, opt_state, model_params = model_init(
         args.model_path,
         model_config,
         args.resume,
@@ -79,7 +80,15 @@ def train_command(args):
 
         for step in range(steps_in_epoch):
             data_key, model_params, opt_state, loss = main_train_step(
-                data_key, X, Y, batch_size, seq_length, model_params, x_model, opt_state
+                data_key,
+                X,
+                Y,
+                batch_size,
+                seq_length,
+                model_params,
+                config,
+                opt_state,
+                optimizer,
             )
 
             epoch_loss += loss
@@ -92,17 +101,17 @@ def train_command(args):
                 tokens_per_sec = (batch_size * seq_length * global_step) / elapsed
 
                 sys.stdout.write(
-                    f"\rEpoch {epoch + 1}/{args.epochs}, Step {step}/{steps_in_epoch} | "
+                    f"\rEpoch {epoch + 1}/{args.epochs}, Step {step + 1}/{steps_in_epoch} | "
                     f"Loss: {loss:.4f} | Smooth: {smooth_loss:.4f} | "
                     f"LR: {args.learning_rate:.6f} | TPS: {tokens_per_sec:.0f}"
                 )
                 if global_step % 20 == 0:
                     generation_output = generate_during_training(
-                        model=x_model.model,
+                        config=config,
                         params=model_params,
                         tokenizer=tokenizer,
                         tokenizer_path=tokenizer_path,
-                        step_count=global_step - 1,
+                        step_count=global_step,
                         temperature=0.8,
                     )
                     sys.stdout.write(generation_output)
