@@ -2,7 +2,8 @@ import argparse
 
 from jax_train import generate_command, train_command
 
-if __name__ == "__main__":
+
+def parse():
     parser = argparse.ArgumentParser(description="Tooling for Transformer Models")
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")

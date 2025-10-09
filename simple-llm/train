@@ -10,4 +10,4 @@ BATCH_SIZE=16
 LEARNING_RATE=0.0008
 VOCAB=800
 RESUME=--resume
-uv run main.py train $RESUME --model-path out/$1 --backend $BACKEND --vocab-size $VOCAB --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE $2
+uv run app.py train $RESUME --model-path out/$1 --backend $BACKEND --vocab-size $VOCAB --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE $2
