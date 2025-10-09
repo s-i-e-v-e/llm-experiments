@@ -1,6 +1,6 @@
 import argparse
 
-from jax_train import interactive_generation, train_command_jax
+from jax_train import generate_command, train_command
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tooling for Transformer Models")
@@ -44,8 +44,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.command == "train":
-        train_command_jax(args)
+        train_command(args)
     elif args.command == "generate":
-        interactive_generation(args)
+        generate_command(args)
     else:
         parser.print_help()

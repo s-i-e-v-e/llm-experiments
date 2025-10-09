@@ -64,7 +64,7 @@ def load_tokenizer(model_path: str, vocab_size: int = 0, corpus_text: str = ""):
     return tokenizer, file
 
 
-def train_command_jax(args):
+def train_command(args):
     """Main training function for transformer using JAX/Flax backend"""
     os.makedirs(args.model_path, exist_ok=True)
 
@@ -286,13 +286,8 @@ def generate_during_training(
         return f"\nGeneration failed at step {step_count}: {e}\n"
 
 
-def interactive_generation(args):
-    """
-    Interactive generation loop.
-    """
-    # Load tokenizer
+def generate_command(args):
     tokenizer, tokenizer_path = load_tokenizer(args.model_path)
-
     model_config = load_model_config(args.model_path, tokenizer.vocab_size, args)
     x_model = model_init(model_config)
 
