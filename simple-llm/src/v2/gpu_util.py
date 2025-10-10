@@ -83,6 +83,57 @@ class GPUOptimizerState:
 # ============================================================================
 # BUFFER MANAGEMENT
 # ============================================================================
+def create_buffer_pool(device, max_buffer_size_mb=512):
+    """Create a memory pool for reusable GPU buffers"""
+    return BufferPool(device, max_buffer_size_mb)
+
+
+class BufferPool:
+    """Memory pool for reusing GPU buffers across training steps"""
+
+    def __init__(self, device, max_size_mb=512):
+        self.device = device
+        self.max_size = max_size_mb * 1024 * 1024 // 4  # Convert to float32 count
+        self.pools = {}  # size -> list of buffers
+        self.in_use = set()  # Track buffers currently in use
+
+    def get_buffer(self, shape):
+        """Get a buffer from pool or create new"""
+        size = int(np.prod(shape))
+
+        if size in self.pools and len(self.pools[size]) > 0:
+            buffer_info = self.pools[size].pop()
+            self.in_use.add(id(buffer_info["buffer"]))
+            return GPUBuffer(
+                buffer=buffer_info["buffer"], shape=shape, size=size, device=self.device
+            )
+
+        # Create new buffer
+        buffer_size = size * 4
+        buffer = self.device.create_buffer(
+            size=buffer_size,
+            usage=wgpu.BufferUsage.STORAGE
+            | wgpu.BufferUsage.COPY_SRC
+            | wgpu.BufferUsage.COPY_DST,
+        )
+
+        gpu_buffer = GPUBuffer(
+            buffer=buffer, shape=shape, size=size, device=self.device
+        )
+        self.in_use.add(id(buffer))
+        return gpu_buffer
+
+    def release_buffer(self, gpu_buffer):
+        """Return buffer to pool for reuse"""
+        buffer_id = id(gpu_buffer.buffer)
+        if buffer_id in self.in_use:
+            self.in_use.remove(buffer_id)
+
+            size = gpu_buffer.size
+            if size not in self.pools:
+                self.pools[size] = []
+
+            self.pools[size].append({"buffer": gpu_buffer.buffer, "size": size})
 
 
 def create_gpu_buffer(shape, data=None, device=None):

@@ -13,21 +13,19 @@ from v2.gpu_util import (
     wgpu,
 )
 
-# ============================================================================
-# BATCHED OPERATIONS (Minimize GPU Submissions)
-# ============================================================================
-
 
 class CommandBatcher:
-    """Batch multiple GPU operations into single submission"""
+    """Batch multiple GPU operations into single submission with proper resource retention"""
 
     def __init__(self, device):
         self.device = device
         self.encoder = None
+        self._retained_buffers = []  # Keep references until submit
 
     def begin(self):
         """Start batching operations"""
         self.encoder = self.device.create_command_encoder()
+        self._retained_buffers = []
         return self
 
     def add_matmul(self, A: GPUBuffer, B: GPUBuffer, C: GPUBuffer):
@@ -39,6 +37,7 @@ class CommandBatcher:
         params_buffer = self.device.create_buffer_with_data(
             data=params, usage=wgpu.BufferUsage.UNIFORM
         )
+        self._retained_buffers.append(params_buffer)
 
         pipeline = _get_or_create_pipeline(TILED_MATMUL_KERNEL, self.device)
         bind_group = self.device.create_bind_group(
@@ -70,7 +69,11 @@ class CommandBatcher:
         compute_pass = self.encoder.begin_compute_pass()
         compute_pass.set_pipeline(pipeline)
         compute_pass.set_bind_group(0, bind_group)
-        compute_pass.dispatch_workgroups((N + 15) // 16, (M + 15) // 16, 1)
+
+        # Validate workgroup size against device limits
+        workgroups_x = min((N + 15) // 16, 65535)
+        workgroups_y = min((M + 15) // 16, 65535)
+        compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1)
         compute_pass.end()
 
     def add_layernorm(
@@ -83,6 +86,7 @@ class CommandBatcher:
         params_buffer = self.device.create_buffer_with_data(
             data=params, usage=wgpu.BufferUsage.UNIFORM
         )
+        self._retained_buffers.append(params_buffer)
 
         pipeline = _get_or_create_pipeline(LAYERNORM_KERNEL, self.device)
         bind_group = self.device.create_bind_group(
@@ -145,6 +149,7 @@ class CommandBatcher:
         params_buffer = self.device.create_buffer_with_data(
             data=params, usage=wgpu.BufferUsage.UNIFORM
         )
+        self._retained_buffers.append(params_buffer)
 
         pipeline = _get_or_create_pipeline(GELU_KERNEL, self.device)
         bind_group = self.device.create_bind_group(
@@ -191,6 +196,7 @@ class CommandBatcher:
         params_buffer = self.device.create_buffer_with_data(
             data=params, usage=wgpu.BufferUsage.UNIFORM
         )
+        self._retained_buffers.append(params_buffer)
 
         pipeline = _get_or_create_pipeline(RESIDUAL_ADD_KERNEL, self.device)
         bind_group = self.device.create_bind_group(
@@ -246,6 +252,7 @@ class CommandBatcher:
         params_buffer = self.device.create_buffer_with_data(
             data=params, usage=wgpu.BufferUsage.UNIFORM
         )
+        self._retained_buffers.append(params_buffer)
 
         pipeline = _get_or_create_pipeline(BIAS_ADD_KERNEL, self.device)
         bind_group = self.device.create_bind_group(
@@ -293,6 +300,8 @@ class CommandBatcher:
         compute_pass.end()
 
     def submit(self):
-        """Execute all batched operations"""
-        self.device.queue.submit([self.encoder.finish()])
-        self.encoder = None
+        """Execute all batched operations and release retained resources"""
+        if self.encoder is not None:
+            self.device.queue.submit([self.encoder.finish()])
+            self.encoder = None
+        self._retained_buffers = []

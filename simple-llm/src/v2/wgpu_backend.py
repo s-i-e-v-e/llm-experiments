@@ -1049,94 +1049,109 @@ def generate_text(
 
 @dataclasses.dataclass
 class WorkspaceBuffers:
-    """Pre-allocated buffers reused across training steps"""
+    """Pre-allocated workspace buffers to avoid allocations during forward/backward"""
 
-    # Double buffers for ping-pong between layers
+    # Forward pass buffers
     x_buffer_a: gpu.GPUBuffer
     x_buffer_b: gpu.GPUBuffer
-
-    # Attention workspace
     x_norm1: gpu.GPUBuffer
+    x_norm2: gpu.GPUBuffer
     Q: gpu.GPUBuffer
     K: gpu.GPUBuffer
     V: gpu.GPUBuffer
     attn_out_pre: gpu.GPUBuffer
     attn_out: gpu.GPUBuffer
     x_with_attn: gpu.GPUBuffer
-
-    # FFN workspace
-    x_norm2: gpu.GPUBuffer
     hidden: gpu.GPUBuffer
     hidden_bias: gpu.GPUBuffer
     hidden_gelu: gpu.GPUBuffer
     ffn_out: gpu.GPUBuffer
     ffn_out_bias: gpu.GPUBuffer
-    x_next: gpu.GPUBuffer
-
-    # Output
-    embedding_T: gpu.GPUBuffer
     logits: gpu.GPUBuffer
+    embedding_T: gpu.GPUBuffer
+
+    # Backward pass buffers
+    grad_logits: gpu.GPUBuffer
+    grad_embedding: gpu.GPUBuffer
+    grad_x: gpu.GPUBuffer
+    grad_attn: gpu.GPUBuffer
+    grad_ffn: gpu.GPUBuffer
+    grad_ln1: gpu.GPUBuffer
+    grad_ln2: gpu.GPUBuffer
+
+    # Temporary gradient buffers for weights
+    grad_wq: gpu.GPUBuffer
+    grad_wk: gpu.GPUBuffer
+    grad_wv: gpu.GPUBuffer
+    grad_wo: gpu.GPUBuffer
+    grad_w1: gpu.GPUBuffer
+    grad_w2: gpu.GPUBuffer
+    grad_b1: gpu.GPUBuffer
+    grad_b2: gpu.GPUBuffer
 
 
-def create_workspace_buffers(model: TransformerModel, batch_size: int, seq_len: int):
-    """Pre-allocate all workspace buffers once"""
+def create_workspace_buffers(model, batch_size, seq_len):
+    """Create all workspace buffers for a given batch size"""
     device = model.params.embedding.device
     embedding_dim = model.tm_params.embedding_dim
-    vocab_size = model.tm_params.vocab_size
+    total_tokens = batch_size * seq_len
 
-    # Per-layer buffers (will be reused for each layer)
-    workspace = WorkspaceBuffers(
-        # Double buffers for alternating between layers
-        x_buffer_a=gpu.create_gpu_buffer(
-            (batch_size * seq_len, embedding_dim), device=device
-        ),
-        x_buffer_b=gpu.create_gpu_buffer(
-            (batch_size * seq_len, embedding_dim), device=device
-        ),
-        x_norm1=gpu.create_gpu_buffer(
-            (batch_size * seq_len, embedding_dim), device=device
-        ),
-        Q=gpu.create_gpu_buffer((batch_size * seq_len, embedding_dim), device=device),
-        K=gpu.create_gpu_buffer((batch_size * seq_len, embedding_dim), device=device),
-        V=gpu.create_gpu_buffer((batch_size * seq_len, embedding_dim), device=device),
+    return WorkspaceBuffers(
+        x_buffer_a=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        x_buffer_b=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        x_norm1=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        x_norm2=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        Q=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        K=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        V=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
         attn_out_pre=gpu.create_gpu_buffer(
-            (batch_size * seq_len, embedding_dim), device=device
+            (total_tokens, embedding_dim), device=device
         ),
-        attn_out=gpu.create_gpu_buffer(
-            (batch_size * seq_len, embedding_dim), device=device
-        ),
-        x_with_attn=gpu.create_gpu_buffer(
-            (batch_size * seq_len, embedding_dim), device=device
-        ),
-        x_norm2=gpu.create_gpu_buffer(
-            (batch_size * seq_len, embedding_dim), device=device
-        ),
-        hidden=gpu.create_gpu_buffer(
-            (batch_size * seq_len, 4 * embedding_dim), device=device
-        ),
+        attn_out=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        x_with_attn=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        hidden=gpu.create_gpu_buffer((total_tokens, 4 * embedding_dim), device=device),
         hidden_bias=gpu.create_gpu_buffer(
-            (batch_size * seq_len, 4 * embedding_dim), device=device
+            (total_tokens, 4 * embedding_dim), device=device
         ),
         hidden_gelu=gpu.create_gpu_buffer(
-            (batch_size * seq_len, 4 * embedding_dim), device=device
+            (total_tokens, 4 * embedding_dim), device=device
         ),
-        ffn_out=gpu.create_gpu_buffer(
-            (batch_size * seq_len, embedding_dim), device=device
-        ),
+        ffn_out=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
         ffn_out_bias=gpu.create_gpu_buffer(
-            (batch_size * seq_len, embedding_dim), device=device
+            (total_tokens, embedding_dim), device=device
         ),
-        x_next=gpu.create_gpu_buffer(
-            (batch_size * seq_len, embedding_dim), device=device
+        logits=gpu.create_gpu_buffer(
+            (total_tokens, model.tm_params.vocab_size), device=device
         ),
-        embedding_T=gpu.create_gpu_buffer((embedding_dim, vocab_size), device=device),
-        logits=gpu.create_gpu_buffer((batch_size * seq_len, vocab_size), device=device),
+        embedding_T=gpu.create_gpu_buffer(
+            (embedding_dim, model.tm_params.vocab_size), device=device
+        ),
+        # Backward buffers
+        grad_logits=gpu.create_gpu_buffer(
+            (total_tokens, model.tm_params.vocab_size), device=device
+        ),
+        grad_embedding=gpu.create_gpu_buffer(
+            (total_tokens, embedding_dim), device=device
+        ),
+        grad_x=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        grad_attn=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        grad_ffn=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        grad_ln1=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        grad_ln2=gpu.create_gpu_buffer((total_tokens, embedding_dim), device=device),
+        # Weight gradients
+        grad_wq=gpu.create_gpu_buffer((embedding_dim, embedding_dim), device=device),
+        grad_wk=gpu.create_gpu_buffer((embedding_dim, embedding_dim), device=device),
+        grad_wv=gpu.create_gpu_buffer((embedding_dim, embedding_dim), device=device),
+        grad_wo=gpu.create_gpu_buffer((embedding_dim, embedding_dim), device=device),
+        grad_w1=gpu.create_gpu_buffer(
+            (embedding_dim, 4 * embedding_dim), device=device
+        ),
+        grad_w2=gpu.create_gpu_buffer(
+            (4 * embedding_dim, embedding_dim), device=device
+        ),
+        grad_b1=gpu.create_gpu_buffer((4 * embedding_dim,), device=device),
+        grad_b2=gpu.create_gpu_buffer((embedding_dim,), device=device),
     )
-
-    # Pre-compute transposed embedding once
-    gpu.run_transpose(model.params.embedding, workspace.embedding_T, device)
-
-    return workspace
 
 
 # Store workspace in model
