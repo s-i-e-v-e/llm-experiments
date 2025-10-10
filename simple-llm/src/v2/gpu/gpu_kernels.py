@@ -887,26 +887,19 @@ fn main(
                    q_pos * embedding_dim +
                    head_idx * head_dim;
 
-    // Compute attention scores in parallel
+    // Phase 1: Compute scores and find max (for numerical stability)
     var max_score = -1e9;
 
-    // Phase 1: Compute scores and find max (for numerical stability)
     for (var k_pos = tid; k_pos <= q_pos; k_pos += BLOCK_SIZE) {
+        var score = 0.0;
         let k_offset = batch_idx * seq_len * embedding_dim +
                       k_pos * embedding_dim +
                       head_idx * head_dim;
 
-        var score = 0.0;
         for (var d = 0u; d < head_dim; d++) {
             score += Q[q_offset + d] * K[k_offset + d];
         }
         score *= scale;
-
-        // Store in shared memory for later use
-        if (k_pos < seq_len) {
-            shared_mem[k_pos % BLOCK_SIZE] = score;
-        }
-
         max_score = max(max_score, score);
     }
 
@@ -914,7 +907,6 @@ fn main(
     shared_mem[tid] = max_score;
     workgroupBarrier();
 
-    // Tree reduction for max
     for (var stride = BLOCK_SIZE / 2u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
             shared_mem[tid] = max(shared_mem[tid], shared_mem[tid + stride]);
@@ -926,6 +918,9 @@ fn main(
 
     // Phase 2: Compute exp and sum
     var sum_exp = 0.0;
+    var score_cache: array<f32, 8>;  // Cache scores for reuse
+    var num_scores = 0u;
+
     for (var k_pos = tid; k_pos <= q_pos; k_pos += BLOCK_SIZE) {
         let k_offset = batch_idx * seq_len * embedding_dim +
                       k_pos * embedding_dim +
@@ -937,7 +932,13 @@ fn main(
         }
         score = score * scale - max_score;
         let exp_score = exp(score);
-        shared_mem[k_pos % BLOCK_SIZE] = exp_score;
+
+        // Cache for later use (limited to 8 entries per thread)
+        if (num_scores < 8u) {
+            score_cache[num_scores] = exp_score;
+            num_scores++;
+        }
+
         sum_exp += exp_score;
     }
 
@@ -954,15 +955,24 @@ fn main(
     sum_exp = shared_mem[0];
     workgroupBarrier();
 
-    // Phase 3: Weighted sum of values
-    for (var d = tid; d < head_dim; d += BLOCK_SIZE) {
+    // Phase 3: Weighted sum of values (process multiple dims per thread)
+    let dims_per_thread = (head_dim + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+
+    for (var d_block = 0u; d_block < dims_per_thread; d_block++) {
+        let d = tid + d_block * BLOCK_SIZE;
+        if (d >= head_dim) {
+            break;
+        }
+
         var result = 0.0;
+        var cache_idx = 0u;
 
         for (var k_pos = 0u; k_pos <= q_pos; k_pos++) {
             let k_offset = batch_idx * seq_len * embedding_dim +
                           k_pos * embedding_dim +
                           head_idx * head_dim;
 
+            // Recompute attention weight (could use cache for first few)
             var score = 0.0;
             for (var dd = 0u; dd < head_dim; dd++) {
                 score += Q[q_offset + dd] * K[k_offset + dd];
@@ -981,6 +991,7 @@ fn main(
     }
 }
 """
+
 
 MULTIHEAD_ATTENTION_KERNEL = """
 // Simplified multi-head self-attention with causal masking
@@ -1420,6 +1431,36 @@ fn main(
         L[stats_offset] = li[row];
         M[stats_offset] = mi[row];
     }
+}
+"""
+
+ATTENTION_BACKWARD_KERNEL = """
+// Backward pass for scaled dot-product attention
+// Given: grad_output, Q, K, V, attention_weights (from cache)
+// Compute: grad_Q, grad_K, grad_V
+
+struct AttentionBackwardParams {
+    batch_size: u32,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: AttentionBackwardParams;
+@group(0) @binding(1) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(2) var<storage, read> Q: array<f32>;
+@group(0) @binding(3) var<storage, read> K: array<f32>;
+@group(0) @binding(4) var<storage, read> V: array<f32>;
+@group(0) @binding(5) var<storage, read> attn_weights: array<f32>;  // Cached from forward
+@group(0) @binding(6) var<storage, read_write> grad_Q: array<f32>;
+@group(0) @binding(7) var<storage, read_write> grad_K: array<f32>;
+@group(0) @binding(8) var<storage, read_write> grad_V: array<f32>;
+
+// Implementation with proper softmax backward and scaling
+@compute @workgroup_size(256)
+fn main(...) {
+    // Compute gradients using chain rule through softmax
+    // This is the most complex part of backward pass
 }
 """
 

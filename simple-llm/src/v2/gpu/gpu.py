@@ -28,6 +28,7 @@ from v2.gpu_kernels import (
     TRANSPOSE_KERNEL,
 )
 from v2.gpu_util import (
+    BufferPool,
     GPUBuffer,
     GPUModelParams,
     GPUOptimizerState,
@@ -53,6 +54,7 @@ __all__ = [
     "CommandBatcher",
     "gpu_to_numpy",
     "gpu_layer_to_dict",
+    "BufferPool",
 ]
 
 # ============================================================================

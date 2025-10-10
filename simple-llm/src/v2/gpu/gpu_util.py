@@ -375,6 +375,13 @@ def gpu_to_numpy(gpu_buffer):
     return data.reshape(gpu_buffer.shape)
 
 
+def clear_buffer(gpu_buffer: GPUBuffer):
+    """Zero-initialize a GPU buffer"""
+    device = gpu_buffer.device
+    zero_data = np.zeros(gpu_buffer.size, dtype=np.float32)
+    device.queue.write_buffer(gpu_buffer.buffer, 0, zero_data)
+
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================

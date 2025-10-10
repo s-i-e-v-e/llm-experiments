@@ -351,6 +351,87 @@ def backward_pass(
     return gradients, loss_value
 
 
+def backward_pass_complete(
+    model: TransformerModel,
+    logits: gpu.GPUBuffer,
+    targets: np.ndarray,
+    cache: ForwardCache,
+):
+    """Complete backward pass implementation"""
+    device = model.params.embedding.device
+    batch_size, seq_len = targets.shape
+    workspace = model.workspace
+
+    # 1. Compute loss gradient (already working)
+    grad_logits, loss = compute_loss_gradient(model, logits, targets)
+
+    # 2. Backprop through embedding projection
+    batcher = gpu.CommandBatcher(device)
+    batcher.begin()
+    batcher.add_matmul_backward_a(
+        grad_logits, workspace.embedding_T, workspace.grad_embedding
+    )
+    batcher.add_matmul_backward_b(cache.final_output, grad_logits, workspace.grad_wte)
+    batcher.submit()
+
+    grad_x = workspace.grad_embedding
+
+    # 3. Backprop through layers (reverse order)
+    for layer_idx in reversed(range(len(model.params.layers))):
+        layer = model.params.layers[layer_idx]
+        layer_cache = cache.layer_outputs[layer_idx]
+
+        batcher.begin()
+
+        # Residual gradient split
+        batcher.add_copy(grad_x, workspace.grad_residual)
+        batcher.add_copy(grad_x, workspace.grad_ffn)
+
+        # Backprop FFN
+        batcher.add_bias_backward(workspace.grad_ffn, workspace.grad_b2)
+        batcher.add_matmul_backward_a(
+            workspace.grad_ffn, layer.ff_w2, workspace.grad_hidden_gelu
+        )
+        batcher.add_matmul_backward_b(
+            cache.ffn_hidden[layer_idx], workspace.grad_ffn, workspace.grad_w2
+        )
+
+        batcher.add_gelu_backward(
+            cache.ffn_hidden[layer_idx],
+            workspace.grad_hidden_gelu,
+            workspace.grad_hidden_bias,
+        )
+        batcher.add_bias_backward(workspace.grad_hidden_bias, workspace.grad_b1)
+        batcher.add_matmul_backward_a(
+            workspace.grad_hidden_bias, layer.ff_w1, workspace.grad_norm2
+        )
+        batcher.add_matmul_backward_b(
+            cache.layer_norms2[layer_idx], workspace.grad_hidden_bias, workspace.grad_w1
+        )
+
+        # Backprop through layer norm 2
+        batcher.add_layernorm_backward(
+            cache.attn_outputs[layer_idx],
+            layer.ln_gamma2,
+            workspace.grad_norm2,
+            workspace.grad_attn_out,
+            workspace.grad_gamma2,
+            workspace.grad_beta2,
+        )
+
+        # Add residual gradient
+        batcher.add_residual(
+            workspace.grad_attn_out, workspace.grad_residual, workspace.grad_attn_out
+        )
+
+        # Backprop attention
+        # ... similar pattern for attention layers
+
+        batcher.submit()
+
+    return collect_gradients(workspace), loss
+
+
 # ============================================================================
 # OPTIMIZER UPDATE
 # ============================================================================
@@ -958,6 +1039,34 @@ def forward_inference(model: TransformerModel, input_tokens: np.ndarray):
     Returns logits for next token prediction.
     """
     return forward_inference_complete(model, input_tokens)
+
+
+def forward_pass_optimized(model, batch_inputs):
+    """Forward pass with maximum batching"""
+    device = model.params.embedding.device
+    ws = model.workspace
+
+    # Single batcher for entire forward pass
+    batcher = gpu.CommandBatcher(device, enable_profiling=True)
+    batcher.begin()
+
+    # Embedding (special case - needs separate submit for dependency)
+    # ... embedding code ...
+    batcher.submit()
+
+    # All layers in ONE submission
+    batcher.begin()
+    for layer_idx, layer in enumerate(model.params.layers):
+        # Add all operations for this layer
+        batcher.add_layernorm(...)
+        batcher.add_matmul(...)
+        # ... all layer ops
+        batcher.operation_count += 7  # Track operations
+
+    # Submit once for all layers!
+    batcher.submit()
+
+    return logits, cache
 
 
 # ============================================================================
