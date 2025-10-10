@@ -303,5 +303,9 @@ class CommandBatcher:
         """Execute all batched operations and release retained resources"""
         if self.encoder is not None:
             self.device.queue.submit([self.encoder.finish()])
+
+             if self.enable_profiling and self.operation_count > 0:
+                print(f"Batched {self.operation_count} operations in single submission")
+
             self.encoder = None
         self._retained_buffers = []

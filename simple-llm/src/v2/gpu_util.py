@@ -35,6 +35,114 @@ def get_device():
     return _device
 
 
+def query_device_limits(device):
+    """Query device capabilities for kernel optimization"""
+    limits = {
+        "max_compute_workgroup_size_x": 256,
+        "max_compute_workgroup_size_y": 256,
+        "max_compute_workgroup_size_z": 64,
+        "max_compute_invocations_per_workgroup": 256,
+        "max_compute_workgroup_storage_size": 16384,
+    }
+
+    # Try to query actual device limits if available
+    try:
+        adapter_info = device.adapter.request_adapter_info()
+        if hasattr(adapter_info, "limits"):
+            limits.update(adapter_info.limits)
+    except:
+        pass  # Use defaults
+
+    return limits
+
+
+def select_optimal_tile_size(M, N, K, device_limits):
+    """Select optimal tile size based on matrix dimensions and device"""
+    max_shared_mem = device_limits.get("max_compute_workgroup_storage_size", 16384)
+
+    # Each tile needs 2 * tile_size^2 * 4 bytes (two tiles, float32)
+    # Plus some overhead for other shared memory
+    max_tile_from_memory = int((max_shared_mem * 0.8 / 8) ** 0.5)
+
+    # Common tile sizes: 8, 16, 32
+    candidate_sizes = [8, 16, 32]
+
+    # Filter by memory constraints
+    valid_sizes = [s for s in candidate_sizes if s <= max_tile_from_memory]
+
+    if not valid_sizes:
+        return 8
+
+    # Prefer 16 for most cases, 32 for large matrices
+    if max(M, N, K) > 2048 and 32 in valid_sizes:
+        return 32
+    elif 16 in valid_sizes:
+        return 16
+    else:
+        return valid_sizes[-1]
+
+
+def create_tuned_pipeline(kernel_code, device, tune_params=None):
+    """Create pipeline with device-specific tuning"""
+    limits = query_device_limits(device)
+
+    # Apply tuning if provided
+    if tune_params:
+        for key, value in tune_params.items():
+            kernel_code = kernel_code.replace(f"${key}$", str(value))
+
+    return _get_or_create_pipeline(kernel_code, device)
+
+
+class GPUPerformanceMonitor:
+    """Monitor GPU performance metrics"""
+
+    def __init__(self):
+        self.kernel_times = {}
+        self.memory_usage = {}
+        self.submission_count = 0
+
+    def record_kernel_time(self, kernel_name, duration_ms):
+        """Record kernel execution time"""
+        if kernel_name not in self.kernel_times:
+            self.kernel_times[kernel_name] = []
+        self.kernel_times[kernel_name].append(duration_ms)
+
+    def record_submission(self):
+        """Increment submission counter"""
+        self.submission_count += 1
+
+    def get_stats(self):
+        """Get performance statistics"""
+        stats = {"total_submissions": self.submission_count, "kernel_times": {}}
+
+        for kernel_name, times in self.kernel_times.items():
+            stats["kernel_times"][kernel_name] = {
+                "count": len(times),
+                "total_ms": sum(times),
+                "avg_ms": sum(times) / len(times) if times else 0,
+                "min_ms": min(times) if times else 0,
+                "max_ms": max(times) if times else 0,
+            }
+
+        return stats
+
+    def reset(self):
+        """Reset all counters"""
+        self.kernel_times.clear()
+        self.memory_usage.clear()
+        self.submission_count = 0
+
+
+# Global monitor instance
+_perf_monitor = GPUPerformanceMonitor()
+
+
+def get_performance_monitor():
+    """Get global performance monitor"""
+    return _perf_monitor
+
+
 # ============================================================================
 # DATA STRUCTURES
 # ============================================================================
@@ -134,6 +242,94 @@ class BufferPool:
                 self.pools[size] = []
 
             self.pools[size].append({"buffer": gpu_buffer.buffer, "size": size})
+
+
+class StagingBufferPool:
+    """Manages persistent staging buffers to reduce allocation overhead"""
+
+    def __init__(self, device, initial_size_mb=64):
+        self.device = device
+        self.staging_buffers = {}  # size -> buffer
+        self.max_size = initial_size_mb * 1024 * 1024
+
+    def get_staging_buffer(self, size_bytes):
+        """Get or create staging buffer for CPU->GPU or GPU->CPU transfers"""
+        # Round up to next power of 2 for better pooling
+        rounded_size = 2 ** (size_bytes - 1).bit_length()
+        rounded_size = min(rounded_size, self.max_size)
+
+        if rounded_size not in self.staging_buffers:
+            self.staging_buffers[rounded_size] = self.device.create_buffer(
+                size=rounded_size,
+                usage=wgpu.BufferUsage.COPY_SRC
+                | wgpu.BufferUsage.COPY_DST
+                | wgpu.BufferUsage.MAP_READ
+                | wgpu.BufferUsage.MAP_WRITE,
+            )
+
+        return self.staging_buffers[rounded_size]
+
+    def upload_data(self, gpu_buffer, data_np):
+        """Upload data to GPU using persistent staging buffer"""
+        size_bytes = data_np.nbytes
+
+        # For small transfers, use direct write
+        if size_bytes < 256 * 1024:  # 256KB threshold
+            self.device.queue.write_buffer(
+                gpu_buffer.buffer, 0, np.ascontiguousarray(data_np, dtype=np.float32)
+            )
+            return
+
+        # For large transfers, use staging buffer
+        staging = self.get_staging_buffer(size_bytes)
+        staging.map_sync(wgpu.MapMode.WRITE)
+        staging.write_mapped(np.ascontiguousarray(data_np, dtype=np.float32))
+        staging.unmap()
+
+        encoder = self.device.create_command_encoder()
+        encoder.copy_buffer_to_buffer(staging, 0, gpu_buffer.buffer, 0, size_bytes)
+        self.device.queue.submit([encoder.finish()])
+
+    def download_data(self, gpu_buffer, shape):
+        """Download data from GPU using persistent staging buffer"""
+        size_bytes = gpu_buffer.size * 4
+        staging = self.get_staging_buffer(size_bytes)
+
+        encoder = self.device.create_command_encoder()
+        encoder.copy_buffer_to_buffer(gpu_buffer.buffer, 0, staging, 0, size_bytes)
+        self.device.queue.submit([encoder.finish()])
+
+        staging.map_sync(wgpu.MapMode.READ)
+        data = np.frombuffer(
+            staging.read_mapped(), dtype=np.float32, count=gpu_buffer.size
+        ).copy()
+        staging.unmap()
+
+        return data.reshape(shape)
+
+
+# Global pool instance
+_staging_pool = None
+
+
+def get_staging_pool():
+    """Get or create global staging buffer pool"""
+    global _staging_pool
+    if _staging_pool is None:
+        device = get_device()
+        if device is not None:
+            _staging_pool = StagingBufferPool(device)
+    return _staging_pool
+
+
+def gpu_to_numpy_optimized(gpu_buffer):
+    """Optimized GPU to numpy with staging buffer pool"""
+    pool = get_staging_pool()
+    if pool is not None:
+        return pool.download_data(gpu_buffer, gpu_buffer.shape)
+    else:
+        # Fallback to original implementation
+        return gpu_to_numpy(gpu_buffer)
 
 
 def create_gpu_buffer(shape, data=None, device=None):

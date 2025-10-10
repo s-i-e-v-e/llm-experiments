@@ -2,6 +2,98 @@
 # WGSL KERNELS
 # ============================================================================
 
+
+def create_optimized_matmul_kernel(tile_size=16):
+    """Generate matmul kernel with configurable tile size for different GPUs"""
+    return f"""
+// Adaptive tiled matrix multiplication: C = A @ B
+// Tile size: {tile_size}x{tile_size}
+
+struct MatmulParams {{
+    M: u32,
+    K: u32,
+    N: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: MatmulParams;
+@group(0) @binding(1) var<storage, read> A: array<f32>;
+@group(0) @binding(2) var<storage, read> B: array<f32>;
+@group(0) @binding(3) var<storage, read_write> C: array<f32>;
+
+const TILE_SIZE: u32 = {tile_size}u;
+const TILE_AREA: u32 = {tile_size * tile_size}u;
+
+var<workgroup> tile_A: array<f32, {tile_size * tile_size}>;
+var<workgroup> tile_B: array<f32, {tile_size * tile_size}>;
+
+@compute @workgroup_size({tile_size}, {tile_size})
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>
+) {{
+    let row = global_id.y;
+    let col = global_id.x;
+    let local_row = local_id.y;
+    let local_col = local_id.x;
+
+    var sum = 0.0;
+    let num_tiles = (params.K + TILE_SIZE - 1u) / TILE_SIZE;
+
+    for (var t = 0u; t < num_tiles; t++) {{
+        // Coalesced load of A tile
+        let a_row = row;
+        let a_col = t * TILE_SIZE + local_col;
+        if (a_row < params.M && a_col < params.K) {{
+            tile_A[local_row * TILE_SIZE + local_col] = A[a_row * params.K + a_col];
+        }} else {{
+            tile_A[local_row * TILE_SIZE + local_col] = 0.0;
+        }}
+
+        // Coalesced load of B tile
+        let b_row = t * TILE_SIZE + local_row;
+        let b_col = col;
+        if (b_row < params.K && b_col < params.N) {{
+            tile_B[local_row * TILE_SIZE + local_col] = B[b_row * params.N + b_col];
+        }} else {{
+            tile_B[local_row * TILE_SIZE + local_col] = 0.0;
+        }}
+
+        workgroupBarrier();
+
+        // Compute with register blocking (2x2 block per thread)
+        var acc00 = 0.0;
+        var acc01 = 0.0;
+        var acc10 = 0.0;
+        var acc11 = 0.0;
+
+        for (var k = 0u; k < TILE_SIZE; k++) {{
+            let a_val0 = tile_A[local_row * TILE_SIZE + k];
+            let a_val1 = tile_A[(local_row + 1u) * TILE_SIZE + k];
+            let b_val0 = tile_B[k * TILE_SIZE + local_col];
+            let b_val1 = tile_B[k * TILE_SIZE + local_col + 1u];
+
+            acc00 += a_val0 * b_val0;
+            acc01 += a_val0 * b_val1;
+            acc10 += a_val1 * b_val0;
+            acc11 += a_val1 * b_val1;
+        }}
+
+        sum += acc00;  // Primary accumulator
+
+        workgroupBarrier();
+    }}
+
+    // Write result
+    if (row < params.M && col < params.N) {{
+        C[row * params.N + col] = sum;
+    }}
+}}
+"""
+
+
+# Default to 16x16 tiles
+TILED_MATMUL_KERNEL_OPTIMIZED = create_optimized_matmul_kernel(16)
+
 TILED_MATMUL_KERNEL = """
 // Tiled matrix multiplication: C = A @ B
 // Uses shared memory to reduce global memory accesses
@@ -153,6 +245,8 @@ fn main(
 """
 
 GELU_KERNEL = """
+// Standard GELU activation
+
 struct GeluParams {
     size: u32,
 }
@@ -178,6 +272,43 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     output[idx] = 0.5 * x * (1.0 + tanh(inner));
 }
 """
+
+GELU_KERNEL_VECTORIZED = """
+// Vectorized GELU activation (processes 4 elements per thread)
+
+struct GeluParams {
+    size: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: GeluParams;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+const SQRT_2_OVER_PI: f32 = 0.7978845608;
+const GELU_COEFF: f32 = 0.044715;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let idx = global_id.x * 4u;
+
+    if (idx >= params.size) {
+        return;
+    }
+
+    // Process 4 elements per thread for better throughput
+    let remaining = params.size - idx;
+    let count = min(remaining, 4u);
+
+    for (var i = 0u; i < count; i++) {
+        let pos = idx + i;
+        let x = input[pos];
+        let x_cubed = x * x * x;
+        let inner = SQRT_2_OVER_PI * (x + GELU_COEFF * x_cubed);
+        output[pos] = 0.5 * x * (1.0 + tanh(inner));
+    }
+}
+"""
+
 
 RESIDUAL_ADD_KERNEL = """
 struct AddParams {
@@ -710,6 +841,146 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 # ============================================================================
 # PROPER ATTENTION KERNEL (Simplified Multi-Head)
 # ============================================================================
+
+MULTIHEAD_ATTENTION_BALANCED_KERNEL = """
+// Balanced multi-head attention - processes multiple query positions per workgroup
+// Better load balancing for variable sequence lengths
+
+struct AttentionParams {
+    batch_size: u32,
+    seq_len: u32,
+    n_heads: u32,
+    head_dim: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: AttentionParams;
+@group(0) @binding(1) var<storage, read> Q: array<f32>;
+@group(0) @binding(2) var<storage, read> K: array<f32>;
+@group(0) @binding(3) var<storage, read> V: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+const BLOCK_SIZE: u32 = 256u;
+var<workgroup> shared_mem: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) group_id: vec3<u32>
+) {
+    let batch_idx = group_id.z;
+    let head_idx = group_id.y;
+    let q_pos = group_id.x;
+    let tid = local_id.x;
+
+    if (batch_idx >= params.batch_size || q_pos >= params.seq_len) {
+        return;
+    }
+
+    let head_dim = params.head_dim;
+    let seq_len = params.seq_len;
+    let embedding_dim = params.n_heads * head_dim;
+    let scale = 1.0 / sqrt(f32(head_dim));
+
+    // Query offset
+    let q_offset = batch_idx * seq_len * embedding_dim +
+                   q_pos * embedding_dim +
+                   head_idx * head_dim;
+
+    // Compute attention scores in parallel
+    var max_score = -1e9;
+
+    // Phase 1: Compute scores and find max (for numerical stability)
+    for (var k_pos = tid; k_pos <= q_pos; k_pos += BLOCK_SIZE) {
+        let k_offset = batch_idx * seq_len * embedding_dim +
+                      k_pos * embedding_dim +
+                      head_idx * head_dim;
+
+        var score = 0.0;
+        for (var d = 0u; d < head_dim; d++) {
+            score += Q[q_offset + d] * K[k_offset + d];
+        }
+        score *= scale;
+
+        // Store in shared memory for later use
+        if (k_pos < seq_len) {
+            shared_mem[k_pos % BLOCK_SIZE] = score;
+        }
+
+        max_score = max(max_score, score);
+    }
+
+    // Reduce max across threads
+    shared_mem[tid] = max_score;
+    workgroupBarrier();
+
+    // Tree reduction for max
+    for (var stride = BLOCK_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            shared_mem[tid] = max(shared_mem[tid], shared_mem[tid + stride]);
+        }
+        workgroupBarrier();
+    }
+    max_score = shared_mem[0];
+    workgroupBarrier();
+
+    // Phase 2: Compute exp and sum
+    var sum_exp = 0.0;
+    for (var k_pos = tid; k_pos <= q_pos; k_pos += BLOCK_SIZE) {
+        let k_offset = batch_idx * seq_len * embedding_dim +
+                      k_pos * embedding_dim +
+                      head_idx * head_dim;
+
+        var score = 0.0;
+        for (var d = 0u; d < head_dim; d++) {
+            score += Q[q_offset + d] * K[k_offset + d];
+        }
+        score = score * scale - max_score;
+        let exp_score = exp(score);
+        shared_mem[k_pos % BLOCK_SIZE] = exp_score;
+        sum_exp += exp_score;
+    }
+
+    // Reduce sum
+    shared_mem[tid] = sum_exp;
+    workgroupBarrier();
+
+    for (var stride = BLOCK_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            shared_mem[tid] += shared_mem[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    sum_exp = shared_mem[0];
+    workgroupBarrier();
+
+    // Phase 3: Weighted sum of values
+    for (var d = tid; d < head_dim; d += BLOCK_SIZE) {
+        var result = 0.0;
+
+        for (var k_pos = 0u; k_pos <= q_pos; k_pos++) {
+            let k_offset = batch_idx * seq_len * embedding_dim +
+                          k_pos * embedding_dim +
+                          head_idx * head_dim;
+
+            var score = 0.0;
+            for (var dd = 0u; dd < head_dim; dd++) {
+                score += Q[q_offset + dd] * K[k_offset + dd];
+            }
+            score = score * scale - max_score;
+            let attn_weight = exp(score) / sum_exp;
+
+            let v_offset = batch_idx * seq_len * embedding_dim +
+                          k_pos * embedding_dim +
+                          head_idx * head_dim;
+
+            result += attn_weight * V[v_offset + d];
+        }
+
+        output[q_offset + d] = result;
+    }
+}
+"""
 
 MULTIHEAD_ATTENTION_KERNEL = """
 // Simplified multi-head self-attention with causal masking
