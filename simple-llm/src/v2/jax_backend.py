@@ -415,10 +415,6 @@ def load_model(learning_rate: float, total_steps: int, model_path: str):
     )
 
 
-import jax
-import jax.numpy as jnp
-
-
 def sample_token(
     key, logits, temperature, top_k, top_p, min_p, repetition_penalty, recent_tokens
 ):

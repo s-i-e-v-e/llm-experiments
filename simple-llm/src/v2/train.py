@@ -45,7 +45,12 @@ def train_command(args):
     elif args.backend == "python":
         raise NotImplementedError(f"Not implemented {args.backend}")
     elif args.backend == "wgpu":
-        raise NotImplementedError(f"Not implemented {args.backend}")
+        from v2.wgpu_backend import (
+            initialize_model,
+            load_model,
+            save_model,
+            train_epoch,
+        )
     else:
         raise ValueError(f"Unknown backend {args.backend}")
 
