@@ -64,19 +64,14 @@ def train_command(args):
 
     # STEP 6: Initialize model
     model = initialize_model(
-        vocab_size=hyper.vocab_size,
-        embedding_dim=hyper.embedding_dim,
-        context_size=hyper.context_size,
-        n_heads=hyper.n_heads,
-        n_layers=hyper.n_layers,
+        hp=hyper,
         epochs=[],
-        learning_rate=hyper.learning_rate,
         total_steps=args.epochs * 1000,
     )
 
     if os.path.exists(get_model_weights_path(args.model_path)):
         print("Resuming training")
-        model = load_model(hyper.learning_rate, args.epochs * 1000, args.model_path)
+        model = load_model(hyper, args.epochs * 1000, args.model_path)
 
     # STEP 7: Training loop (backend-agnostic)
     global_step = 0

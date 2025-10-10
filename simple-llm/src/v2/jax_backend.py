@@ -9,10 +9,12 @@ import optax
 from flax import struct
 
 from common.util import deserialize, get_model_file_names, serialize
+from v2.hyper import HyperParams
 
 # JAX configuration
 jax.config.update("jax_enable_x64", False)
 jax.config.update("jax_default_matmul_precision", "bfloat16")
+from v2.hyper import HyperParams
 
 
 # ============================================================================
@@ -320,61 +322,60 @@ def create_optimizer_with_schedule(scaled_lr, total_steps):
 
 
 def initialize_model(
-    vocab_size,
-    embedding_dim,
-    context_size,
-    n_heads,
-    n_layers,
+    hp: HyperParams,
     epochs,
-    learning_rate,
     total_steps,
 ):
     """Initialize model - no pre-compilation overhead"""
     key = jax.random.PRNGKey(0)
 
     layers = []
-    for i in range(n_layers):
+    for i in range(hp.n_layers):
         key, subkey = jax.random.split(key)
         k_wq, k_wk, k_wv, k_wo, k_w1, k_w2 = jax.random.split(subkey, 6)
 
         layers.append(
             LayerParams(
-                attn_wq=jax.random.normal(k_wq, (embedding_dim, embedding_dim)) * 0.01,
-                attn_wk=jax.random.normal(k_wk, (embedding_dim, embedding_dim)) * 0.01,
-                attn_wv=jax.random.normal(k_wv, (embedding_dim, embedding_dim)) * 0.01,
-                attn_wo=jax.random.normal(k_wo, (embedding_dim, embedding_dim)) * 0.01,
-                ff_w1=jax.random.normal(k_w1, (embedding_dim, 4 * embedding_dim))
+                attn_wq=jax.random.normal(k_wq, (hp.embedding_dim, hp.embedding_dim))
                 * 0.01,
-                ff_b1=jnp.zeros((4 * embedding_dim,)),
-                ff_w2=jax.random.normal(k_w2, (4 * embedding_dim, embedding_dim))
+                attn_wk=jax.random.normal(k_wk, (hp.embedding_dim, hp.embedding_dim))
                 * 0.01,
-                ff_b2=jnp.zeros((embedding_dim,)),
-                ln_gamma1=jnp.ones((embedding_dim,)),
-                ln_beta1=jnp.zeros((embedding_dim,)),
-                ln_gamma2=jnp.ones((embedding_dim,)),
-                ln_beta2=jnp.zeros((embedding_dim,)),
+                attn_wv=jax.random.normal(k_wv, (hp.embedding_dim, hp.embedding_dim))
+                * 0.01,
+                attn_wo=jax.random.normal(k_wo, (hp.embedding_dim, hp.embedding_dim))
+                * 0.01,
+                ff_w1=jax.random.normal(k_w1, (hp.embedding_dim, 4 * hp.embedding_dim))
+                * 0.01,
+                ff_b1=jnp.zeros((4 * hp.embedding_dim,)),
+                ff_w2=jax.random.normal(k_w2, (4 * hp.embedding_dim, hp.embedding_dim))
+                * 0.01,
+                ff_b2=jnp.zeros((hp.embedding_dim,)),
+                ln_gamma1=jnp.ones((hp.embedding_dim,)),
+                ln_beta1=jnp.zeros((hp.embedding_dim,)),
+                ln_gamma2=jnp.ones((hp.embedding_dim,)),
+                ln_beta2=jnp.zeros((hp.embedding_dim,)),
             )
         )
 
     key, k1 = jax.random.split(key)
     params = ModelParams(
-        embedding=jax.random.normal(k1, (vocab_size, embedding_dim)) * 0.01,
-        pos_encoding=positional_encoding(context_size, embedding_dim),
+        embedding=jax.random.normal(k1, (hp.vocab_size, hp.embedding_dim)) * 0.01,
+        pos_encoding=positional_encoding(hp.context_size, hp.embedding_dim),
         layers=layers,
     )
 
     optimizer = create_optimizer_with_schedule(
-        scaled_lr=learning_rate, total_steps=total_steps
+        scaled_lr=hp.learning_rate, total_steps=total_steps
     )
     opt_state = optimizer.init(params)
 
     return TransformerModel(
         TransformerModelParams(
-            vocab_size=vocab_size,
-            embedding_dim=embedding_dim,
-            context_size=context_size,
-            n_heads=n_heads,
-            n_layers=n_layers,
+            vocab_size=hp.vocab_size,
+            embedding_dim=hp.embedding_dim,
+            context_size=hp.context_size,
+            n_heads=hp.n_heads,
+            n_layers=hp.n_layers,
             epochs=epochs,
         ),
         params=params,
@@ -391,18 +392,18 @@ def save_model(model: TransformerModel, model_path: str):
         json.dump(dataclasses.asdict(model.tm_params), f, indent=2)
 
 
-def load_model(learning_rate: float, total_steps: int, model_path: str):
+def load_model(hp: HyperParams, total_steps: int, model_path: str):
     xs = get_model_file_names(model_path)
     with open(xs[2], "r") as f:
         config_data = json.load(f)
-        if "epochs" not in config_data:
-            config_data["epochs"] = []
         tm_params = TransformerModelParams(**config_data)
 
     q = dataclasses.asdict(tm_params)
-    q["learning_rate"] = learning_rate
-    q["total_steps"] = total_steps
-    dummy_model = initialize_model(**q)
+    q["learning_rate"] = hp.learning_rate
+    q["batch_size"] = hp.batch_size
+    epochs = q.pop("epochs")
+    hp = HyperParams(**q)
+    dummy_model = initialize_model(hp, epochs, total_steps)
 
     params = deserialize(dummy_model.params, xs[0])
     opt_state = deserialize(dummy_model.opt_state, xs[1])

@@ -13,6 +13,7 @@ import numpy as np
 
 import v2.gpu as gpu
 from common.util import deserialize, get_model_file_names, serialize
+from v2.hyper import HyperParams
 
 # ============================================================================
 # DATA STRUCTURES
@@ -730,13 +731,8 @@ def train_epoch(
 
 
 def initialize_model(
-    vocab_size,
-    embedding_dim,
-    context_size,
-    n_heads,
-    n_layers,
+    hp: HyperParams,
     epochs,
-    learning_rate,
     total_steps,
 ):
     """Initialize model on GPU"""
@@ -749,10 +745,10 @@ def initialize_model(
         raise RuntimeError("Failed to initialize WGPU device")
 
     print(
-        f"Creating model: {n_layers} layers, {embedding_dim} dims, {vocab_size} vocab"
+        f"Creating model: {hp.n_layers} layers, {hp.embedding_dim} dims, {hp.vocab_size} vocab"
     )
     gpu_params = gpu.create_gpu_model_params(
-        vocab_size, embedding_dim, context_size, n_layers
+        hp.vocab_size, hp.embedding_dim, hp.context_size, hp.n_layers
     )
 
     print("Initializing optimizer state...")
@@ -762,16 +758,16 @@ def initialize_model(
 
     return TransformerModel(
         tm_params=TransformerModelParams(
-            vocab_size=vocab_size,
-            embedding_dim=embedding_dim,
-            context_size=context_size,
-            n_heads=n_heads,
-            n_layers=n_layers,
+            vocab_size=hp.vocab_size,
+            embedding_dim=hp.embedding_dim,
+            context_size=hp.context_size,
+            n_heads=hp.n_heads,
+            n_layers=hp.n_layers,
             epochs=epochs,
         ),
         params=gpu_params,
         opt_state=opt_state,
-        learning_rate=learning_rate,
+        learning_rate=hp.learning_rate,
         total_steps=total_steps,
     )
 
@@ -809,15 +805,13 @@ def save_model(model: TransformerModel, model_path: str):
     print("✅ Model saved")
 
 
-def load_model(learning_rate: float, total_steps: int, model_path: str):
+def load_model(hp: HyperParams, total_steps: int, model_path: str):
     """Load model from disk"""
     print(f"Loading model from {model_path}...")
     xs = get_model_file_names(model_path)
 
     with open(xs[2], "r") as f:
         config_data = json.load(f)
-        if "epochs" not in config_data:
-            config_data["epochs"] = []
         tm_params = TransformerModelParams(**config_data)
 
     device = gpu.get_device()
@@ -867,7 +861,7 @@ def load_model(learning_rate: float, total_steps: int, model_path: str):
         tm_params=tm_params,
         params=gpu_params,
         opt_state=opt_state,
-        learning_rate=learning_rate,
+        learning_rate=hp.learning_rate,
         total_steps=total_steps,
     )
 

@@ -33,7 +33,7 @@ def train_command(args):
     print(f"Tokenized corpus: {len(input_tokens)} tokens")
 
     batch_size = args.batch_size
-    seq_length = args.context_length
+    seq_length = args.context_size
 
     # Prepare training data
     print("Preparing training data...")
@@ -62,7 +62,7 @@ def train_command(args):
         model_config,
         args.resume,
         args.learning_rate,
-        args.context_length,
+        args.context_size,
     )
     smooth_loss = -math.log(1.0 / tokenizer.vocab_size)
     start_time = time.time()

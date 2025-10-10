@@ -68,7 +68,7 @@ def load_model_config(model_path: str, vocab_size: int, args):
             "d_model": args.embedding_dim,
             "n_heads": args.n_heads,
             "n_layers": args.n_layers,
-            "max_seq_len": args.context_length,
+            "max_seq_len": args.context_size,
             "epochs": [],
         }
         save_model_config(x, model_path)
@@ -90,7 +90,7 @@ class ModelConfig:
     max_seq_len: int
 
 
-def model_init(model_path, model_config, resume, learning_rate, context_length):
+def model_init(model_path, model_config, resume, learning_rate, context_size):
     if learning_rate:
         optimizer = create_optimizer(learning_rate)
     else:
@@ -237,9 +237,7 @@ def transformer_block(params, x, d_model, n_heads, mask=None):
     return output
 
 
-def jax_transformer(
-    params, tokens, vocab_size, d_model, n_heads, n_layers, max_seq_len
-):
+def jax_transformer(params, tokens, vocab_size, d_model, n_heads, n_layers, max_seq_len):
     """Pure functional transformer."""
     batch_size, seq_len = tokens.shape
 
