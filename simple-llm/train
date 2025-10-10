@@ -1,5 +1,5 @@
 #!/bin/sh
-BACKEND=jax
+BACKEND=wgpu
 EPOCHS=10
 MODEL="out/$1"
 INPUT_FILE="$2"

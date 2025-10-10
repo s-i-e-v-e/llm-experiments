@@ -15,7 +15,6 @@ import numpy as np
 
 import v2.gpu as gpu
 from common.util import deserialize, get_model_file_names, serialize
-from v2.hyper import HyperParams
 
 # ============================================================================
 # DATA STRUCTURES
