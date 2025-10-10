@@ -1,19 +1,21 @@
-"""
-Fixed high-performance GPU transformer using WGSL kernels.
-Complete implementation with all data structures and helper functions.
-"""
+"""Individual kernel dispatch functions - refactored from gpu.py"""
 
 import numpy as np
 
-from v2.gpu_batch import (
-    CommandBatcher,
-)
-from v2.gpu_kernels import (
+try:
+    import wgpu
+
+    WGPU_AVAILABLE = True
+except ImportError:
+    WGPU_AVAILABLE = False
+    wgpu = None
+
+from gpu_buffer import create_gpu_buffer
+from gpu_device import get_device, get_or_create_pipeline
+from gpu_kernels import (
     ADAMW_OPTIMIZER_KERNEL,
     BIAS_ADD_KERNEL,
     BIAS_BACKWARD_KERNEL,
-    CROSS_ENTROPY_LOSS_KERNEL,
-    EMBEDDING_KERNEL,
     EXTRACT_LAST_TOKENS_KERNEL,
     FLASHATTENTION_FORWARD_KERNEL,
     GELU_BACKWARD_KERNEL,
@@ -27,42 +29,15 @@ from v2.gpu_kernels import (
     TILED_MATMUL_KERNEL,
     TRANSPOSE_KERNEL,
 )
-from v2.gpu_util import (
-    BufferPool,
-    GPUBuffer,
-    GPUModelParams,
-    GPUOptimizerState,
-    _get_or_create_pipeline,
-    create_gpu_buffer,
-    create_gpu_model_params,
-    create_optimizer_state,
-    dict_to_gpu_layer,
-    get_device,
-    gpu_layer_to_dict,
-    gpu_to_numpy,
-    wgpu,
-)
-
-__all__ = [
-    "GPUModelParams",
-    "GPUOptimizerState",
-    "create_gpu_model_params",
-    "dict_to_gpu_layer",
-    "create_optimizer_state",
-    "EMBEDDING_KERNEL",
-    "CROSS_ENTROPY_LOSS_KERNEL",
-    "CommandBatcher",
-    "gpu_to_numpy",
-    "gpu_layer_to_dict",
-    "BufferPool",
-]
 
 # ============================================================================
-# KERNEL EXECUTION FUNCTIONS
+# FORWARD PASS OPERATIONS
 # ============================================================================
 
 
-def run_matmul(A: GPUBuffer, B: GPUBuffer, C: GPUBuffer, device=None):
+def run_matmul(
+    A: GPUBuffer, B: GPUBuffer, C: GPUBuffer, device: Optional[object] = None
+) -> None:
     """Execute tiled matrix multiplication: C = A @ B"""
     device = device or get_device()
 
@@ -76,7 +51,7 @@ def run_matmul(A: GPUBuffer, B: GPUBuffer, C: GPUBuffer, device=None):
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(TILED_MATMUL_KERNEL, device)
+    pipeline = get_or_create_pipeline(TILED_MATMUL_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -118,8 +93,8 @@ def run_layernorm(
     gamma: GPUBuffer,
     beta: GPUBuffer,
     output: GPUBuffer,
-    device=None,
-):
+    device: Optional[object] = None,
+) -> None:
     """Execute layer normalization"""
     device = device or get_device()
 
@@ -130,7 +105,7 @@ def run_layernorm(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(LAYERNORM_KERNEL, device)
+    pipeline = get_or_create_pipeline(LAYERNORM_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -183,7 +158,9 @@ def run_layernorm(
     device.queue.submit([encoder.finish()])
 
 
-def run_gelu(input_buf: GPUBuffer, output: GPUBuffer, device=None):
+def run_gelu(
+    input_buf: GPUBuffer, output: GPUBuffer, device: Optional[object] = None
+) -> None:
     """Apply GELU activation"""
     device = device or get_device()
 
@@ -194,7 +171,7 @@ def run_gelu(input_buf: GPUBuffer, output: GPUBuffer, device=None):
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(GELU_KERNEL, device)
+    pipeline = get_or_create_pipeline(GELU_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -236,8 +213,11 @@ def run_gelu(input_buf: GPUBuffer, output: GPUBuffer, device=None):
 
 
 def run_residual_add(
-    input_a: GPUBuffer, input_b: GPUBuffer, output: GPUBuffer, device=None
-):
+    input_a: GPUBuffer,
+    input_b: GPUBuffer,
+    output: GPUBuffer,
+    device: Optional[object] = None,
+) -> None:
     """Element-wise addition for residual connections"""
     device = device or get_device()
 
@@ -249,7 +229,7 @@ def run_residual_add(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(RESIDUAL_ADD_KERNEL, device)
+    pipeline = get_or_create_pipeline(RESIDUAL_ADD_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -298,7 +278,12 @@ def run_residual_add(
     device.queue.submit([encoder.finish()])
 
 
-def run_bias_add(input_buf: GPUBuffer, bias: GPUBuffer, output: GPUBuffer, device=None):
+def run_bias_add(
+    input_buf: GPUBuffer,
+    bias: GPUBuffer,
+    output: GPUBuffer,
+    device: Optional[object] = None,
+) -> None:
     """Add bias vector to each row of input matrix"""
     device = device or get_device()
 
@@ -310,7 +295,7 @@ def run_bias_add(input_buf: GPUBuffer, bias: GPUBuffer, output: GPUBuffer, devic
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(BIAS_ADD_KERNEL, device)
+    pipeline = get_or_create_pipeline(BIAS_ADD_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -356,7 +341,7 @@ def run_bias_add(input_buf: GPUBuffer, bias: GPUBuffer, output: GPUBuffer, devic
 
 
 # ============================================================================
-# BACKWARD PASS EXECUTION FUNCTIONS
+# BACKWARD PASS OPERATIONS
 # ============================================================================
 
 
@@ -366,8 +351,8 @@ def run_matmul_backward(
     grad_C: GPUBuffer,
     grad_A: GPUBuffer,
     grad_B: GPUBuffer,
-    device=None,
-):
+    device: Optional[object] = None,
+) -> None:
     """
     Backward pass for matrix multiplication
     Given: A, B, grad_C
@@ -384,7 +369,7 @@ def run_matmul_backward(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline_A = _get_or_create_pipeline(MATMUL_BACKWARD_A_KERNEL, device)
+    pipeline_A = get_or_create_pipeline(MATMUL_BACKWARD_A_KERNEL, device)
     bind_group_A = device.create_bind_group(
         layout=pipeline_A.get_bind_group_layout(0),
         entries=[
@@ -427,7 +412,7 @@ def run_matmul_backward(
     compute_pass.end()
 
     # Compute grad_B = A^T @ grad_C
-    pipeline_B = _get_or_create_pipeline(MATMUL_BACKWARD_B_KERNEL, device)
+    pipeline_B = get_or_create_pipeline(MATMUL_BACKWARD_B_KERNEL, device)
     bind_group_B = device.create_bind_group(
         layout=pipeline_B.get_bind_group_layout(0),
         entries=[
@@ -478,8 +463,8 @@ def run_layernorm_backward(
     grad_input: GPUBuffer,
     grad_gamma: GPUBuffer,
     grad_beta: GPUBuffer,
-    device=None,
-):
+    device: Optional[object] = None,
+) -> None:
     """Backward pass for layer normalization"""
     device = device or get_device()
 
@@ -495,7 +480,7 @@ def run_layernorm_backward(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(LAYERNORM_BACKWARD_KERNEL, device)
+    pipeline = get_or_create_pipeline(LAYERNORM_BACKWARD_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -571,8 +556,11 @@ def run_layernorm_backward(
 
 
 def run_gelu_backward(
-    input_buf: GPUBuffer, grad_output: GPUBuffer, grad_input: GPUBuffer, device=None
-):
+    input_buf: GPUBuffer,
+    grad_output: GPUBuffer,
+    grad_input: GPUBuffer,
+    device: Optional[object] = None,
+) -> None:
     """Backward pass for GELU activation"""
     device = device or get_device()
 
@@ -583,7 +571,7 @@ def run_gelu_backward(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(GELU_BACKWARD_KERNEL, device)
+    pipeline = get_or_create_pipeline(GELU_BACKWARD_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -632,7 +620,9 @@ def run_gelu_backward(
     device.queue.submit([encoder.finish()])
 
 
-def run_bias_backward(grad_output: GPUBuffer, grad_bias: GPUBuffer, device=None):
+def run_bias_backward(
+    grad_output: GPUBuffer, grad_bias: GPUBuffer, device: Optional[object] = None
+) -> None:
     """Backward pass for bias - sum gradients over batch"""
     device = device or get_device()
 
@@ -644,7 +634,7 @@ def run_bias_backward(grad_output: GPUBuffer, grad_bias: GPUBuffer, device=None)
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(BIAS_BACKWARD_KERNEL, device)
+    pipeline = get_or_create_pipeline(BIAS_BACKWARD_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -696,8 +686,8 @@ def run_adamw_update(
     weight_decay: float,
     eps: float,
     step: int,
-    device=None,
-):
+    device: Optional[object] = None,
+) -> None:
     """Execute AdamW optimizer update"""
     device = device or get_device()
 
@@ -714,7 +704,7 @@ def run_adamw_update(
         data=np.array([total_size], dtype=np.uint32), usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(ADAMW_OPTIMIZER_KERNEL, device)
+    pipeline = get_or_create_pipeline(ADAMW_OPTIMIZER_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -765,7 +755,7 @@ def run_adamw_update(
 
 
 # ============================================================================
-# ATTENTION AND INFERENCE HELPER FUNCTIONS
+# ATTENTION AND HELPER OPERATIONS
 # ============================================================================
 
 
@@ -775,8 +765,8 @@ def run_multihead_attention(
     V: GPUBuffer,
     output: GPUBuffer,
     n_heads: int,
-    device=None,
-):
+    device: Optional[object] = None,
+) -> None:
     """
     Execute multi-head self-attention.
 
@@ -800,7 +790,7 @@ def run_multihead_attention(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(MULTIHEAD_ATTENTION_KERNEL, device)
+    pipeline = get_or_create_pipeline(MULTIHEAD_ATTENTION_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -847,7 +837,9 @@ def run_multihead_attention(
     device.queue.submit([encoder.finish()])
 
 
-def run_transpose(input_buf: GPUBuffer, output: GPUBuffer, device=None):
+def run_transpose(
+    input_buf: GPUBuffer, output: GPUBuffer, device: Optional[object] = None
+) -> None:
     """Transpose a matrix"""
     device = device or get_device()
 
@@ -861,7 +853,7 @@ def run_transpose(input_buf: GPUBuffer, output: GPUBuffer, device=None):
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(TRANSPOSE_KERNEL, device)
+    pipeline = get_or_create_pipeline(TRANSPOSE_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -903,8 +895,12 @@ def run_transpose(input_buf: GPUBuffer, output: GPUBuffer, device=None):
 
 
 def run_extract_last_tokens(
-    input_buf: GPUBuffer, output: GPUBuffer, batch_size: int, seq_len: int, device=None
-):
+    input_buf: GPUBuffer,
+    output: GPUBuffer,
+    batch_size: int,
+    seq_len: int,
+    device: Optional[object] = None,
+) -> None:
     """Extract last token from each sequence"""
     device = device or get_device()
 
@@ -915,7 +911,7 @@ def run_extract_last_tokens(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(EXTRACT_LAST_TOKENS_KERNEL, device)
+    pipeline = get_or_create_pipeline(EXTRACT_LAST_TOKENS_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -956,11 +952,6 @@ def run_extract_last_tokens(
     device.queue.submit([encoder.finish()])
 
 
-# ============================================================================
-# FLASHATTENTION EXECUTION FUNCTIONS
-# ============================================================================
-
-
 def run_flashattention(
     Q: GPUBuffer,
     K: GPUBuffer,
@@ -968,8 +959,8 @@ def run_flashattention(
     output: GPUBuffer,
     n_heads: int,
     save_for_backward: bool = False,
-    device=None,
-):
+    device: Optional[object] = None,
+) -> GPUBuffer | Tuple[GPUBuffer, GPUBuffer, GPUBuffer]:
     """
     Execute FlashAttention with tiling and online softmax.
 
@@ -1013,7 +1004,7 @@ def run_flashattention(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = _get_or_create_pipeline(FLASHATTENTION_FORWARD_KERNEL, device)
+    pipeline = get_or_create_pipeline(FLASHATTENTION_FORWARD_KERNEL, device)
 
     bind_group = device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
@@ -1086,16 +1077,13 @@ def run_simple_attention(
     V: GPUBuffer,
     output: GPUBuffer,
     n_heads: int,
-    device=None,
-):
+    device: Optional[object] = None,
+) -> None:
     """
     Simplified attention without tiling - faster for small sequences.
     Use this instead of FlashAttention for seq_len < 512
     """
     device = device or get_device()
-
-    batch_seq, embedding_dim = Q.shape
-    head_dim = embedding_dim // n_heads
 
     # Just use the multihead attention kernel we already have
     return run_multihead_attention(Q, K, V, output, n_heads, device)

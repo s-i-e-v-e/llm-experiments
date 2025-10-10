@@ -1,7 +1,9 @@
-import numpy as np
+"""Test GPU operations - updated imports for refactored code"""
 
-from v2.gpu import run_layernorm, run_matmul
-from v2.gpu_util import WGPU_AVAILABLE, create_gpu_buffer, get_device, gpu_to_numpy
+import numpy as np
+from gpu_buffer import create_gpu_buffer, gpu_to_numpy
+from gpu_device import WGPU_AVAILABLE, get_device
+from gpu_ops import run_layernorm, run_matmul
 
 # ============================================================================
 # TEST FUNCTION
