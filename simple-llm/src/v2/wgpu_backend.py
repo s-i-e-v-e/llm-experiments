@@ -23,7 +23,7 @@ from common.util import deserialize, get_model_file_names, serialize
 class TransformerModelParams:
     vocab_size: int
     embedding_dim: int
-    context_length: int
+    context_size: int
     n_heads: int
     n_layers: int
     epochs: list = dataclasses.field(default_factory=list)
@@ -652,7 +652,7 @@ def train_epoch(
     model: TransformerModel,
     token_data: list,
     batch_size: int,
-    context_length: int,
+    context_size: int,
     epoch_num: int,
 ):
     """Train for one epoch using GPU kernels"""
@@ -660,9 +660,9 @@ def train_epoch(
     # Create sequences
     sequences = []
     stride = batch_size
-    for i in range(0, len(token_data) - context_length, stride):
-        seq = token_data[i : i + context_length + 1]
-        if len(seq) == context_length + 1:
+    for i in range(0, len(token_data) - context_size, stride):
+        seq = token_data[i : i + context_size + 1]
+        if len(seq) == context_size + 1:
             input_seq = seq[:-1]
             target_seq = seq[1:]
             sequences.append((input_seq, target_seq))
@@ -703,7 +703,7 @@ def train_epoch(
         # Progress reporting
         elapsed = time.time() - start_time
         tokens_per_sec = (
-            (batch_size * context_length * step) / elapsed if elapsed > 0 else 0
+            (batch_size * context_size * step) / elapsed if elapsed > 0 else 0
         )
 
         print(
@@ -732,7 +732,7 @@ def train_epoch(
 def initialize_model(
     vocab_size,
     embedding_dim,
-    context_length,
+    context_size,
     n_heads,
     n_layers,
     epochs,
@@ -752,7 +752,7 @@ def initialize_model(
         f"Creating model: {n_layers} layers, {embedding_dim} dims, {vocab_size} vocab"
     )
     gpu_params = gpu.create_gpu_model_params(
-        vocab_size, embedding_dim, context_length, n_layers
+        vocab_size, embedding_dim, context_size, n_layers
     )
 
     print("Initializing optimizer state...")
@@ -764,7 +764,7 @@ def initialize_model(
         tm_params=TransformerModelParams(
             vocab_size=vocab_size,
             embedding_dim=embedding_dim,
-            context_length=context_length,
+            context_size=context_size,
             n_heads=n_heads,
             n_layers=n_layers,
             epochs=epochs,
@@ -1190,11 +1190,11 @@ def generate_text(
     """
     # Encode prompt
     input_ids = tokenizer.encode(prompt)
-    context_length = model.tm_params.context_length
+    context_size = model.tm_params.context_size
 
     # Truncate if too long
-    if len(input_ids) > context_length:
-        input_ids = input_ids[-context_length:]
+    if len(input_ids) > context_size:
+        input_ids = input_ids[-context_size:]
 
     generated_tokens = list(input_ids)
     recent_tokens = list(input_ids[-20:])  # For repetition penalty
@@ -1203,14 +1203,14 @@ def generate_text(
     print("=" * 50)
 
     for i in range(max_new_tokens):
-        # Prepare input (last context_length tokens)
-        context = generated_tokens[-context_length:]
+        # Prepare input (last context_size tokens)
+        context = generated_tokens[-context_size:]
 
         # Pad if necessary
-        if len(context) < context_length:
-            context = [0] * (context_length - len(context)) + context
+        if len(context) < context_size:
+            context = [0] * (context_size - len(context)) + context
 
-        # Convert to batch format [1, context_length]
+        # Convert to batch format [1, context_size]
         input_array = np.array([context], dtype=np.int32)
 
         # Get logits for next token

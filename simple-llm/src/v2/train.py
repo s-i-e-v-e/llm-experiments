@@ -9,6 +9,7 @@ from common.util import (
     load_tokenizer,
 )
 from v2.generate import generate_text
+from v2.hyper import get_hyperparams_auto
 
 
 def train_command(args):
@@ -16,21 +17,18 @@ def train_command(args):
 
     # STEP 1: Load and preprocess corpus
     corpus_text = load_corpus(args.input_file)
+    hyper = get_hyperparams_auto(args, len(corpus_text), 4.0)
     print(f"Loaded corpus: {len(corpus_text)} characters")
 
     # STEP 2: Load or train tokenizer
     tokenizer, tokenizer_path = load_tokenizer(
-        args.model_path, args.vocab_size, corpus_text
+        args.model_path, hyper.vocab_size, corpus_text
     )
     print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
 
     # STEP 3: Tokenize corpus
     input_tokens = tokenizer.encode(corpus_text, tokenizer_path)
     print(f"Tokenized corpus: {len(input_tokens)} tokens")
-
-    # STEP 4: Calculate training parameters
-    base_lr = args.learning_rate
-    learning_rate = base_lr * math.sqrt(args.batch_size / 16)
 
     # STEP 5: Backend selection
     if args.backend == "jax":
@@ -56,29 +54,29 @@ def train_command(args):
 
     # LOG
     print("\nTraining parameters:")
-    print(f"  Context length: {args.context_length}")
-    print(f"  Batch size: {args.batch_size}")
-    print(f"  Model dimensions: {args.embedding_dim}")
-    print(f"  Number of heads: {args.n_heads}")
-    print(f"  Number of layers: {args.n_layers}")
-    print(f"  Learning rate (base): {learning_rate} ({base_lr})")
+    print(f"  Context length: {hyper.context_size}")
+    print(f"  Batch size: {hyper.batch_size}")
+    print(f"  Model dimensions: {hyper.embedding_dim}")
+    print(f"  Number of heads: {hyper.n_heads}")
+    print(f"  Number of layers: {hyper.n_layers}")
+    print(f"  Learning rate: {hyper.learning_rate}")
     print(f"  Epochs: {args.epochs}")
 
     # STEP 6: Initialize model
     model = initialize_model(
-        vocab_size=args.vocab_size,
-        embedding_dim=args.embedding_dim,
-        context_length=args.context_length,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
+        vocab_size=hyper.vocab_size,
+        embedding_dim=hyper.embedding_dim,
+        context_size=hyper.context_size,
+        n_heads=hyper.n_heads,
+        n_layers=hyper.n_layers,
         epochs=[],
-        learning_rate=learning_rate,
+        learning_rate=hyper.learning_rate,
         total_steps=args.epochs * 1000,
     )
 
-    if args.resume and os.path.exists(get_model_weights_path(args.model_path)):
+    if os.path.exists(get_model_weights_path(args.model_path)):
         print("Resuming training")
-        model = load_model(learning_rate, args.epochs * 1000, args.model_path)
+        model = load_model(hyper.learning_rate, args.epochs * 1000, args.model_path)
 
     # STEP 7: Training loop (backend-agnostic)
     global_step = 0
@@ -93,8 +91,8 @@ def train_command(args):
         model, epoch_metrics = train_epoch(
             model=model,
             token_data=input_tokens,
-            batch_size=args.batch_size,
-            context_length=args.context_length,
+            batch_size=hyper.batch_size,
+            context_size=hyper.context_size,
             epoch_num=epoch,
         )
 
@@ -105,7 +103,7 @@ def train_command(args):
 
         # Calculate tokens per second
         elapsed = time.time() - start_time
-        tokens_per_sec = (args.batch_size * args.context_length * global_step) / elapsed
+        tokens_per_sec = (hyper.batch_size * hyper.context_size * global_step) / elapsed
 
         # Log epoch results
         print(f"\nEpoch {epoch + 1} completed:")
@@ -119,8 +117,8 @@ def train_command(args):
                 "epoch": global_epoch,
                 "steps": epoch_metrics["steps"],
                 "smooth_loss": smooth_loss,
-                "learning_rate": learning_rate,
-                "batch_size": args.batch_size,
+                "learning_rate": hyper.learning_rate,
+                "batch_size": hyper.batch_size,
             }
         )
 

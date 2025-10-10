@@ -1,30 +1,6 @@
 #!/bin/sh
-train_large() {
-    BACKEND=wgpu
-    EPOCHS=10
-    EMBEDDING_DIM=288
-    CONTEXT_LENGTH=512
-    HEADS=16
-    LAYERS=8
-    BATCH_SIZE=256
-    LEARNING_RATE=0.0008
-    VOCAB=5000
-    RESUME=--resume
-    uv run app.py train $RESUME --model-path out/$1 --backend $BACKEND --vocab-size $VOCAB --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE $2
-}
-
-train_small() {
-    BACKEND=wgpu
-    EPOCHS=10
-    EMBEDDING_DIM=64
-    CONTEXT_LENGTH=128
-    HEADS=8
-    LAYERS=4
-    BATCH_SIZE=16
-    LEARNING_RATE=0.0008
-    VOCAB=800
-    RESUME=--resume
-    uv run app.py train $RESUME --model-path out/$1 --backend $BACKEND --vocab-size $VOCAB --epochs $EPOCHS --embedding-dim $EMBEDDING_DIM --n-heads $HEADS --n-layers $LAYERS --batch-size $BATCH_SIZE --context-length $CONTEXT_LENGTH --learning-rate $LEARNING_RATE $2
-}
-
-train_small $1 $2
+BACKEND=jax
+EPOCHS=10
+MODEL="out/$1"
+INPUT_FILE="$2"
+uv run app.py train --model-path "$MODEL" --backend $BACKEND --epochs $EPOCHS "$INPUT_FILE"

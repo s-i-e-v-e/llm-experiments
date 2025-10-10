@@ -10,29 +10,20 @@ def main(train_command, generate_command):
     train_parser.add_argument("--backend", default="jax", help="Backend to use")
     train_parser.add_argument("input_file", help="Input text file")
     train_parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
+    train_parser.add_argument("--embedding-dim", type=int, help="Embedding dimension")
+    train_parser.add_argument("--context-size", type=int, help="Context size")
     train_parser.add_argument(
-        "--embedding-dim", type=int, default=256, help="Embedding dimension"
+        "--n-heads", type=int, help="Number of attention heads"
     )
     train_parser.add_argument(
-        "--context-length", type=int, default=512, help="Context length"
+        "--n-layers", type=int, help="Number of transformer layers"
     )
-    train_parser.add_argument(
-        "--n-heads", type=int, default=16, help="Number of attention heads"
-    )
-    train_parser.add_argument(
-        "--n-layers", type=int, default=8, help="Number of transformer layers"
-    )
-    train_parser.add_argument(
-        "--learning-rate", type=float, default=0.001, help="Learning rate"
-    )
-    train_parser.add_argument(
-        "--vocab-size", type=int, default=5000, help="Vocabulary size for BPE"
-    )
+    train_parser.add_argument("--learning-rate", type=float, help="Learning rate")
+    train_parser.add_argument("--vocab-size", type=int, help="Vocabulary size for BPE")
     train_parser.add_argument(
         "--model-path", type=str, required=True, help="Model save path"
     )
-    train_parser.add_argument("--resume", action="store_true", help="Resume training")
-    train_parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    train_parser.add_argument("--batch-size", type=int, help="Batch size")
 
     # For generate command
     generate_parser = subparsers.add_parser(

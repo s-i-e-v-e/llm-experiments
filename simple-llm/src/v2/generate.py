@@ -18,7 +18,7 @@ def generate_text(
 ):
     """Generate text - simple non-JIT version for compatibility"""
 
-    context_length = model.tm_params.context_length
+    context_size = model.tm_params.context_size
     n_heads = model.tm_params.n_heads
     head_dim = model.tm_params.embedding_dim // n_heads
 
@@ -28,12 +28,12 @@ def generate_text(
 
     for _ in range(max_tokens):
         # Get context window
-        context_start = max(0, len(tokens) - context_length)
+        context_start = max(0, len(tokens) - context_size)
         context = tokens[context_start:]
 
         # Pad if necessary
-        if len(context) < context_length:
-            context = [0] * (context_length - len(context)) + context
+        if len(context) < context_size:
+            context = [0] * (context_size - len(context)) + context
 
         # Convert to JAX array
         context_array = jnp.array([context], dtype=jnp.int32)

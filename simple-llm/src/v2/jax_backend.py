@@ -60,7 +60,7 @@ class ModelParams:
 class TransformerModelParams:
     vocab_size: int
     embedding_dim: int
-    context_length: int
+    context_size: int
     n_heads: int
     n_layers: int
     epochs: list = dataclasses.field(default_factory=list)
@@ -204,7 +204,7 @@ def train_epoch(
     model: TransformerModel,
     token_data: list,
     batch_size: int,
-    context_length: int,
+    context_size: int,
     epoch_num: int,
 ):
     """
@@ -216,9 +216,9 @@ def train_epoch(
     # Create sequences EXACTLY like OLD code
     sequences = []
     stride = batch_size
-    for i in range(0, len(token_data) - context_length, stride):
-        seq = token_data[i : i + context_length + 1]
-        if len(seq) == context_length + 1:
+    for i in range(0, len(token_data) - context_size, stride):
+        seq = token_data[i : i + context_size + 1]
+        if len(seq) == context_size + 1:
             input_seq = seq[:-1]
             target_seq = seq[1:]
             sequences.append((input_seq, target_seq))
@@ -282,7 +282,7 @@ def train_epoch(
         # Progress reporting
         elapsed = time.time() - start_time
         tokens_per_sec = (
-            (batch_size * context_length * step) / elapsed if elapsed > 0 else 0
+            (batch_size * context_size * step) / elapsed if elapsed > 0 else 0
         )
 
         print(
@@ -322,7 +322,7 @@ def create_optimizer_with_schedule(scaled_lr, total_steps):
 def initialize_model(
     vocab_size,
     embedding_dim,
-    context_length,
+    context_size,
     n_heads,
     n_layers,
     epochs,
@@ -359,7 +359,7 @@ def initialize_model(
     key, k1 = jax.random.split(key)
     params = ModelParams(
         embedding=jax.random.normal(k1, (vocab_size, embedding_dim)) * 0.01,
-        pos_encoding=positional_encoding(context_length, embedding_dim),
+        pos_encoding=positional_encoding(context_size, embedding_dim),
         layers=layers,
     )
 
@@ -372,7 +372,7 @@ def initialize_model(
         TransformerModelParams(
             vocab_size=vocab_size,
             embedding_dim=embedding_dim,
-            context_length=context_length,
+            context_size=context_size,
             n_heads=n_heads,
             n_layers=n_layers,
             epochs=epochs,

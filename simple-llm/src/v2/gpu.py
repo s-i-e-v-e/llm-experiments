@@ -777,7 +777,7 @@ def create_gpu_layer_params(embedding_dim: int, device=None) -> GPULayerParams:
 
 
 def create_gpu_model_params(
-    vocab_size: int, embedding_dim: int, context_length: int, n_layers: int, device=None
+    vocab_size: int, embedding_dim: int, context_size: int, n_layers: int, device=None
 ) -> GPUModelParams:
     """Initialize complete GPU model"""
     device = device or get_device()
@@ -787,9 +787,9 @@ def create_gpu_model_params(
     )
     embedding = create_gpu_buffer((vocab_size, embedding_dim), embedding_data, device)
 
-    pos_encoding_data = positional_encoding(context_length, embedding_dim)
+    pos_encoding_data = positional_encoding(context_size, embedding_dim)
     pos_encoding = create_gpu_buffer(
-        (context_length, embedding_dim), pos_encoding_data, device
+        (context_size, embedding_dim), pos_encoding_data, device
     )
 
     layers = [create_gpu_layer_params(embedding_dim, device) for _ in range(n_layers)]
