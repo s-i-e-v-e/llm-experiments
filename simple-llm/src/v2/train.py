@@ -128,13 +128,13 @@ def train_command(args):
         save_model(model, args.model_path)
 
         # Generate sample
-        generation_output = generate_during_training(
-            model=model,
-            tokenizer=tokenizer,
-            tokenizer_path=tokenizer_path,
-            step_count=global_step,
-        )
-        print(generation_output)
+        # generation_output = generate_during_training(
+        #     model=model,
+        #     tokenizer=tokenizer,
+        #     tokenizer_path=tokenizer_path,
+        #     step_count=global_step,
+        # )
+        # print(generation_output)
 
     # STEP 8: Final save
     print(f"\nTraining completed! Model saved to {args.model_path}")
