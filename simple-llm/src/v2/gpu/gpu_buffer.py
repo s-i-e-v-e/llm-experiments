@@ -11,6 +11,7 @@ from gpu_types import (
     GPUBuffer1D,
     GPUBuffer2D,
     GPUBuffer3D,
+    GPUBufferAny,
     StagingPool,
 )
 

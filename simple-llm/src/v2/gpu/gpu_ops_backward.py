@@ -1,10 +1,6 @@
 """Backward pass operations - individual kernel dispatches"""
 
 import numpy as np
-from gpu_device import (
-    BindGroupEntry,
-    get_or_create_pipeline,
-)
 from gpu_kernels_backward import (
     BIAS_BACKWARD_KERNEL,
     GELU_BACKWARD_KERNEL,
@@ -12,7 +8,7 @@ from gpu_kernels_backward import (
     MATMUL_BACKWARD_A_KERNEL,
     MATMUL_BACKWARD_B_KERNEL,
 )
-from gpu_ops import _create_bind_group, _create_uniform_buffer, _dispatch_compute
+from gpu_ops import dispatch_simple_compute
 from gpu_types import GPUBuffer1D, GPUBuffer2D, PipelineCache
 
 # ============================================================================
@@ -32,25 +28,11 @@ def run_matmul_backward_a(
     assert N == N2, f"Dimension mismatch: {N} != {N2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
-    params_buffer = _create_uniform_buffer(pipeline_cache, params)
-
-    pipeline = get_or_create_pipeline(pipeline_cache, MATMUL_BACKWARD_A_KERNEL)
-
-    bind_group = _create_bind_group(
+    dispatch_simple_compute(
         pipeline_cache,
-        pipeline,
-        [
-            BindGroupEntry(0, params_buffer, 0, params.nbytes),
-            BindGroupEntry(1, grad_C.buffer, 0, grad_C.size * 4),
-            BindGroupEntry(2, B.buffer, 0, B.size * 4),
-            BindGroupEntry(3, grad_A.buffer, 0, grad_A.size * 4),
-        ],
-    )
-
-    _dispatch_compute(
-        pipeline_cache,
-        pipeline,
-        bind_group,
+        MATMUL_BACKWARD_A_KERNEL,
+        params,
+        [grad_C, B, grad_A],
         (K + 15) // 16,
         (M + 15) // 16,
         1,
@@ -69,25 +51,11 @@ def run_matmul_backward_b(
     assert M == M2, f"Dimension mismatch: {M} != {M2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
-    params_buffer = _create_uniform_buffer(pipeline_cache, params)
-
-    pipeline = get_or_create_pipeline(pipeline_cache, MATMUL_BACKWARD_B_KERNEL)
-
-    bind_group = _create_bind_group(
+    dispatch_simple_compute(
         pipeline_cache,
-        pipeline,
-        [
-            BindGroupEntry(0, params_buffer, 0, params.nbytes),
-            BindGroupEntry(1, A.buffer, 0, A.size * 4),
-            BindGroupEntry(2, grad_C.buffer, 0, grad_C.size * 4),
-            BindGroupEntry(3, grad_B.buffer, 0, grad_B.size * 4),
-        ],
-    )
-
-    _dispatch_compute(
-        pipeline_cache,
-        pipeline,
-        bind_group,
+        MATMUL_BACKWARD_B_KERNEL,
+        params,
+        [A, grad_C, grad_B],
         (N + 15) // 16,
         (K + 15) // 16,
         1,
@@ -114,25 +82,13 @@ def run_layernorm_backward(
     pipeline_cache.device.wgpu_device.queue.write_buffer(grad_beta.buffer, 0, zero_data)
 
     params = np.array([size, n_elements], dtype=np.uint32)
-    params_buffer = _create_uniform_buffer(pipeline_cache, params)
-
-    pipeline = get_or_create_pipeline(pipeline_cache, LAYERNORM_BACKWARD_KERNEL)
-
-    bind_group = _create_bind_group(
+    dispatch_simple_compute(
         pipeline_cache,
-        pipeline,
-        [
-            BindGroupEntry(0, params_buffer, 0, params.nbytes),
-            BindGroupEntry(1, input_buf.buffer, 0, input_buf.size * 4),
-            BindGroupEntry(2, gamma.buffer, 0, gamma.size * 4),
-            BindGroupEntry(3, grad_output.buffer, 0, grad_output.size * 4),
-            BindGroupEntry(4, grad_input.buffer, 0, grad_input.size * 4),
-            BindGroupEntry(5, grad_gamma.buffer, 0, grad_gamma.size * 4),
-            BindGroupEntry(6, grad_beta.buffer, 0, grad_beta.size * 4),
-        ],
+        LAYERNORM_BACKWARD_KERNEL,
+        params,
+        [input_buf, gamma, grad_output, grad_input, grad_gamma, grad_beta],
+        n_elements,
     )
-
-    _dispatch_compute(pipeline_cache, pipeline, bind_group, n_elements)
 
 
 def run_gelu_backward(
@@ -145,22 +101,13 @@ def run_gelu_backward(
     total_size = input_buf.size
 
     params = np.array([total_size], dtype=np.uint32)
-    params_buffer = _create_uniform_buffer(pipeline_cache, params)
-
-    pipeline = get_or_create_pipeline(pipeline_cache, GELU_BACKWARD_KERNEL)
-
-    bind_group = _create_bind_group(
+    dispatch_simple_compute(
         pipeline_cache,
-        pipeline,
-        [
-            BindGroupEntry(0, params_buffer, 0, params.nbytes),
-            BindGroupEntry(1, input_buf.buffer, 0, input_buf.size * 4),
-            BindGroupEntry(2, grad_output.buffer, 0, grad_output.size * 4),
-            BindGroupEntry(3, grad_input.buffer, 0, grad_input.size * 4),
-        ],
+        GELU_BACKWARD_KERNEL,
+        params,
+        [input_buf, grad_output, grad_input],
+        (total_size + 255) // 256,
     )
-
-    _dispatch_compute(pipeline_cache, pipeline, bind_group, (total_size + 255) // 256)
 
 
 def run_bias_backward(
@@ -173,18 +120,10 @@ def run_bias_backward(
     total_size = n_elements * dim
 
     params = np.array([total_size, dim], dtype=np.uint32)
-    params_buffer = _create_uniform_buffer(pipeline_cache, params)
-
-    pipeline = get_or_create_pipeline(pipeline_cache, BIAS_BACKWARD_KERNEL)
-
-    bind_group = _create_bind_group(
+    dispatch_simple_compute(
         pipeline_cache,
-        pipeline,
-        [
-            BindGroupEntry(0, params_buffer, 0, params.nbytes),
-            BindGroupEntry(1, grad_output.buffer, 0, grad_output.size * 4),
-            BindGroupEntry(2, grad_bias.buffer, 0, grad_bias.size * 4),
-        ],
+        BIAS_BACKWARD_KERNEL,
+        params,
+        [grad_output, grad_bias],
+        (dim + 255) // 256,
     )
-
-    _dispatch_compute(pipeline_cache, pipeline, bind_group, (dim + 255) // 256)

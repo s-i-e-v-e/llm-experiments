@@ -1,7 +1,20 @@
-- The GPUBuffer shape handling could be more type-safe
-- Bind group creation pattern repeated everywhere with slight variations
-- active_workspaces: Dict[tuple, dict] in WorkspaceManager - nested dicts. Should use typed data classes
-- Many functions in gpu_batch.py have partial typing. Return types often missing
+- Duplicate Matmul Functions - KEEP AS-IS for performance reasons
+
+---
+
+Issue: atomicAdd(&dQ[offset], dQi[i]) is not valid WGSL
+
+Location: FLASHATTENTION_BACKWARD_KERNEL
+
+Problem: WGSL doesn't support atomicAdd on f32 types
+
+Fix: Either:
+
+    Use atomic<u32> with bitcast/reinterpret operations
+
+    Redesign the algorithm to avoid atomic operations on floats
+
+    Use workgroup-level accumulation instead
 
 
 Logical Bugs to Investigate

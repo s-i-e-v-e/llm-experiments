@@ -12,16 +12,6 @@ class Device:
     adapter: object = None  # Optional adapter reference
 
 
-@dataclass
-class PipelineCache:
-    """Compute pipeline cache state"""
-
-    device: Device
-    pipelines: Dict[Tuple[int, int], object] = field(
-        default_factory=dict
-    )  # (device_id, shader_hash) -> pipeline
-
-
 # ============================================================================
 # Dimension-specific GPU Buffer Types
 # ============================================================================
@@ -230,3 +220,28 @@ class StagingPool:
     device: Device
     staging_buffers: Dict[int, object] = field(default_factory=dict)
     max_size: int = 0
+
+
+# ============================================================================
+# Pipeline Cache Types (add to existing file)
+# ============================================================================
+
+
+@dataclass
+class BindGroupEntry:
+    """Entry for bind group creation"""
+
+    binding: int
+    buffer: object
+    offset: int
+    size: int
+
+
+@dataclass
+class PipelineCache:
+    """Cache for compiled GPU pipelines"""
+
+    device: object
+    pipelines: Dict[str, object] = field(default_factory=dict)
+    bind_groups: Dict[int, object] = field(default_factory=dict)
+    bind_group_counter: int = 0

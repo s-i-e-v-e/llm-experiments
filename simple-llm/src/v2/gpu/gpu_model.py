@@ -3,7 +3,7 @@
 from typing import Dict
 
 import numpy as np
-from gpu_buffer import create_gpu_buffer
+from gpu_buffer import create_gpu_buffer_1d, create_gpu_buffer_2d
 from gpu_types import Device, GPULayerParams, GPUModelParams, GPUOptimizerState
 
 # ============================================================================
@@ -35,36 +35,38 @@ def create_gpu_layer_params(device: Device, embedding_dim: int) -> GPULayerParam
     dim = embedding_dim
 
     return GPULayerParams(
-        attn_wq=create_gpu_buffer(
-            device, (dim, dim), np.random.normal(0, 0.02, (dim, dim)).astype(np.float32)
+        attn_wq=create_gpu_buffer_2d(
+            device, dim, dim, np.random.normal(0, 0.02, (dim, dim)).astype(np.float32)
         ),
-        attn_wk=create_gpu_buffer(
-            device, (dim, dim), np.random.normal(0, 0.02, (dim, dim)).astype(np.float32)
+        attn_wk=create_gpu_buffer_2d(
+            device, dim, dim, np.random.normal(0, 0.02, (dim, dim)).astype(np.float32)
         ),
-        attn_wv=create_gpu_buffer(
-            device, (dim, dim), np.random.normal(0, 0.02, (dim, dim)).astype(np.float32)
+        attn_wv=create_gpu_buffer_2d(
+            device, dim, dim, np.random.normal(0, 0.02, (dim, dim)).astype(np.float32)
         ),
-        attn_wo=create_gpu_buffer(
-            device, (dim, dim), np.random.normal(0, 0.02, (dim, dim)).astype(np.float32)
+        attn_wo=create_gpu_buffer_2d(
+            device, dim, dim, np.random.normal(0, 0.02, (dim, dim)).astype(np.float32)
         ),
-        ff_w1=create_gpu_buffer(
+        ff_w1=create_gpu_buffer_2d(
             device,
-            (dim, 4 * dim),
+            dim,
+            4 * dim,
             np.random.normal(0, 0.02, (dim, 4 * dim)).astype(np.float32),
         ),
-        ff_b1=create_gpu_buffer(
-            device, (4 * dim,), np.zeros(4 * dim, dtype=np.float32)
+        ff_b1=create_gpu_buffer_1d(
+            device, 4 * dim, np.zeros(4 * dim, dtype=np.float32)
         ),
-        ff_w2=create_gpu_buffer(
+        ff_w2=create_gpu_buffer_2d(
             device,
-            (4 * dim, dim),
+            4 * dim,
+            dim,
             np.random.normal(0, 0.02, (4 * dim, dim)).astype(np.float32),
         ),
-        ff_b2=create_gpu_buffer(device, (dim,), np.zeros(dim, dtype=np.float32)),
-        ln_gamma1=create_gpu_buffer(device, (dim,), np.ones(dim, dtype=np.float32)),
-        ln_beta1=create_gpu_buffer(device, (dim,), np.zeros(dim, dtype=np.float32)),
-        ln_gamma2=create_gpu_buffer(device, (dim,), np.ones(dim, dtype=np.float32)),
-        ln_beta2=create_gpu_buffer(device, (dim,), np.zeros(dim, dtype=np.float32)),
+        ff_b2=create_gpu_buffer_1d(device, dim, np.zeros(dim, dtype=np.float32)),
+        ln_gamma1=create_gpu_buffer_1d(device, dim, np.ones(dim, dtype=np.float32)),
+        ln_beta1=create_gpu_buffer_1d(device, dim, np.zeros(dim, dtype=np.float32)),
+        ln_gamma2=create_gpu_buffer_1d(device, dim, np.ones(dim, dtype=np.float32)),
+        ln_beta2=create_gpu_buffer_1d(device, dim, np.zeros(dim, dtype=np.float32)),
     )
 
 
@@ -76,16 +78,19 @@ def create_gpu_model_params(
     n_layers: int,
 ) -> GPUModelParams:
     """Initialize complete GPU model"""
+    # Embedding table
     embedding_data = np.random.normal(0, 0.02, (vocab_size, embedding_dim)).astype(
         np.float32
     )
-    embedding = create_gpu_buffer(device, (vocab_size, embedding_dim), embedding_data)
+    embedding = create_gpu_buffer_2d(device, vocab_size, embedding_dim, embedding_data)
 
+    # Positional encoding
     pos_encoding_data = positional_encoding(context_size, embedding_dim)
-    pos_encoding = create_gpu_buffer(
-        device, (context_size, embedding_dim), pos_encoding_data
+    pos_encoding = create_gpu_buffer_2d(
+        device, context_size, embedding_dim, pos_encoding_data
     )
 
+    # Layers
     layers = [create_gpu_layer_params(device, embedding_dim) for _ in range(n_layers)]
 
     return GPUModelParams(embedding=embedding, pos_encoding=pos_encoding, layers=layers)
@@ -100,22 +105,25 @@ def create_optimizer_state(model_params: GPUModelParams) -> GPUOptimizerState:
     """Initialize optimizer state (zero moments)"""
     device = model_params.embedding.device
 
-    m_embedding = create_gpu_buffer(
+    # Embedding momentum and variance
+    m_embedding = create_gpu_buffer_2d(
         device,
-        model_params.embedding.shape,
+        *model_params.embedding.shape,
         np.zeros(model_params.embedding.shape, dtype=np.float32),
     )
-    v_embedding = create_gpu_buffer(
+    v_embedding = create_gpu_buffer_2d(
         device,
-        model_params.embedding.shape,
+        *model_params.embedding.shape,
         np.zeros(model_params.embedding.shape, dtype=np.float32),
     )
 
+    # Layer moments
     m_layers = []
     v_layers = []
     for layer in model_params.layers:
         dim = layer.attn_wq.shape[0]
 
+        # Create layer params for momentum
         m_layer = create_gpu_layer_params(device, dim)
         v_layer = create_gpu_layer_params(device, dim)
 
@@ -187,16 +195,16 @@ def dict_to_gpu_layer(
     dim = embedding_dim
 
     return GPULayerParams(
-        attn_wq=create_gpu_buffer(device, (dim, dim), data["attn_wq"]),
-        attn_wk=create_gpu_buffer(device, (dim, dim), data["attn_wk"]),
-        attn_wv=create_gpu_buffer(device, (dim, dim), data["attn_wv"]),
-        attn_wo=create_gpu_buffer(device, (dim, dim), data["attn_wo"]),
-        ff_w1=create_gpu_buffer(device, (dim, 4 * dim), data["ff_w1"]),
-        ff_b1=create_gpu_buffer(device, (4 * dim,), data["ff_b1"]),
-        ff_w2=create_gpu_buffer(device, (4 * dim, dim), data["ff_w2"]),
-        ff_b2=create_gpu_buffer(device, (dim,), data["ff_b2"]),
-        ln_gamma1=create_gpu_buffer(device, (dim,), data["ln_gamma1"]),
-        ln_beta1=create_gpu_buffer(device, (dim,), data["ln_beta1"]),
-        ln_gamma2=create_gpu_buffer(device, (dim,), data["ln_gamma2"]),
-        ln_beta2=create_gpu_buffer(device, (dim,), data["ln_beta2"]),
+        attn_wq=create_gpu_buffer_2d(device, dim, dim, data["attn_wq"]),
+        attn_wk=create_gpu_buffer_2d(device, dim, dim, data["attn_wk"]),
+        attn_wv=create_gpu_buffer_2d(device, dim, dim, data["attn_wv"]),
+        attn_wo=create_gpu_buffer_2d(device, dim, dim, data["attn_wo"]),
+        ff_w1=create_gpu_buffer_2d(device, dim, 4 * dim, data["ff_w1"]),
+        ff_b1=create_gpu_buffer_1d(device, 4 * dim, data["ff_b1"]),
+        ff_w2=create_gpu_buffer_2d(device, 4 * dim, dim, data["ff_w2"]),
+        ff_b2=create_gpu_buffer_1d(device, dim, data["ff_b2"]),
+        ln_gamma1=create_gpu_buffer_1d(device, dim, data["ln_gamma1"]),
+        ln_beta1=create_gpu_buffer_1d(device, dim, data["ln_beta1"]),
+        ln_gamma2=create_gpu_buffer_1d(device, dim, data["ln_gamma2"]),
+        ln_beta2=create_gpu_buffer_1d(device, dim, data["ln_beta2"]),
     )
