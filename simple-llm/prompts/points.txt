@@ -549,3 +549,17 @@ for step in range(1, num_steps + 1):
         eps=1e-8,
         step=step
     )
+
+----
+# The training loop can now safely run with:
+
+# Create pool with 2GB limit
+pool = create_buffer_pool(device, max_total_memory_mb=2048)
+
+# Periodically clean up workspaces
+if step % 100 == 0:
+    workspace_release_lru(workspace_mgr, keep_count=2)
+
+# Monitor memory
+stats = get_pool_memory_stats(pool)
+print(f"GPU Memory: {stats['in_use'] / 1e6:.1f} MB in use, {stats['pooled'] / 1e6:.1f} MB pooled")

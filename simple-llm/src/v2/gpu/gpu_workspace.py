@@ -120,3 +120,51 @@ def workspace_clear_all(manager: WorkspaceManager) -> None:
     """Release all workspaces"""
     for key in list(manager.active_workspaces.keys()):
         workspace_release(manager, *key)
+
+
+def workspace_release_lru(manager: WorkspaceManager, keep_count: int = 2) -> int:
+    """
+    Release least recently used workspaces, keeping only `keep_count` most recent.
+
+    This implements LRU eviction to prevent unbounded memory growth during training.
+
+    Args:
+        manager: Workspace manager state (MUTATED)
+        keep_count: Number of workspaces to keep (most recently accessed)
+
+    Returns:
+        Number of workspaces released
+    """
+    if len(manager.active_workspaces) <= keep_count:
+        return 0
+
+    # For simplicity, release smallest workspaces first
+    # In production, would track access times for true LRU
+    sorted_keys = sorted(
+        manager.active_workspaces.keys(),
+        key=lambda k: k[0] * k[1],  # Sort by batch_size * seq_len
+    )
+
+    num_to_release = len(sorted_keys) - keep_count
+    released = 0
+
+    for key in sorted_keys[:num_to_release]:
+        workspace_release(manager, *key)
+        released += 1
+
+    return released
+
+
+def workspace_get_memory_usage(manager: WorkspaceManager) -> Dict[str, int]:
+    """
+    Get memory usage statistics for workspace manager.
+
+    Returns:
+        Dictionary with:
+        - num_workspaces: Number of active workspaces
+        - workspace_configs: List of (batch_size, seq_len) tuples
+    """
+    return {
+        "num_workspaces": len(manager.active_workspaces),
+        "workspace_configs": list(manager.active_workspaces.keys()),
+    }

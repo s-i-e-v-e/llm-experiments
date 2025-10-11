@@ -138,9 +138,19 @@ def create_tuned_pipeline(
 def get_or_create_pipeline(
     pipeline_cache: PipelineCache, shader_code: str
 ) -> WGPUComputePipeline:
-    """Cache compute pipelines to avoid recompilation"""
+    """
+    Cache compute pipelines to avoid recompilation.
+
+    Uses SHA256 hash of shader code to avoid collisions.
+    Previously used Python hash() which can collide for different shaders.
+    """
+    import hashlib
+
     device = pipeline_cache.device
-    cache_key = (id(device.wgpu_device), hash(shader_code))
+
+    # FIXED: Use SHA256 instead of hash() to avoid collisions
+    shader_hash = hashlib.sha256(shader_code.encode("utf-8")).hexdigest()
+    cache_key = (id(device.wgpu_device), shader_hash)
 
     if cache_key not in pipeline_cache.pipelines:
         shader_module = device.wgpu_device.create_shader_module(code=shader_code)

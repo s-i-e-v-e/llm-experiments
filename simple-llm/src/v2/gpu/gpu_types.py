@@ -107,9 +107,12 @@ class BufferPool:
     """Memory pool state for reusable GPU buffers"""
 
     device: Device
-    max_size: int
+    max_size: int  # Max size per individual buffer
     pools: Dict[int, List[BufferInfo]] = field(default_factory=dict)
     in_use: Set[int] = field(default_factory=set)
+    # NEW: Total memory tracking
+    total_memory_bytes: int = 0  # Current total memory allocated
+    max_total_memory_bytes: int = 0  # Maximum total memory allowed (0 = unlimited)
 
 
 @dataclass
@@ -119,6 +122,7 @@ class StagingPool:
     device: Device
     staging_buffers: Dict[int, WGPUBuffer] = field(default_factory=dict)
     max_size: int = 0
+    max_entries: int = 8  # NEW: Limit number of different sized buffers
 
 
 # ============================================================================

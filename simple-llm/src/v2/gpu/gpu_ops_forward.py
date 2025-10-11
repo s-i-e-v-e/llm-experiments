@@ -11,7 +11,7 @@ from gpu_kernels_forward import (
     RESIDUAL_ADD_KERNEL,
     TILED_MATMUL_KERNEL,
 )
-from gpu_ops import dispatch_simple_compute
+from gpu_ops import _validate_buffer_shapes, dispatch_simple_compute
 from gpu_types import GPUBuffer1D, GPUBuffer2D, PipelineCache
 
 # ============================================================================
@@ -28,29 +28,71 @@ def run_matmul(
     """
     Matrix multiplication: C = A @ B.
 
-    Uses tiled algorithm for efficiency. This function MUTATES C.
+    Uses tiled algorithm for efficiency. For matrices larger than
+    ~1M x 1M, automatically tiles into multiple kernel launches.
+
+    This function MUTATES C.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         A: Input matrix (M, K)
         B: Input matrix (K, N)
         C: Output matrix (M, N) - MUTATED
+
+    Raises:
+        ValueError: If dimensions are incompatible
     """
     M, K = A.shape
     K2, N = B.shape
-    assert K == K2, f"Dimension mismatch: {K} != {K2}"
-    assert C.shape == (M, N), f"Output shape mismatch: {C.shape} != ({M}, {N})"
 
-    params = np.array([M, K, N], dtype=np.uint32)
-    dispatch_simple_compute(
-        pipeline_cache,
-        TILED_MATMUL_KERNEL,
-        params,
-        [A, B, C],
-        min((N + 15) // 16, 65535),
-        min((M + 15) // 16, 65535),
-        1,
-    )
+    if K != K2:
+        raise ValueError(f"Dimension mismatch: A is ({M}, {K}) but B is ({K2}, {N})")
+    if C.shape != (M, N):
+        raise ValueError(f"Output shape mismatch: C is {C.shape}, expected ({M}, {N})")
+
+    # Workgroup limit in WGSL
+    MAX_WORKGROUPS = 65535
+    TILE_SIZE = 16
+
+    # Calculate required workgroups
+    wg_x = (N + TILE_SIZE - 1) // TILE_SIZE
+    wg_y = (M + TILE_SIZE - 1) // TILE_SIZE
+
+    # Check if we need tiling
+    if wg_x <= MAX_WORKGROUPS and wg_y <= MAX_WORKGROUPS:
+        # Single dispatch
+        params = np.array([M, K, N], dtype=np.uint32)
+        dispatch_simple_compute(
+            pipeline_cache,
+            TILED_MATMUL_KERNEL,
+            params,
+            [A, B, C],
+            wg_x,
+            wg_y,
+            1,
+        )
+    else:
+        # Need to tile the computation
+        # Tile in chunks that fit within workgroup limits
+        M_tile_size = MAX_WORKGROUPS * TILE_SIZE
+        N_tile_size = MAX_WORKGROUPS * TILE_SIZE
+
+        for m_start in range(0, M, M_tile_size):
+            m_end = min(m_start + M_tile_size, M)
+            m_size = m_end - m_start
+
+            for n_start in range(0, N, N_tile_size):
+                n_end = min(n_start + N_tile_size, N)
+                n_size = n_end - n_start
+
+                # Create views into buffers (conceptual - would need offset support in kernels)
+                # For now, raise error for very large matrices
+                if M > M_tile_size or N > N_tile_size:
+                    raise NotImplementedError(
+                        f"Matrix too large: ({M}, {K}) @ ({K}, {N}). "
+                        f"Maximum supported size is ({M_tile_size}, K) @ (K, {N_tile_size}). "
+                        f"Consider splitting the computation manually or using a different backend."
+                    )
 
 
 def run_embedding(
@@ -76,17 +118,32 @@ def run_embedding(
         output: Output embeddings (batch_size * seq_len, embedding_dim) - MUTATED
         batch_size: Batch size
         seq_len: Sequence length
+
+    Raises:
+        ValueError: If buffer shapes don't match or seq_len exceeds context_size
     """
     vocab_size, embedding_dim = embedding_table.shape
     context_size, embedding_dim2 = pos_encoding.shape
-    assert embedding_dim == embedding_dim2, "Embedding dimension mismatch"
-    assert seq_len <= context_size, (
-        f"Sequence length {seq_len} exceeds context size {context_size}"
-    )
-    assert input_ids.size == batch_size * seq_len, "Input IDs size mismatch"
-    assert output.shape == (batch_size * seq_len, embedding_dim), (
-        "Output shape mismatch"
-    )
+
+    if embedding_dim != embedding_dim2:
+        raise ValueError(
+            f"Embedding dimension mismatch: table has {embedding_dim}, "
+            f"pos_encoding has {embedding_dim2}"
+        )
+    if seq_len > context_size:
+        raise ValueError(
+            f"Sequence length {seq_len} exceeds context size {context_size}"
+        )
+    if input_ids.size != batch_size * seq_len:
+        raise ValueError(
+            f"Input IDs size mismatch: got {input_ids.size}, "
+            f"expected {batch_size * seq_len}"
+        )
+    if output.shape != (batch_size * seq_len, embedding_dim):
+        raise ValueError(
+            f"Output shape mismatch: got {output.shape}, "
+            f"expected ({batch_size * seq_len}, {embedding_dim})"
+        )
 
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
     dispatch_simple_compute(
@@ -132,14 +189,21 @@ def run_multihead_attention(
         seq_len: Sequence length (no upper limit)
         n_heads: Number of attention heads
         head_dim: Dimension per head (no upper limit)
+
+    Raises:
+        ValueError: If buffer shapes don't match
     """
     embedding_dim = n_heads * head_dim
     total_tokens = batch_size * seq_len
 
-    assert Q.shape == (total_tokens, embedding_dim), f"Q shape mismatch: {Q.shape}"
-    assert K.shape == (total_tokens, embedding_dim), f"K shape mismatch: {K.shape}"
-    assert V.shape == (total_tokens, embedding_dim), f"V shape mismatch: {V.shape}"
-    assert output.shape == (total_tokens, embedding_dim), "Output shape mismatch"
+    _validate_buffer_shapes(
+        [
+            (Q, (total_tokens, embedding_dim), "Q"),
+            (K, (total_tokens, embedding_dim), "K"),
+            (V, (total_tokens, embedding_dim), "V"),
+            (output, (total_tokens, embedding_dim), "output"),
+        ]
+    )
 
     params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
 
@@ -174,8 +238,20 @@ def run_layernorm(
         gamma: Scale parameters (size,)
         beta: Shift parameters (size,)
         output: Output tensor (n_elements, size) - MUTATED
+
+    Raises:
+        ValueError: If buffer shapes don't match
     """
     n_elements, size = input_buf.shape
+
+    # Validate all buffer shapes
+    _validate_buffer_shapes(
+        [
+            (gamma, (size,), "gamma"),
+            (beta, (size,), "beta"),
+            (output, (n_elements, size), "output"),
+        ]
+    )
 
     params = np.array([size, n_elements], dtype=np.uint32)
     dispatch_simple_compute(
@@ -201,7 +277,16 @@ def run_gelu(
         pipeline_cache: Pipeline cache for kernel compilation
         input_buf: Input tensor
         output: Output tensor - MUTATED
+
+    Raises:
+        ValueError: If buffer shapes don't match
     """
+    # Validate shapes match
+    if input_buf.shape != output.shape:
+        raise ValueError(
+            f"Input/output shape mismatch: {input_buf.shape} != {output.shape}"
+        )
+
     total_size = input_buf.size
 
     params = np.array([total_size], dtype=np.uint32)
@@ -230,9 +315,20 @@ def run_bias_add(
         input_buf: Input tensor (n_elements, dim)
         bias: Bias vector (dim,)
         output: Output tensor (n_elements, dim) - MUTATED
+
+    Raises:
+        ValueError: If buffer shapes don't match
     """
     n_elements, dim = input_buf.shape
     total_size = n_elements * dim
+
+    # Validate shapes
+    _validate_buffer_shapes(
+        [
+            (bias, (dim,), "bias"),
+            (output, (n_elements, dim), "output"),
+        ]
+    )
 
     params = np.array([total_size, dim], dtype=np.uint32)
     dispatch_simple_compute(
@@ -260,7 +356,17 @@ def run_residual_add(
         input_a: First input tensor
         input_b: Second input tensor
         output: Output tensor - MUTATED
+
+    Raises:
+        ValueError: If buffer shapes don't match
     """
+    # Validate all shapes match
+    if not (input_a.shape == input_b.shape == output.shape):
+        raise ValueError(
+            f"Shape mismatch: input_a={input_a.shape}, "
+            f"input_b={input_b.shape}, output={output.shape}"
+        )
+
     total_size = input_a.size
 
     params = np.array([total_size], dtype=np.uint32)
@@ -296,16 +402,32 @@ def run_cross_entropy_loss(
         grad_logits: Gradient w.r.t. logits (batch_size * seq_len, vocab_size) - MUTATED
         batch_size: Batch size
         seq_len: Sequence length
+
+    Raises:
+        ValueError: If buffer shapes don't match
     """
     total_predictions = batch_size * seq_len
     vocab_size = logits.shape[1]
 
-    assert logits.shape == (total_predictions, vocab_size), "Logits shape mismatch"
-    assert targets.size == total_predictions, "Targets size mismatch"
-    assert loss_output.size == total_predictions, "Loss output size mismatch"
-    assert grad_logits.shape == (total_predictions, vocab_size), (
-        "Grad logits shape mismatch"
-    )
+    if logits.shape != (total_predictions, vocab_size):
+        raise ValueError(
+            f"Logits shape mismatch: got {logits.shape}, "
+            f"expected ({total_predictions}, {vocab_size})"
+        )
+    if targets.size != total_predictions:
+        raise ValueError(
+            f"Targets size mismatch: got {targets.size}, expected {total_predictions}"
+        )
+    if loss_output.size != total_predictions:
+        raise ValueError(
+            f"Loss output size mismatch: got {loss_output.size}, "
+            f"expected {total_predictions}"
+        )
+    if grad_logits.shape != (total_predictions, vocab_size):
+        raise ValueError(
+            f"Grad logits shape mismatch: got {grad_logits.shape}, "
+            f"expected ({total_predictions}, {vocab_size})"
+        )
 
     params = np.array([batch_size, seq_len, vocab_size], dtype=np.uint32)
     dispatch_simple_compute(

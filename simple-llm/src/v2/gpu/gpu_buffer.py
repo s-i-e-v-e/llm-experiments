@@ -173,7 +173,9 @@ def clear_buffer(gpu_buffer: GPUBufferAny) -> None:
 # ============================================================================
 
 
-def create_buffer_pool(device: Device, max_buffer_size_mb: int = 512) -> BufferPool:
+def create_buffer_pool(
+    device: Device, max_buffer_size_mb: int = 512, max_total_memory_mb: int = 2048
+) -> BufferPool:
     """
     Create a memory pool state for reusable GPU buffers.
 
@@ -181,13 +183,25 @@ def create_buffer_pool(device: Device, max_buffer_size_mb: int = 512) -> BufferP
 
     Args:
         device: GPU device state
-        max_buffer_size_mb: Maximum size of pooled buffers in MB
+        max_buffer_size_mb: Maximum size of individual pooled buffers in MB
+        max_total_memory_mb: Maximum total pool memory in MB (0 = unlimited)
 
     Returns:
-        Buffer pool state
+        Buffer pool state with memory limits enforced
     """
     max_size = max_buffer_size_mb * 1024 * 1024 // 4  # Convert to float32 count
-    return BufferPool(device=device, max_size=max_size, pools={}, in_use=set())
+    max_total_bytes = (
+        max_total_memory_mb * 1024 * 1024 if max_total_memory_mb > 0 else 0
+    )
+
+    return BufferPool(
+        device=device,
+        max_size=max_size,
+        pools={},
+        in_use=set(),
+        total_memory_bytes=0,
+        max_total_memory_bytes=max_total_bytes,
+    )
 
 
 def _pool_take_buffer_internal(
@@ -200,6 +214,9 @@ def _pool_take_buffer_internal(
     The returned buffer is removed from pool.pools and added to pool.in_use.
     Caller owns the buffer and must return it with pool_release_buffer().
 
+    Raises:
+        MemoryError: If creating new buffer would exceed max_total_memory_bytes
+
     Args:
         pool_state: Buffer pool state (MUTATED)
         shape: Buffer shape (for documentation only)
@@ -208,21 +225,134 @@ def _pool_take_buffer_internal(
     Returns:
         Raw WGPU buffer
     """
+    # Try to reuse from pool first
     if size in pool_state.pools and len(pool_state.pools[size]) > 0:
         buffer_info = pool_state.pools[size].pop()
         pool_state.in_use.add(id(buffer_info.buffer))
         return buffer_info.buffer
 
+    # Need to create new buffer - check memory limit
+    buffer_size_bytes = size * 4
+
+    if pool_state.max_total_memory_bytes > 0:
+        if (
+            pool_state.total_memory_bytes + buffer_size_bytes
+            > pool_state.max_total_memory_bytes
+        ):
+            # Try to free unused buffers
+            freed = _pool_evict_unused_buffers_internal(pool_state, buffer_size_bytes)
+            if freed < buffer_size_bytes:
+                raise MemoryError(
+                    f"Cannot allocate {buffer_size_bytes} bytes. "
+                    f"Current: {pool_state.total_memory_bytes}, "
+                    f"Max: {pool_state.max_total_memory_bytes}, "
+                    f"Available: {pool_state.max_total_memory_bytes - pool_state.total_memory_bytes}"
+                )
+
     # Create new buffer
-    buffer_size = size * 4
     buffer = pool_state.device.wgpu_device.create_buffer(
-        size=buffer_size,
+        size=buffer_size_bytes,
         usage=wgpu.BufferUsage.STORAGE
         | wgpu.BufferUsage.COPY_SRC
         | wgpu.BufferUsage.COPY_DST,
     )
+
     pool_state.in_use.add(id(buffer))
+    pool_state.total_memory_bytes += buffer_size_bytes
+
     return buffer
+
+
+def _pool_evict_unused_buffers_internal(
+    pool_state: BufferPool, needed_bytes: int
+) -> int:
+    """
+    Internal: Evict unused buffers from pool to free memory.
+
+    Eviction strategy: Remove smallest buffers first (they're least likely to be reused).
+
+    Args:
+        pool_state: Buffer pool state (MUTATED)
+        needed_bytes: Minimum bytes to free
+
+    Returns:
+        Total bytes freed
+    """
+    freed_bytes = 0
+
+    # Sort sizes smallest first
+    sorted_sizes = sorted(pool_state.pools.keys())
+
+    for size in sorted_sizes:
+        if freed_bytes >= needed_bytes:
+            break
+
+        buffer_list = pool_state.pools[size]
+        while buffer_list and freed_bytes < needed_bytes:
+            buffer_info = buffer_list.pop()
+            # Buffer is automatically freed by WGPU when no references exist
+            freed_bytes += size * 4
+            pool_state.total_memory_bytes -= size * 4
+
+        # Remove empty size categories
+        if not buffer_list:
+            del pool_state.pools[size]
+
+    return freed_bytes
+
+
+def pool_release_buffer(pool_state: BufferPool, gpu_buffer: GPUBufferAny) -> None:
+    """
+    Return buffer to pool for reuse (mutation).
+
+    This function MUTATES pool_state by adding buffer back to the pool.
+    After calling this, the buffer should not be used by the caller.
+
+    Args:
+        pool_state: Buffer pool state (MUTATED)
+        gpu_buffer: GPU buffer to return to pool
+    """
+    buffer_id = id(gpu_buffer.buffer)
+    if buffer_id in pool_state.in_use:
+        pool_state.in_use.remove(buffer_id)
+
+    size = gpu_buffer.size
+    if size not in pool_state.pools:
+        pool_state.pools[size] = []
+
+    buffer_info = BufferInfo(buffer=gpu_buffer.buffer)
+    pool_state.pools[size].append(buffer_info)
+
+
+def get_pool_memory_stats(pool_state: BufferPool) -> Dict[str, int]:
+    """
+    Get memory statistics for buffer pool.
+
+    Returns:
+        Dictionary with memory statistics in bytes:
+        - total_allocated: Total memory currently allocated
+        - in_use: Memory for buffers currently in use
+        - pooled: Memory for buffers available in pool
+        - num_pooled_buffers: Number of buffers in pool
+        - num_in_use_buffers: Number of buffers in use
+    """
+    pooled_bytes = sum(
+        len(buffers) * size * 4 for size, buffers in pool_state.pools.items()
+    )
+
+    in_use_bytes = pool_state.total_memory_bytes - pooled_bytes
+
+    num_pooled = sum(len(buffers) for buffers in pool_state.pools.values())
+    num_in_use = len(pool_state.in_use)
+
+    return {
+        "total_allocated": pool_state.total_memory_bytes,
+        "in_use": in_use_bytes,
+        "pooled": pooled_bytes,
+        "num_pooled_buffers": num_pooled,
+        "num_in_use_buffers": num_in_use,
+        "max_total": pool_state.max_total_memory_bytes,
+    }
 
 
 def pool_take_buffer_1d(pool_state: BufferPool, size: int) -> GPUBuffer1D:
@@ -289,35 +419,14 @@ def pool_take_buffer_3d(
     return GPUBuffer3D(buffer=buffer, shape=shape, size=size, device=pool_state.device)
 
 
-def pool_release_buffer(pool_state: BufferPool, gpu_buffer: GPUBufferAny) -> None:
-    """
-    Return buffer to pool for reuse (mutation).
-
-    This function MUTATES pool_state by adding buffer back to the pool.
-    After calling this, the buffer should not be used by the caller.
-
-    Args:
-        pool_state: Buffer pool state (MUTATED)
-        gpu_buffer: GPU buffer to return to pool
-    """
-    buffer_id = id(gpu_buffer.buffer)
-    if buffer_id in pool_state.in_use:
-        pool_state.in_use.remove(buffer_id)
-
-    size = gpu_buffer.size
-    if size not in pool_state.pools:
-        pool_state.pools[size] = []
-
-    buffer_info = BufferInfo(buffer=gpu_buffer.buffer)
-    pool_state.pools[size].append(buffer_info)
-
-
 # ============================================================================
 # STAGING BUFFER POOL
 # ============================================================================
 
 
-def create_staging_pool(device: Device, initial_size_mb: int = 64) -> StagingPool:
+def create_staging_pool(
+    device: Device, initial_size_mb: int = 64, max_entries: int = 8
+) -> StagingPool:
     """
     Create staging buffer pool state for CPU-GPU transfers.
 
@@ -326,6 +435,7 @@ def create_staging_pool(device: Device, initial_size_mb: int = 64) -> StagingPoo
     Args:
         device: GPU device state
         initial_size_mb: Initial maximum staging buffer size in MB
+        max_entries: Maximum number of different-sized buffers to cache
 
     Returns:
         Staging pool state
@@ -334,6 +444,7 @@ def create_staging_pool(device: Device, initial_size_mb: int = 64) -> StagingPoo
         device=device,
         staging_buffers={},
         max_size=initial_size_mb * 1024 * 1024,
+        max_entries=max_entries,
     )
 
 
@@ -344,6 +455,7 @@ def _get_staging_buffer_internal(
     Internal: Get or create staging buffer for CPU-GPU or GPU-CPU transfers.
 
     Staging buffers are reused and persist in the pool (not taken out).
+    Implements LRU eviction when max_entries is exceeded.
 
     Args:
         pool_state: Staging pool state (MUTATED if new buffer created)
@@ -357,6 +469,13 @@ def _get_staging_buffer_internal(
     rounded_size = min(rounded_size, pool_state.max_size)
 
     if rounded_size not in pool_state.staging_buffers:
+        # Check if we need to evict
+        if len(pool_state.staging_buffers) >= pool_state.max_entries:
+            # Evict smallest buffer (least likely to be reused)
+            smallest_size = min(pool_state.staging_buffers.keys())
+            del pool_state.staging_buffers[smallest_size]
+
+        # Create new buffer
         pool_state.staging_buffers[rounded_size] = (
             pool_state.device.wgpu_device.create_buffer(
                 size=rounded_size,

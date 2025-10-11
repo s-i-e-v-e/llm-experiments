@@ -1,6 +1,6 @@
 """Core GPU operations and compute dispatch"""
 
-from typing import List, Union
+from typing import List, Tuple, Union
 
 import numpy as np
 from gpu_device import (
@@ -121,6 +121,25 @@ def dispatch_simple_compute(
     )
 
     # params_buffer goes out of scope here, but WGPU keeps it alive until GPU finishes
+
+
+def _validate_buffer_shapes(
+    buffers: List[Tuple[GPUBufferAny, Tuple[int, ...], str]],
+) -> None:
+    """
+    Validate buffer shapes match expected dimensions.
+
+    Args:
+        buffers: List of (buffer, expected_shape, name) tuples
+
+    Raises:
+        ValueError: If any buffer shape doesn't match expected
+    """
+    for buffer, expected_shape, name in buffers:
+        if buffer.shape != expected_shape:
+            raise ValueError(
+                f"{name} shape mismatch: got {buffer.shape}, expected {expected_shape}"
+            )
 
 
 # ============================================================================
