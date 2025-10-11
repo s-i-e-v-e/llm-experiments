@@ -1,5 +1,7 @@
 """Individual kernel dispatch functions"""
 
+from typing import Tuple
+
 import numpy as np
 
 try:
@@ -11,7 +13,7 @@ except ImportError:
     wgpu = None
 
 from gpu_buffer import create_gpu_buffer
-from gpu_device import get_device, get_or_create_pipeline
+from gpu_device import get_or_create_pipeline
 from gpu_kernels import (
     BIAS_ADD_KERNEL,
     EXTRACT_LAST_TOKENS_KERNEL,
@@ -23,20 +25,21 @@ from gpu_kernels import (
     TILED_MATMUL_KERNEL,
     TRANSPOSE_KERNEL,
 )
+from gpu_types import GPUBuffer, PipelineCache
 
 
 # ============================================================================
 # FORWARD PASS OPERATIONS
 # ============================================================================
 def run_matmul(
-    A: GPUBuffer, B: GPUBuffer, C: GPUBuffer, device: Optional[object] = None
+    pipeline_cache: PipelineCache, A: GPUBuffer, B: GPUBuffer, C: GPUBuffer
 ) -> None:
     """
     Represents a core matrix multiplication, fundamental for linear transformations in both attention and feed-forward layers.
 
     Execute tiled matrix multiplication: C = A @ B
     """
-    device = device or get_device()
+    device = pipeline_cache.device
 
     M, K = A.shape
     K2, N = B.shape
@@ -44,13 +47,13 @@ def run_matmul(
     assert C.shape == (M, N), f"Output shape mismatch: {C.shape} != ({M}, {N})"
 
     params = np.array([M, K, N], dtype=np.uint32)
-    params_buffer = device.create_buffer_with_data(
+    params_buffer = device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = get_or_create_pipeline(TILED_MATMUL_KERNEL, device)
+    pipeline = get_or_create_pipeline(pipeline_cache, TILED_MATMUL_KERNEL)
 
-    bind_group = device.create_bind_group(
+    bind_group = device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -76,37 +79,37 @@ def run_matmul(
         ],
     )
 
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
     compute_pass.dispatch_workgroups((N + 15) // 16, (M + 15) // 16, 1)
     compute_pass.end()
-    device.queue.submit([encoder.finish()])
+    device.wgpu_device.queue.submit([encoder.finish()])
 
 
 def run_layernorm(
+    pipeline_cache: PipelineCache,
     input_buf: GPUBuffer,
     gamma: GPUBuffer,
     beta: GPUBuffer,
     output: GPUBuffer,
-    device: Optional[object] = None,
 ) -> None:
     """
     Applies layer normalization to stabilize the activations.
     """
-    device = device or get_device()
+    device = pipeline_cache.device
 
     n_elements, size = input_buf.shape
 
     params = np.array([size, n_elements], dtype=np.uint32)
-    params_buffer = device.create_buffer_with_data(
+    params_buffer = device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = get_or_create_pipeline(LAYERNORM_KERNEL, device)
+    pipeline = get_or_create_pipeline(pipeline_cache, LAYERNORM_KERNEL)
 
-    bind_group = device.create_bind_group(
+    bind_group = device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -148,33 +151,33 @@ def run_layernorm(
         ],
     )
 
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
     compute_pass.dispatch_workgroups(n_elements, 1, 1)
     compute_pass.end()
-    device.queue.submit([encoder.finish()])
+    device.wgpu_device.queue.submit([encoder.finish()])
 
 
 def run_gelu(
-    input_buf: GPUBuffer, output: GPUBuffer, device: Optional[object] = None
+    pipeline_cache: PipelineCache, input_buf: GPUBuffer, output: GPUBuffer
 ) -> None:
     """
     An element-wise activation function used in the feed-forward networks.
     """
-    device = device or get_device()
+    device = pipeline_cache.device
 
     total_size = input_buf.size
 
     params = np.array([total_size], dtype=np.uint32)
-    params_buffer = device.create_buffer_with_data(
+    params_buffer = device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = get_or_create_pipeline(GELU_KERNEL, device)
+    pipeline = get_or_create_pipeline(pipeline_cache, GELU_KERNEL)
 
-    bind_group = device.create_bind_group(
+    bind_group = device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -204,39 +207,39 @@ def run_gelu(
         ],
     )
 
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
     compute_pass.dispatch_workgroups((total_size + 255) // 256, 1, 1)
     compute_pass.end()
-    device.queue.submit([encoder.finish()])
+    device.wgpu_device.queue.submit([encoder.finish()])
 
 
 def run_residual_add(
+    pipeline_cache: PipelineCache,
     input_a: GPUBuffer,
     input_b: GPUBuffer,
     output: GPUBuffer,
-    device: Optional[object] = None,
 ) -> None:
     """
     Implements the skip/residual connection by adding the input of a block to its output.
 
     Element-wise addition for residual connections
     """
-    device = device or get_device()
+    device = pipeline_cache.device
 
     total_size = input_a.size
     assert input_a.size == input_b.size == output.size
 
     params = np.array([total_size], dtype=np.uint32)
-    params_buffer = device.create_buffer_with_data(
+    params_buffer = device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = get_or_create_pipeline(RESIDUAL_ADD_KERNEL, device)
+    pipeline = get_or_create_pipeline(pipeline_cache, RESIDUAL_ADD_KERNEL)
 
-    bind_group = device.create_bind_group(
+    bind_group = device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -274,35 +277,35 @@ def run_residual_add(
         ],
     )
 
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
     compute_pass.dispatch_workgroups((total_size + 255) // 256, 1, 1)
     compute_pass.end()
-    device.queue.submit([encoder.finish()])
+    device.wgpu_device.queue.submit([encoder.finish()])
 
 
 def run_bias_add(
+    pipeline_cache: PipelineCache,
     input_buf: GPUBuffer,
     bias: GPUBuffer,
     output: GPUBuffer,
-    device: Optional[object] = None,
 ) -> None:
     """Add bias vector to each row of input matrix"""
-    device = device or get_device()
+    device = pipeline_cache.device
 
     n_elements, dim = input_buf.shape
     total_size = n_elements * dim
 
     params = np.array([total_size, dim], dtype=np.uint32)
-    params_buffer = device.create_buffer_with_data(
+    params_buffer = device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = get_or_create_pipeline(BIAS_ADD_KERNEL, device)
+    pipeline = get_or_create_pipeline(pipeline_cache, BIAS_ADD_KERNEL)
 
-    bind_group = device.create_bind_group(
+    bind_group = device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -336,13 +339,13 @@ def run_bias_add(
         ],
     )
 
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
     compute_pass.dispatch_workgroups((total_size + 255) // 256, 1, 1)
     compute_pass.end()
-    device.queue.submit([encoder.finish()])
+    device.wgpu_device.queue.submit([encoder.finish()])
 
 
 # ============================================================================
@@ -351,12 +354,12 @@ def run_bias_add(
 
 
 def run_multihead_attention(
+    pipeline_cache: PipelineCache,
     Q: GPUBuffer,
     K: GPUBuffer,
     V: GPUBuffer,
     output: GPUBuffer,
     n_heads: int,
-    device: Optional[object] = None,
 ) -> None:
     """
     A standard implementation of the attention mechanism.
@@ -368,7 +371,7 @@ def run_multihead_attention(
         output: [batch_size * seq_len, embedding_dim]
         n_heads: Number of attention heads
     """
-    device = device or get_device()
+    device = pipeline_cache.device
 
     batch_seq, embedding_dim = Q.shape
     head_dim = embedding_dim // n_heads
@@ -379,13 +382,13 @@ def run_multihead_attention(
     seq_len = batch_seq
 
     params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
-    params_buffer = device.create_buffer_with_data(
+    params_buffer = device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = get_or_create_pipeline(MULTIHEAD_ATTENTION_KERNEL, device)
+    pipeline = get_or_create_pipeline(pipeline_cache, MULTIHEAD_ATTENTION_KERNEL)
 
-    bind_group = device.create_bind_group(
+    bind_group = device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -419,7 +422,7 @@ def run_multihead_attention(
         ],
     )
 
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
@@ -427,17 +430,17 @@ def run_multihead_attention(
     # Launch one workgroup per (batch, head, query_position)
     compute_pass.dispatch_workgroups(seq_len, n_heads, batch_size)
     compute_pass.end()
-    device.queue.submit([encoder.finish()])
+    device.wgpu_device.queue.submit([encoder.finish()])
 
 
 def run_flashattention(
+    pipeline_cache: PipelineCache,
     Q: GPUBuffer,
     K: GPUBuffer,
     V: GPUBuffer,
     output: GPUBuffer,
     n_heads: int,
     save_for_backward: bool = False,
-    device: Optional[object] = None,
 ) -> GPUBuffer | Tuple[GPUBuffer, GPUBuffer, GPUBuffer]:
     """
     A memory-efficient, optimized implementation of the attention mechanism.
@@ -454,7 +457,7 @@ def run_flashattention(
         If save_for_backward: (output, L_buffer, M_buffer)
         Else: output
     """
-    device = device or get_device()
+    device = pipeline_cache.device
 
     batch_seq, embedding_dim = Q.shape
     head_dim = embedding_dim // n_heads
@@ -472,21 +475,21 @@ def run_flashattention(
 
     # Create statistics buffers if needed
     if save_for_backward:
-        L_buffer = create_gpu_buffer((batch_size, seq_len, n_heads), device=device)
-        M_buffer = create_gpu_buffer((batch_size, seq_len, n_heads), device=device)
+        L_buffer = create_gpu_buffer(device, (batch_size, seq_len, n_heads))
+        M_buffer = create_gpu_buffer(device, (batch_size, seq_len, n_heads))
     else:
         # Dummy buffers (won't be used)
-        L_buffer = create_gpu_buffer((1,), device=device)
-        M_buffer = create_gpu_buffer((1,), device=device)
+        L_buffer = create_gpu_buffer(device, (1,))
+        M_buffer = create_gpu_buffer(device, (1,))
 
     params = np.array([batch_size, seq_len, n_heads, head_dim, Bc, Br], dtype=np.uint32)
-    params_buffer = device.create_buffer_with_data(
+    params_buffer = device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = get_or_create_pipeline(FLASHATTENTION_FORWARD_KERNEL, device)
+    pipeline = get_or_create_pipeline(pipeline_cache, FLASHATTENTION_FORWARD_KERNEL)
 
-    bind_group = device.create_bind_group(
+    bind_group = device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -536,7 +539,7 @@ def run_flashattention(
         ],
     )
 
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
@@ -544,7 +547,7 @@ def run_flashattention(
     # Launch one workgroup per (batch, head, Q_block)
     compute_pass.dispatch_workgroups(num_q_blocks, n_heads, batch_size)
     compute_pass.end()
-    device.queue.submit([encoder.finish()])
+    device.wgpu_device.queue.submit([encoder.finish()])
 
     if save_for_backward:
         return output, L_buffer, M_buffer
@@ -552,28 +555,26 @@ def run_flashattention(
 
 
 def run_simple_attention(
+    pipeline_cache: PipelineCache,
     Q: GPUBuffer,
     K: GPUBuffer,
     V: GPUBuffer,
     output: GPUBuffer,
     n_heads: int,
-    device: Optional[object] = None,
 ) -> None:
     """
     Simplified attention without tiling - faster for small sequences.
     Use this instead of FlashAttention for seq_len < 512
     """
-    device = device or get_device()
-
     # Just use the multihead attention kernel we already have
-    return run_multihead_attention(Q, K, V, output, n_heads, device)
+    return run_multihead_attention(pipeline_cache, Q, K, V, output, n_heads)
 
 
 def run_transpose(
-    input_buf: GPUBuffer, output: GPUBuffer, device: Optional[object] = None
+    pipeline_cache: PipelineCache, input_buf: GPUBuffer, output: GPUBuffer
 ) -> None:
     """A sub-operation, often used within attention to align matrix dimensions for multiplication (e.g., transposing the Key matrix)."""
-    device = device or get_device()
+    device = pipeline_cache.device
 
     rows, cols = input_buf.shape
     assert output.shape == (cols, rows), (
@@ -581,13 +582,13 @@ def run_transpose(
     )
 
     params = np.array([rows, cols], dtype=np.uint32)
-    params_buffer = device.create_buffer_with_data(
+    params_buffer = device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = get_or_create_pipeline(TRANSPOSE_KERNEL, device)
+    pipeline = get_or_create_pipeline(pipeline_cache, TRANSPOSE_KERNEL)
 
-    bind_group = device.create_bind_group(
+    bind_group = device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -617,35 +618,35 @@ def run_transpose(
         ],
     )
 
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
     compute_pass.dispatch_workgroups((cols + 15) // 16, (rows + 15) // 16, 1)
     compute_pass.end()
-    device.queue.submit([encoder.finish()])
+    device.wgpu_device.queue.submit([encoder.finish()])
 
 
 def run_extract_last_tokens(
+    pipeline_cache: PipelineCache,
     input_buf: GPUBuffer,
     output: GPUBuffer,
     batch_size: int,
     seq_len: int,
-    device: Optional[object] = None,
 ) -> None:
     """A utility function used at the end of the forward pass to select the final hidden states, which are then used for next-token prediction."""
-    device = device or get_device()
+    device = pipeline_cache.device
 
     embedding_dim = input_buf.size // (batch_size * seq_len)
 
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
-    params_buffer = device.create_buffer_with_data(
+    params_buffer = device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = get_or_create_pipeline(EXTRACT_LAST_TOKENS_KERNEL, device)
+    pipeline = get_or_create_pipeline(pipeline_cache, EXTRACT_LAST_TOKENS_KERNEL)
 
-    bind_group = device.create_bind_group(
+    bind_group = device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -675,10 +676,10 @@ def run_extract_last_tokens(
         ],
     )
 
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
     compute_pass.dispatch_workgroups((embedding_dim + 255) // 256, batch_size, 1)
     compute_pass.end()
-    device.queue.submit([encoder.finish()])
+    device.wgpu_device.queue.submit([encoder.finish()])

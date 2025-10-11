@@ -2,7 +2,7 @@
 
 import numpy as np
 from gpu_buffer import create_gpu_buffer, gpu_to_numpy
-from gpu_device import WGPU_AVAILABLE, get_device
+from gpu_device import WGPU_AVAILABLE, create_device, create_pipeline_cache
 from gpu_ops import run_layernorm, run_matmul
 
 # ============================================================================
@@ -10,16 +10,18 @@ from gpu_ops import run_layernorm, run_matmul
 # ============================================================================
 
 
-def test_fixed_kernels():
+def test_fixed_kernels() -> None:
     """Test the fixed implementation"""
     if not WGPU_AVAILABLE:
         print("⚠️  wgpu not available, skipping tests")
         return
 
-    device = get_device()
+    device = create_device()
     if device is None:
         print("⚠️  Could not initialize device")
         return
+
+    pipeline_cache = create_pipeline_cache(device)
 
     print("\n🧪 Testing Fixed Kernels\n")
 
@@ -30,11 +32,11 @@ def test_fixed_kernels():
     B_data = np.random.randn(K, N).astype(np.float32)
     C_expected = A_data @ B_data
 
-    A_gpu = create_gpu_buffer((M, K), A_data, device)
-    B_gpu = create_gpu_buffer((K, N), B_data, device)
-    C_gpu = create_gpu_buffer((M, N), device=device)
+    A_gpu = create_gpu_buffer(device, (M, K), A_data)
+    B_gpu = create_gpu_buffer(device, (K, N), B_data)
+    C_gpu = create_gpu_buffer(device, (M, N))
 
-    run_matmul(A_gpu, B_gpu, C_gpu, device)
+    run_matmul(pipeline_cache, A_gpu, B_gpu, C_gpu)
     C_result = gpu_to_numpy(C_gpu)
 
     error = np.abs(C_result - C_expected).max()
@@ -53,12 +55,12 @@ def test_fixed_kernels():
     var = x_data.var(axis=1, keepdims=True)
     x_norm_expected = (x_data - mean) / np.sqrt(var + 1e-5)
 
-    x_gpu = create_gpu_buffer((batch, dim), x_data, device)
-    gamma_gpu = create_gpu_buffer((dim,), gamma_data, device)
-    beta_gpu = create_gpu_buffer((dim,), beta_data, device)
-    out_gpu = create_gpu_buffer((batch, dim), device=device)
+    x_gpu = create_gpu_buffer(device, (batch, dim), x_data)
+    gamma_gpu = create_gpu_buffer(device, (dim,), gamma_data)
+    beta_gpu = create_gpu_buffer(device, (dim,), beta_data)
+    out_gpu = create_gpu_buffer(device, (batch, dim))
 
-    run_layernorm(x_gpu, gamma_gpu, beta_gpu, out_gpu, device)
+    run_layernorm(pipeline_cache, x_gpu, gamma_gpu, beta_gpu, out_gpu)
     out_result = gpu_to_numpy(out_gpu)
 
     error = np.abs(out_result - x_norm_expected).max()

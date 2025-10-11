@@ -3,7 +3,7 @@
 from typing import Dict, Tuple
 
 from gpu_buffer import pool_get_buffer, pool_release_buffer
-from gpu_types import GPUBuffer, GPUModelParams, WorkspaceManager
+from gpu_types import BufferPool, Device, GPUBuffer, GPUModelParams, WorkspaceManager
 
 # ============================================================================
 # WORKSPACE MANAGER
@@ -11,10 +11,10 @@ from gpu_types import GPUBuffer, GPUModelParams, WorkspaceManager
 
 
 def create_workspace_manager(
-    device: object, buffer_pool_state: dict
+    device: Device, buffer_pool: BufferPool
 ) -> WorkspaceManager:
     """Create workspace manager state"""
-    return WorkspaceManager(device=device, buffer_pool=buffer_pool_state)
+    return WorkspaceManager(device=device, buffer_pool=buffer_pool)
 
 
 def workspace_get(

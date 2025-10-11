@@ -10,13 +10,13 @@ except ImportError:
     WGPU_AVAILABLE = False
     wgpu = None
 
-from gpu_device import get_device, get_or_create_pipeline
-from gpu_kernels import (
-    ADAMW_OPTIMIZER_KERNEL,
-)
+from gpu_device import get_or_create_pipeline
+from gpu_kernels import ADAMW_OPTIMIZER_KERNEL
+from gpu_types import GPUBuffer, PipelineCache
 
 
 def run_adamw_update(
+    pipeline_cache: PipelineCache,
     gradients: GPUBuffer,
     weights: GPUBuffer,
     m: GPUBuffer,
@@ -27,27 +27,25 @@ def run_adamw_update(
     weight_decay: float,
     eps: float,
     step: int,
-    device: Optional[object] = None,
 ) -> None:
     """Execute AdamW optimizer update"""
-    device = device or get_device()
-
+    device = pipeline_cache.device
     total_size = weights.size
 
     opt_params = np.array(
         [lr, beta1, beta2, weight_decay, eps, float(step)], dtype=np.float32
     )
-    opt_params_buffer = device.create_buffer_with_data(
+    opt_params_buffer = device.wgpu_device.create_buffer_with_data(
         data=opt_params, usage=wgpu.BufferUsage.UNIFORM
     )
 
-    size_buffer = device.create_buffer_with_data(
+    size_buffer = device.wgpu_device.create_buffer_with_data(
         data=np.array([total_size], dtype=np.uint32), usage=wgpu.BufferUsage.UNIFORM
     )
 
-    pipeline = get_or_create_pipeline(ADAMW_OPTIMIZER_KERNEL, device)
+    pipeline = get_or_create_pipeline(pipeline_cache, ADAMW_OPTIMIZER_KERNEL)
 
-    bind_group = device.create_bind_group(
+    bind_group = device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -86,10 +84,10 @@ def run_adamw_update(
         ],
     )
 
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
     compute_pass.dispatch_workgroups((total_size + 255) // 256, 1, 1)
     compute_pass.end()
-    device.queue.submit([encoder.finish()])
+    device.wgpu_device.queue.submit([encoder.finish()])

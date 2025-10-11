@@ -23,16 +23,16 @@ from gpu_kernels import (
     RESIDUAL_ADD_KERNEL,
     TILED_MATMUL_KERNEL,
 )
-from gpu_types import BatchState, GPUBuffer
+from gpu_types import BatchState, Device, GPUBuffer, PipelineCache
 
 # ============================================================================
 # COMMAND BATCH STATE
 # ============================================================================
 
 
-def create_command_batch(device: object, enable_profiling: bool = False) -> BatchState:
+def create_command_batch(device: Device, enable_profiling: bool = False) -> BatchState:
     """Create command batch state for batched GPU operations"""
-    encoder = device.create_command_encoder()
+    encoder = device.wgpu_device.create_command_encoder()
     return BatchState(
         device=device,
         encoder=encoder,
@@ -43,20 +43,24 @@ def create_command_batch(device: object, enable_profiling: bool = False) -> Batc
 
 
 def batch_add_matmul(
-    batch_state: BatchState, A: GPUBuffer, B: GPUBuffer, C: GPUBuffer
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    A: GPUBuffer,
+    B: GPUBuffer,
+    C: GPUBuffer,
 ) -> BatchState:
     """Add matmul to batch. Returns updated batch_state."""
     M, K = A.shape
     K2, N = B.shape
 
     params = np.array([M, K, N], dtype=np.uint32)
-    params_buffer = batch_state.device.create_buffer_with_data(
+    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
     batch_state.retained_buffers.append(params_buffer)
 
-    pipeline = get_or_create_pipeline(TILED_MATMUL_KERNEL, batch_state.device)
-    bind_group = batch_state.device.create_bind_group(
+    pipeline = get_or_create_pipeline(pipeline_cache, TILED_MATMUL_KERNEL)
+    bind_group = batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -97,6 +101,7 @@ def batch_add_matmul(
 
 
 def batch_add_layernorm(
+    pipeline_cache: PipelineCache,
     batch_state: BatchState,
     input_buf: GPUBuffer,
     gamma: GPUBuffer,
@@ -107,13 +112,13 @@ def batch_add_layernorm(
     n_elements, size = input_buf.shape
 
     params = np.array([size, n_elements], dtype=np.uint32)
-    params_buffer = batch_state.device.create_buffer_with_data(
+    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
     batch_state.retained_buffers.append(params_buffer)
 
-    pipeline = get_or_create_pipeline(LAYERNORM_KERNEL, batch_state.device)
-    bind_group = batch_state.device.create_bind_group(
+    pipeline = get_or_create_pipeline(pipeline_cache, LAYERNORM_KERNEL)
+    bind_group = batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -170,19 +175,22 @@ def batch_add_layernorm(
 
 
 def batch_add_gelu(
-    batch_state: BatchState, input_buf: GPUBuffer, output: GPUBuffer
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    input_buf: GPUBuffer,
+    output: GPUBuffer,
 ) -> BatchState:
     """Add GELU to batch. Returns updated batch_state."""
     total_size = input_buf.size
 
     params = np.array([total_size], dtype=np.uint32)
-    params_buffer = batch_state.device.create_buffer_with_data(
+    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
     batch_state.retained_buffers.append(params_buffer)
 
-    pipeline = get_or_create_pipeline(GELU_KERNEL, batch_state.device)
-    bind_group = batch_state.device.create_bind_group(
+    pipeline = get_or_create_pipeline(pipeline_cache, GELU_KERNEL)
+    bind_group = batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -223,20 +231,24 @@ def batch_add_gelu(
 
 
 def batch_add_bias_add(
-    batch_state: BatchState, input_buf: GPUBuffer, bias: GPUBuffer, output: GPUBuffer
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    input_buf: GPUBuffer,
+    bias: GPUBuffer,
+    output: GPUBuffer,
 ) -> BatchState:
     """Add bias addition to batch. Returns updated batch_state."""
     n_elements, dim = input_buf.shape
     total_size = n_elements * dim
 
     params = np.array([total_size, dim], dtype=np.uint32)
-    params_buffer = batch_state.device.create_buffer_with_data(
+    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
     batch_state.retained_buffers.append(params_buffer)
 
-    pipeline = get_or_create_pipeline(BIAS_ADD_KERNEL, batch_state.device)
-    bind_group = batch_state.device.create_bind_group(
+    pipeline = get_or_create_pipeline(pipeline_cache, BIAS_ADD_KERNEL)
+    bind_group = batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -285,19 +297,23 @@ def batch_add_bias_add(
 
 
 def batch_add_residual(
-    batch_state: BatchState, input_a: GPUBuffer, input_b: GPUBuffer, output: GPUBuffer
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    input_a: GPUBuffer,
+    input_b: GPUBuffer,
+    output: GPUBuffer,
 ) -> BatchState:
     """Add residual connection to batch. Returns updated batch_state."""
     total_size = input_a.size
 
     params = np.array([total_size], dtype=np.uint32)
-    params_buffer = batch_state.device.create_buffer_with_data(
+    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
     batch_state.retained_buffers.append(params_buffer)
 
-    pipeline = get_or_create_pipeline(RESIDUAL_ADD_KERNEL, batch_state.device)
-    bind_group = batch_state.device.create_bind_group(
+    pipeline = get_or_create_pipeline(pipeline_cache, RESIDUAL_ADD_KERNEL)
+    bind_group = batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -374,7 +390,11 @@ def batch_add_copy(
 
 
 def batch_add_matmul_backward_a(
-    batch_state: BatchState, grad_C: GPUBuffer, B: GPUBuffer, grad_A: GPUBuffer
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    grad_C: GPUBuffer,
+    B: GPUBuffer,
+    grad_A: GPUBuffer,
 ) -> BatchState:
     """Add matmul backward w.r.t. A: grad_A = grad_C @ B^T"""
     M, N = grad_C.shape
@@ -382,13 +402,13 @@ def batch_add_matmul_backward_a(
     assert N == N2, f"Dimension mismatch: {N} != {N2}"
 
     params = np.array([M, K2, N], dtype=np.uint32)
-    params_buffer = batch_state.device.create_buffer_with_data(
+    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
     batch_state.retained_buffers.append(params_buffer)
 
-    pipeline = get_or_create_pipeline(MATMUL_BACKWARD_A_KERNEL, batch_state.device)
-    bind_group = batch_state.device.create_bind_group(
+    pipeline = get_or_create_pipeline(pipeline_cache, MATMUL_BACKWARD_A_KERNEL)
+    bind_group = batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -435,7 +455,11 @@ def batch_add_matmul_backward_a(
 
 
 def batch_add_matmul_backward_b(
-    batch_state: BatchState, A: GPUBuffer, grad_C: GPUBuffer, grad_B: GPUBuffer
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    A: GPUBuffer,
+    grad_C: GPUBuffer,
+    grad_B: GPUBuffer,
 ) -> BatchState:
     """Add matmul backward w.r.t. B: grad_B = A^T @ grad_C"""
     M, K = A.shape
@@ -443,13 +467,13 @@ def batch_add_matmul_backward_b(
     assert M == M2, f"Dimension mismatch: {M} != {M2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
-    params_buffer = batch_state.device.create_buffer_with_data(
+    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
     batch_state.retained_buffers.append(params_buffer)
 
-    pipeline = get_or_create_pipeline(MATMUL_BACKWARD_B_KERNEL, batch_state.device)
-    bind_group = batch_state.device.create_bind_group(
+    pipeline = get_or_create_pipeline(pipeline_cache, MATMUL_BACKWARD_B_KERNEL)
+    bind_group = batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -496,6 +520,7 @@ def batch_add_matmul_backward_b(
 
 
 def batch_add_gelu_backward(
+    pipeline_cache: PipelineCache,
     batch_state: BatchState,
     input_buf: GPUBuffer,
     grad_output: GPUBuffer,
@@ -506,13 +531,13 @@ def batch_add_gelu_backward(
     assert grad_output.size == total_size and grad_input.size == total_size
 
     params = np.array([total_size], dtype=np.uint32)
-    params_buffer = batch_state.device.create_buffer_with_data(
+    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
     batch_state.retained_buffers.append(params_buffer)
 
-    pipeline = get_or_create_pipeline(GELU_BACKWARD_KERNEL, batch_state.device)
-    bind_group = batch_state.device.create_bind_group(
+    pipeline = get_or_create_pipeline(pipeline_cache, GELU_BACKWARD_KERNEL)
+    bind_group = batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -561,6 +586,7 @@ def batch_add_gelu_backward(
 
 
 def batch_add_layernorm_backward(
+    pipeline_cache: PipelineCache,
     batch_state: BatchState,
     input_buf: GPUBuffer,
     gamma: GPUBuffer,
@@ -573,13 +599,13 @@ def batch_add_layernorm_backward(
     n_elements, size = input_buf.shape
 
     params = np.array([size, n_elements], dtype=np.uint32)
-    params_buffer = batch_state.device.create_buffer_with_data(
+    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
     batch_state.retained_buffers.append(params_buffer)
 
-    pipeline = get_or_create_pipeline(LAYERNORM_BACKWARD_KERNEL, batch_state.device)
-    bind_group = batch_state.device.create_bind_group(
+    pipeline = get_or_create_pipeline(pipeline_cache, LAYERNORM_BACKWARD_KERNEL)
+    bind_group = batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -652,20 +678,23 @@ def batch_add_layernorm_backward(
 
 
 def batch_add_bias_backward(
-    batch_state: BatchState, grad_output: GPUBuffer, grad_bias: GPUBuffer
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    grad_output: GPUBuffer,
+    grad_bias: GPUBuffer,
 ) -> BatchState:
     """Add bias backward to batch - sums gradients over batch dimension"""
     n_elements, dim = grad_output.shape
     total_size = n_elements * dim
 
     params = np.array([total_size, dim], dtype=np.uint32)
-    params_buffer = batch_state.device.create_buffer_with_data(
+    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=params, usage=wgpu.BufferUsage.UNIFORM
     )
     batch_state.retained_buffers.append(params_buffer)
 
-    pipeline = get_or_create_pipeline(BIAS_BACKWARD_KERNEL, batch_state.device)
-    bind_group = batch_state.device.create_bind_group(
+    pipeline = get_or_create_pipeline(pipeline_cache, BIAS_BACKWARD_KERNEL)
+    bind_group = batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=[
             {
@@ -713,7 +742,7 @@ def batch_add_bias_backward(
 def batch_submit(batch_state: BatchState) -> BatchState:
     """Execute all batched operations and release retained resources. Returns batch_state."""
     if batch_state.encoder is not None:
-        batch_state.device.queue.submit([batch_state.encoder.finish()])
+        batch_state.device.wgpu_device.queue.submit([batch_state.encoder.finish()])
 
         if batch_state.enable_profiling and batch_state.operation_count > 0:
             print(

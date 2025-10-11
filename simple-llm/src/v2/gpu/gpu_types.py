@@ -5,11 +5,29 @@ from typing import Any, Dict, List, Set, Tuple
 
 
 @dataclass
+class Device:
+    """GPU device wrapper"""
+
+    wgpu_device: object  # The actual wgpu.Device object
+    adapter: object = None  # Optional adapter reference
+
+
+@dataclass
+class PipelineCache:
+    """Compute pipeline cache state"""
+
+    device: Device
+    pipelines: Dict[Tuple[int, int], object] = field(
+        default_factory=dict
+    )  # (device_id, shader_hash) -> pipeline
+
+
+@dataclass
 class GPUBuffer:
     buffer: object
     shape: Tuple[int, ...]
     size: int
-    device: object
+    device: Device  # Changed from object to Device
 
 
 @dataclass
@@ -86,8 +104,8 @@ class PerfMonitor:
 class WorkspaceManager:
     """Workspace buffer manager state"""
 
-    device: object
-    buffer_pool: object  # Will be BufferPool
+    device: Device  # Changed from object to Device
+    buffer_pool: "BufferPool"  # Changed from object to BufferPool (forward reference)
     active_workspaces: Dict[tuple, dict] = field(default_factory=dict)
 
 
@@ -100,7 +118,7 @@ class WorkspaceManager:
 class BatchState:
     """State for batched GPU operations"""
 
-    device: object
+    device: Device  # Changed from object to Device
     encoder: object
     retained_buffers: List[object] = field(default_factory=list)
     enable_profiling: bool = False
@@ -123,7 +141,7 @@ class BufferInfo:
 class BufferPool:
     """Memory pool state for reusable GPU buffers"""
 
-    device: object
+    device: Device  # Changed from object to Device
     max_size: int
     pools: Dict[int, List[BufferInfo]] = field(default_factory=dict)
     in_use: Set[int] = field(default_factory=set)
@@ -133,6 +151,6 @@ class BufferPool:
 class StagingPool:
     """Staging buffer pool state for CPU<->GPU transfers"""
 
-    device: object
+    device: Device  # Changed from object to Device
     staging_buffers: Dict[int, object] = field(default_factory=dict)
     max_size: int = 0

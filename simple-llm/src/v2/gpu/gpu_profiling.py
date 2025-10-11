@@ -1,11 +1,6 @@
 """Performance monitoring functions"""
 
-from typing import Optional
-
 from gpu_types import KernelTimeStats, PerfMonitor, PerfStats
-
-# Module-level state
-_perf_monitor: Optional[PerfMonitor] = None
 
 
 def create_perf_monitor() -> PerfMonitor:
@@ -53,11 +48,3 @@ def reset_perf_monitor(monitor: PerfMonitor) -> PerfMonitor:
     monitor.memory_usage.clear()
     monitor.submission_count = 0
     return monitor
-
-
-def get_performance_monitor() -> PerfMonitor:
-    """Get global performance monitor"""
-    global _perf_monitor
-    if _perf_monitor is None:
-        _perf_monitor = create_perf_monitor()
-    return _perf_monitor
