@@ -1,4 +1,6 @@
-"""Buffer creation and pool management - refactored from gpu_util.py"""
+"""Buffer creation and pool management"""
+
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -11,7 +13,7 @@ except ImportError:
     wgpu = None
 
 from gpu_device import get_device
-from gpu_types import GPUBuffer
+from gpu_types import BufferInfo, BufferPool, GPUBuffer, StagingPool
 
 # ============================================================================
 # BASIC BUFFER OPERATIONS
@@ -73,38 +75,40 @@ def clear_buffer(gpu_buffer: GPUBuffer) -> None:
 
 
 # ============================================================================
-# BUFFER POOL (refactored from BufferPool class)
+# BUFFER POOL
 # ============================================================================
 
 
-def create_buffer_pool(device: object, max_buffer_size_mb: int = 512) -> dict:
+def create_buffer_pool(device: object, max_buffer_size_mb: int = 512) -> BufferPool:
     """Create a memory pool state for reusable GPU buffers"""
     max_size = max_buffer_size_mb * 1024 * 1024 // 4  # Convert to float32 count
-    return {
-        "device": device,
-        "max_size": max_size,
-        "pools": {},  # size -> list of buffers
-        "in_use": set(),  # Track buffers currently in use
-    }
+    return BufferPool(
+        device=device,
+        max_size=max_size,
+        pools={},
+        in_use=set(),
+    )
 
 
-def pool_get_buffer(pool_state: dict, shape: Tuple[int, ...]) -> Tuple[dict, GPUBuffer]:
+def pool_get_buffer(
+    pool_state: BufferPool, shape: Tuple[int, ...]
+) -> Tuple[BufferPool, GPUBuffer]:
     """Get a buffer from pool or create new. Returns (pool_state, GPUBuffer)"""
     size = int(np.prod(shape))
 
-    if size in pool_state["pools"] and len(pool_state["pools"][size]) > 0:
-        buffer_info = pool_state["pools"][size].pop()
-        pool_state["in_use"].add(id(buffer_info["buffer"]))
+    if size in pool_state.pools and len(pool_state.pools[size]) > 0:
+        buffer_info = pool_state.pools[size].pop()
+        pool_state.in_use.add(id(buffer_info.buffer))
         return pool_state, GPUBuffer(
-            buffer=buffer_info["buffer"],
+            buffer=buffer_info.buffer,
             shape=shape,
             size=size,
-            device=pool_state["device"],
+            device=pool_state.device,
         )
 
     # Create new buffer
     buffer_size = size * 4
-    buffer = pool_state["device"].create_buffer(
+    buffer = pool_state.device.create_buffer(
         size=buffer_size,
         usage=wgpu.BufferUsage.STORAGE
         | wgpu.BufferUsage.COPY_SRC
@@ -112,52 +116,53 @@ def pool_get_buffer(pool_state: dict, shape: Tuple[int, ...]) -> Tuple[dict, GPU
     )
 
     gpu_buffer = GPUBuffer(
-        buffer=buffer, shape=shape, size=size, device=pool_state["device"]
+        buffer=buffer, shape=shape, size=size, device=pool_state.device
     )
-    pool_state["in_use"].add(id(buffer))
+    pool_state.in_use.add(id(buffer))
 
     return pool_state, gpu_buffer
 
 
-def pool_release_buffer(pool_state: dict, gpu_buffer: GPUBuffer) -> dict:
+def pool_release_buffer(pool_state: BufferPool, gpu_buffer: GPUBuffer) -> BufferPool:
     """Return buffer to pool for reuse. Returns updated pool_state"""
     buffer_id = id(gpu_buffer.buffer)
-    if buffer_id in pool_state["in_use"]:
-        pool_state["in_use"].remove(buffer_id)
+    if buffer_id in pool_state.in_use:
+        pool_state.in_use.remove(buffer_id)
 
         size = gpu_buffer.size
-        if size not in pool_state["pools"]:
-            pool_state["pools"][size] = []
+        if size not in pool_state.pools:
+            pool_state.pools[size] = []
 
-        pool_state["pools"][size].append({"buffer": gpu_buffer.buffer, "size": size})
+        buffer_info = BufferInfo(buffer=gpu_buffer.buffer)
+        pool_state.pools[size].append(buffer_info)
 
     return pool_state
 
 
 # ============================================================================
-# STAGING BUFFER POOL (refactored from StagingBufferPool class)
+# STAGING BUFFER POOL
 # ============================================================================
 
 
-def create_staging_pool(device: object, initial_size_mb: int = 64) -> dict:
+def create_staging_pool(device: object, initial_size_mb: int = 64) -> StagingPool:
     """Create staging buffer pool state for CPU<->GPU transfers"""
-    return {
-        "device": device,
-        "staging_buffers": {},  # size -> buffer
-        "max_size": initial_size_mb * 1024 * 1024,
-    }
+    return StagingPool(
+        device=device,
+        staging_buffers={},
+        max_size=initial_size_mb * 1024 * 1024,
+    )
 
 
-def staging_get_buffer(pool_state: dict, size_bytes: int) -> Tuple[dict, object]:
+def staging_get_buffer(
+    pool_state: StagingPool, size_bytes: int
+) -> Tuple[StagingPool, object]:
     """Get or create staging buffer for CPU->GPU or GPU->CPU transfers"""
     # Round up to next power of 2 for better pooling
     rounded_size = 2 ** (size_bytes - 1).bit_length()
-    rounded_size = min(rounded_size, pool_state["max_size"])
+    rounded_size = min(rounded_size, pool_state.max_size)
 
-    if rounded_size not in pool_state["staging_buffers"]:
-        pool_state["staging_buffers"][rounded_size] = pool_state[
-            "device"
-        ].create_buffer(
+    if rounded_size not in pool_state.staging_buffers:
+        pool_state.staging_buffers[rounded_size] = pool_state.device.create_buffer(
             size=rounded_size,
             usage=wgpu.BufferUsage.COPY_SRC
             | wgpu.BufferUsage.COPY_DST
@@ -165,18 +170,18 @@ def staging_get_buffer(pool_state: dict, size_bytes: int) -> Tuple[dict, object]
             | wgpu.BufferUsage.MAP_WRITE,
         )
 
-    return pool_state, pool_state["staging_buffers"][rounded_size]
+    return pool_state, pool_state.staging_buffers[rounded_size]
 
 
 def staging_upload_data(
-    pool_state: dict, gpu_buffer: GPUBuffer, data_np: np.ndarray
-) -> dict:
+    pool_state: StagingPool, gpu_buffer: GPUBuffer, data_np: np.ndarray
+) -> StagingPool:
     """Upload data to GPU using persistent staging buffer"""
     size_bytes = data_np.nbytes
 
     # For small transfers, use direct write
     if size_bytes < 256 * 1024:  # 256KB threshold
-        pool_state["device"].queue.write_buffer(
+        pool_state.device.queue.write_buffer(
             gpu_buffer.buffer, 0, np.ascontiguousarray(data_np, dtype=np.float32)
         )
         return pool_state
@@ -187,23 +192,23 @@ def staging_upload_data(
     staging.write_mapped(np.ascontiguousarray(data_np, dtype=np.float32))
     staging.unmap()
 
-    encoder = pool_state["device"].create_command_encoder()
+    encoder = pool_state.device.create_command_encoder()
     encoder.copy_buffer_to_buffer(staging, 0, gpu_buffer.buffer, 0, size_bytes)
-    pool_state["device"].queue.submit([encoder.finish()])
+    pool_state.device.queue.submit([encoder.finish()])
 
     return pool_state
 
 
 def staging_download_data(
-    pool_state: dict, gpu_buffer: GPUBuffer, shape: Tuple[int, ...]
-) -> Tuple[dict, np.ndarray]:
+    pool_state: StagingPool, gpu_buffer: GPUBuffer, shape: Tuple[int, ...]
+) -> Tuple[StagingPool, np.ndarray]:
     """Download data from GPU using persistent staging buffer"""
     size_bytes = gpu_buffer.size * 4
     pool_state, staging = staging_get_buffer(pool_state, size_bytes)
 
-    encoder = pool_state["device"].create_command_encoder()
+    encoder = pool_state.device.create_command_encoder()
     encoder.copy_buffer_to_buffer(gpu_buffer.buffer, 0, staging, 0, size_bytes)
-    pool_state["device"].queue.submit([encoder.finish()])
+    pool_state.device.queue.submit([encoder.finish()])
 
     staging.map_sync(wgpu.MapMode.READ)
     data = np.frombuffer(
@@ -215,10 +220,10 @@ def staging_download_data(
 
 
 # Global pool instance (for compatibility)
-_staging_pool = None
+_staging_pool: Optional[StagingPool] = None
 
 
-def get_staging_pool() -> Optional[dict]:
+def get_staging_pool() -> Optional[StagingPool]:
     """Get or create global staging buffer pool"""
     global _staging_pool
     if _staging_pool is None:

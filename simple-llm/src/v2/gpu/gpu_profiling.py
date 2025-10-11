@@ -1,53 +1,61 @@
 """Performance monitoring functions"""
 
+from typing import Optional
+
+from gpu_types import KernelTimeStats, PerfMonitor, PerfStats
+
 # Module-level state
-_perf_monitor = None
+_perf_monitor: Optional[PerfMonitor] = None
 
 
-def create_perf_monitor():
+def create_perf_monitor() -> PerfMonitor:
     """Create performance monitor state"""
-    return {"kernel_times": {}, "memory_usage": {}, "submission_count": 0}
+    return PerfMonitor()
 
 
-def record_kernel_time(monitor, kernel_name, duration_ms):
+def record_kernel_time(
+    monitor: PerfMonitor, kernel_name: str, duration_ms: float
+) -> PerfMonitor:
     """Record kernel execution time"""
-    if kernel_name not in monitor["kernel_times"]:
-        monitor["kernel_times"][kernel_name] = []
-    monitor["kernel_times"][kernel_name].append(duration_ms)
+    if kernel_name not in monitor.kernel_times:
+        monitor.kernel_times[kernel_name] = []
+    monitor.kernel_times[kernel_name].append(duration_ms)
     return monitor
 
 
-def record_submission(monitor):
+def record_submission(monitor: PerfMonitor) -> PerfMonitor:
     """Increment submission counter"""
-    monitor["submission_count"] += 1
+    monitor.submission_count += 1
     return monitor
 
 
-def get_perf_stats(monitor):
+def get_perf_stats(monitor: PerfMonitor) -> PerfStats:
     """Get performance statistics"""
-    stats = {"total_submissions": monitor["submission_count"], "kernel_times": {}}
+    kernel_stats = {}
 
-    for kernel_name, times in monitor["kernel_times"].items():
-        stats["kernel_times"][kernel_name] = {
-            "count": len(times),
-            "total_ms": sum(times),
-            "avg_ms": sum(times) / len(times) if times else 0,
-            "min_ms": min(times) if times else 0,
-            "max_ms": max(times) if times else 0,
-        }
+    for kernel_name, times in monitor.kernel_times.items():
+        kernel_stats[kernel_name] = KernelTimeStats(
+            count=len(times),
+            total_ms=sum(times),
+            avg_ms=sum(times) / len(times) if times else 0,
+            min_ms=min(times) if times else 0,
+            max_ms=max(times) if times else 0,
+        )
 
-    return stats
+    return PerfStats(
+        total_submissions=monitor.submission_count, kernel_times=kernel_stats
+    )
 
 
-def reset_perf_monitor(monitor):
+def reset_perf_monitor(monitor: PerfMonitor) -> PerfMonitor:
     """Reset all counters"""
-    monitor["kernel_times"].clear()
-    monitor["memory_usage"].clear()
-    monitor["submission_count"] = 0
+    monitor.kernel_times.clear()
+    monitor.memory_usage.clear()
+    monitor.submission_count = 0
     return monitor
 
 
-def get_performance_monitor():
+def get_performance_monitor() -> PerfMonitor:
     """Get global performance monitor"""
     global _perf_monitor
     if _perf_monitor is None:

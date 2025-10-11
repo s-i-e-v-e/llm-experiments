@@ -3,7 +3,7 @@
 # ============================================================================
 
 
-def create_optimized_matmul_kernel(tile_size=16):
+def create_optimized_matmul_kernel(tile_size: int = 16) -> str:
     """Generate matmul kernel with configurable tile size for different GPUs"""
     return f"""
 // Adaptive tiled matrix multiplication: C = A @ B
@@ -309,7 +309,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 """
 
-
 RESIDUAL_ADD_KERNEL = """
 struct AddParams {
     size: u32,
@@ -392,7 +391,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     output[idx] = input[idx] + bias[col];
 }
 """
-
 
 # ============================================================================
 # BACKWARD PASS KERNELS
@@ -992,7 +990,6 @@ fn main(
 }
 """
 
-
 MULTIHEAD_ATTENTION_KERNEL = """
 // Simplified multi-head self-attention with causal masking
 // Processes one query position across all heads
@@ -1209,7 +1206,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     output[output_offset] = input[input_offset];
 }
 """
-
 
 # ============================================================================
 # FLASHATTENTION-STYLE TILED ATTENTION KERNEL

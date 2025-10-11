@@ -1,10 +1,10 @@
 """Core data types - plain dataclasses only"""
 
-import dataclasses
-from typing import Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Set, Tuple
 
 
-@dataclasses.dataclass
+@dataclass
 class GPUBuffer:
     buffer: object
     shape: Tuple[int, ...]
@@ -12,7 +12,7 @@ class GPUBuffer:
     device: object
 
 
-@dataclasses.dataclass
+@dataclass
 class GPULayerParams:
     attn_wq: GPUBuffer
     attn_wk: GPUBuffer
@@ -28,17 +28,111 @@ class GPULayerParams:
     ln_beta2: GPUBuffer
 
 
-@dataclasses.dataclass
+@dataclass
 class GPUModelParams:
     embedding: GPUBuffer
     pos_encoding: GPUBuffer
     layers: list  # List of GPULayerParams
 
 
-@dataclasses.dataclass
+@dataclass
 class GPUOptimizerState:
     m_embedding: GPUBuffer
     v_embedding: GPUBuffer
     m_layers: list  # List of GPULayerParams (momentum)
     v_layers: list  # List of GPULayerParams (variance)
     step: int
+
+
+# ============================================================================
+# Performance Monitoring Types
+# ============================================================================
+
+
+@dataclass
+class KernelTimeStats:
+    """Statistics for a single kernel's execution times"""
+
+    count: int
+    total_ms: float
+    avg_ms: float
+    min_ms: float
+    max_ms: float
+
+
+@dataclass
+class PerfStats:
+    """Performance statistics snapshot"""
+
+    total_submissions: int
+    kernel_times: Dict[str, KernelTimeStats]
+
+
+@dataclass
+class PerfMonitor:
+    """Performance monitoring state"""
+
+    kernel_times: Dict[str, List[float]] = field(default_factory=dict)
+    memory_usage: Dict[str, Any] = field(default_factory=dict)
+    submission_count: int = 0
+
+
+# ============================================================================
+# Workspace Management Types
+# ============================================================================
+
+
+@dataclass
+class WorkspaceManager:
+    """Workspace buffer manager state"""
+
+    device: object
+    buffer_pool: object  # Will be BufferPool
+    active_workspaces: Dict[tuple, dict] = field(default_factory=dict)
+
+
+# ============================================================================
+# Batch Operation Types
+# ============================================================================
+
+
+@dataclass
+class BatchState:
+    """State for batched GPU operations"""
+
+    device: object
+    encoder: object
+    retained_buffers: List[object] = field(default_factory=list)
+    enable_profiling: bool = False
+    operation_count: int = 0
+
+
+# ============================================================================
+# Buffer Pool Types
+# ============================================================================
+
+
+@dataclass
+class BufferInfo:
+    """Information about a pooled buffer"""
+
+    buffer: object
+
+
+@dataclass
+class BufferPool:
+    """Memory pool state for reusable GPU buffers"""
+
+    device: object
+    max_size: int
+    pools: Dict[int, List[BufferInfo]] = field(default_factory=dict)
+    in_use: Set[int] = field(default_factory=set)
+
+
+@dataclass
+class StagingPool:
+    """Staging buffer pool state for CPU<->GPU transfers"""
+
+    device: object
+    staging_buffers: Dict[int, object] = field(default_factory=dict)
+    max_size: int = 0

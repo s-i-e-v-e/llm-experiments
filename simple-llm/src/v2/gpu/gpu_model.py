@@ -1,4 +1,4 @@
-"""Model parameter initialization - refactored from gpu_util.py"""
+"""Model parameter initialization"""
 
 import numpy as np
 from gpu_buffer import create_gpu_buffer

@@ -1,32 +1,36 @@
-"""Workspace buffer management - refactored from gpu_workspace.py"""
+"""Workspace buffer management"""
+
+from typing import Dict, Tuple
 
 from gpu_buffer import pool_get_buffer, pool_release_buffer
+from gpu_types import GPUBuffer, GPUModelParams, WorkspaceManager
 
 # ============================================================================
-# WORKSPACE MANAGER (refactored from WorkspaceManager class)
+# WORKSPACE MANAGER
 # ============================================================================
 
 
-def create_workspace_manager(device: object, buffer_pool_state: dict) -> dict:
+def create_workspace_manager(
+    device: object, buffer_pool_state: dict
+) -> WorkspaceManager:
     """Create workspace manager state"""
-    return {
-        "device": device,
-        "buffer_pool": buffer_pool_state,
-        "active_workspaces": {},  # (batch_size, seq_len) -> workspace dict
-    }
+    return WorkspaceManager(device=device, buffer_pool=buffer_pool_state)
 
 
 def workspace_get(
-    manager_state: dict, model_params: GPUModelParams, batch_size: int, seq_len: int
-) -> Tuple[dict, Dict[str, GPUBuffer]]:
+    manager: WorkspaceManager,
+    model_params: GPUModelParams,
+    batch_size: int,
+    seq_len: int,
+) -> Tuple[WorkspaceManager, Dict[str, GPUBuffer]]:
     """
     Get or create workspace buffers for given batch/sequence size.
-    Returns (manager_state, workspace_dict)
+    Returns (manager, workspace_dict)
     """
     key = (batch_size, seq_len)
 
-    if key in manager_state["active_workspaces"]:
-        return manager_state, manager_state["active_workspaces"][key]
+    if key in manager.active_workspaces:
+        return manager, manager.active_workspaces[key]
 
     # Create new workspace
     embedding_dim = model_params.embedding.shape[1]
@@ -64,31 +68,29 @@ def workspace_get(
 
     # Allocate all buffers from pool
     for name, shape in buffer_specs:
-        manager_state["buffer_pool"], buffer = pool_get_buffer(
-            manager_state["buffer_pool"], shape
-        )
+        manager.buffer_pool, buffer = pool_get_buffer(manager.buffer_pool, shape)
         workspace[name] = buffer
 
-    manager_state["active_workspaces"][key] = workspace
-    return manager_state, workspace
+    manager.active_workspaces[key] = workspace
+    return manager, workspace
 
 
-def workspace_release(manager_state: dict, batch_size: int, seq_len: int) -> dict:
-    """Return workspace buffers to pool. Returns updated manager_state"""
+def workspace_release(
+    manager: WorkspaceManager, batch_size: int, seq_len: int
+) -> WorkspaceManager:
+    """Return workspace buffers to pool. Returns updated manager"""
     key = (batch_size, seq_len)
-    if key in manager_state["active_workspaces"]:
-        workspace = manager_state["active_workspaces"][key]
+    if key in manager.active_workspaces:
+        workspace = manager.active_workspaces[key]
         for buffer in workspace.values():
-            manager_state["buffer_pool"] = pool_release_buffer(
-                manager_state["buffer_pool"], buffer
-            )
-        del manager_state["active_workspaces"][key]
+            manager.buffer_pool = pool_release_buffer(manager.buffer_pool, buffer)
+        del manager.active_workspaces[key]
 
-    return manager_state
+    return manager
 
 
-def workspace_clear_all(manager_state: dict) -> dict:
-    """Release all workspaces. Returns updated manager_state"""
-    for key in list(manager_state["active_workspaces"].keys()):
-        manager_state = workspace_release(manager_state, *key)
-    return manager_state
+def workspace_clear_all(manager: WorkspaceManager) -> WorkspaceManager:
+    """Release all workspaces. Returns updated manager"""
+    for key in list(manager.active_workspaces.keys()):
+        manager = workspace_release(manager, *key)
+    return manager

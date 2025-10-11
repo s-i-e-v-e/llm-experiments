@@ -1,4 +1,4 @@
-"""Test GPU operations - updated imports for refactored code"""
+"""Test GPU operations"""
 
 import numpy as np
 from gpu_buffer import create_gpu_buffer, gpu_to_numpy
