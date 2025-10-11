@@ -563,3 +563,25 @@ if step % 100 == 0:
 # Monitor memory
 stats = get_pool_memory_stats(pool)
 print(f"GPU Memory: {stats['in_use'] / 1e6:.1f} MB in use, {stats['pooled'] / 1e6:.1f} MB pooled")
+
+---
+
+After (With Gradient Accumulation):
+
+python
+# Can train with effective batch_size = 32 using 4 mini-batches of 8
+effective_batch_size = 32
+mini_batch_size = 8
+accumulation_steps = effective_batch_size // mini_batch_size
+
+for step in range(accumulation_steps):
+    mini_batch = get_mini_batch(step, mini_batch_size)
+    forward_pass(model, mini_batch)
+
+    # First step: clear gradients
+    # Subsequent steps: accumulate gradients
+    is_first = (step == 0)
+    backward_pass(model, mini_batch, accumulate=not is_first)
+
+# After all mini-batches, take optimizer step
+optimizer_step(model)

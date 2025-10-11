@@ -203,23 +203,33 @@ def clear_buffer(gpu_buffer: GPUBufferAny) -> None:
 # ============================================================================
 # BUFFER POOL
 # ============================================================================
-
-
 def create_buffer_pool(
-    device: Device, max_buffer_size_mb: int = 512, max_total_memory_mb: int = 2048
+    device: Device,
+    max_buffer_size_mb: Optional[int] = None,
+    max_total_memory_mb: Optional[int] = None,
 ) -> BufferPool:
-    """Create a memory pool state for reusable GPU buffers.
+    """
+    Create a memory pool state for reusable GPU buffers
 
     Buffers are pooled by size for efficient reuse without reallocation.
 
     Args:
         device: GPU device state
-        max_buffer_size_mb: Maximum size of individual pooled buffers in MB
-        max_total_memory_mb: Maximum total pool memory in MB (0 = unlimited)
+        max_buffer_size_mb: Maximum size of individual pooled buffers in MB.
+                           If None, uses device.config.buffer_pool_max_buffer_mb
+        max_total_memory_mb: Maximum total pool memory in MB (0 = unlimited).
+                             If None, uses device.config.buffer_pool_max_mb
 
     Returns:
         Buffer pool state with memory limits enforced
     """
+    # Use config defaults if not provided
+    if max_buffer_size_mb is None:
+        max_buffer_size_mb = device.config.buffer_pool_max_buffer_mb
+
+    if max_total_memory_mb is None:
+        max_total_memory_mb = device.config.buffer_pool_max_mb
+
     max_size = max_buffer_size_mb * 1024 * 1024 // 4  # Convert to float32 count
     max_total_bytes = (
         max_total_memory_mb * 1024 * 1024 if max_total_memory_mb > 0 else 0
@@ -227,11 +237,11 @@ def create_buffer_pool(
 
     return BufferPool(
         device=device,
-        max_size=max_size,
+        maxsize=max_size,
         pools={},
-        in_use=set(),
-        total_memory_bytes=0,
-        max_total_memory_bytes=max_total_bytes,
+        inuse=set(),
+        totalmemorybytes=0,
+        maxtotalmemorybytes=max_total_bytes,
     )
 
 
@@ -428,25 +438,36 @@ def pool_clear(pool_state: BufferPool) -> None:
 
 
 def create_staging_pool(
-    device: Device, initial_size_mb: int = 64, max_entries: int = 8
+    device: Device,
+    initial_size_mb: Optional[int] = None,
+    max_entries: Optional[int] = None,
 ) -> StagingPool:
-    """Create staging buffer pool state for CPU-GPU transfers.
+    """
+    Create staging buffer pool state for CPU-GPU transfers
 
     Staging buffers are persistent and reused across transfers for efficiency.
 
     Args:
         device: GPU device state
-        initial_size_mb: Initial maximum staging buffer size in MB
-        max_entries: Maximum number of different-sized buffers to cache
+        initial_size_mb: Initial maximum staging buffer size in MB.
+                        If None, uses 64 MB default
+        max_entries: Maximum number of different-sized buffers to cache.
+                    If None, uses device.config.staging_buffer_max_entries
 
     Returns:
         Staging pool state
     """
+    if initial_size_mb is None:
+        initial_size_mb = 64
+
+    if max_entries is None:
+        max_entries = device.config.staging_buffer_max_entries
+
     return StagingPool(
         device=device,
-        staging_buffers={},
-        max_size=initial_size_mb * 1024 * 1024,
-        max_entries=max_entries,
+        stagingbuffers={},
+        maxsize=initial_size_mb * 1024 * 1024,
+        maxentries=max_entries,
     )
 
 
@@ -491,41 +512,45 @@ def _get_staging_buffer_internal(
 
 
 def staging_upload_data(
-    pool_state: StagingPool, gpu_buffer: GPUBufferAny, data_np: np.ndarray
+    poolstate: StagingPool, gpubuffer: GPUBufferAny, data_np: np.ndarray
 ) -> None:
-    """Upload data to GPU using persistent staging buffer (mutation).
+    """
+    Upload data to GPU using persistent staging buffer (mutation)
 
-    This function MUTATES gpu_buffer contents by writing data to it.
+    This function MUTATES gpubuffer contents by writing data to it.
     Returns None to signal mutation.
 
-    For small transfers (<256KB), uses direct write.
+    For small transfers (<= threshold), uses direct write.
     For large transfers, uses staging buffer for better performance.
 
     Args:
-        pool_state: Staging pool state (may be mutated if new staging buffer created)
-        gpu_buffer: Target GPU buffer (MUTATED)
+        poolstate: Staging pool state (may be mutated if new staging buffer created)
+        gpubuffer: Target GPU buffer (MUTATED)
         data_np: Source numpy array
     """
     size_bytes = data_np.nbytes
 
+    # Use config threshold for deciding staging vs direct transfer
+    threshold_bytes = poolstate.device.config.staging_buffer_threshold_kb * 1024
+
     # For small transfers, use direct write
-    if size_bytes < 256 * 1024:  # 256KB threshold
-        pool_state.device.wgpu_device.queue.write_buffer(
-            gpu_buffer.buffer,
+    if size_bytes <= threshold_bytes:
+        poolstate.device.wgpu_device.queue.write_buffer(
+            gpubuffer.buffer,
             0,
             np.ascontiguousarray(data_np, dtype=np.float32),
         )
         return
 
     # For large transfers, use staging buffer
-    staging = _get_staging_buffer_internal(pool_state, size_bytes)
+    staging = _get_staging_buffer_internal(poolstate, size_bytes)
     staging.map_sync(wgpu.MapMode.WRITE)
     staging.write_mapped(np.ascontiguousarray(data_np, dtype=np.float32))
     staging.unmap()
 
-    encoder = pool_state.device.wgpu_device.create_command_encoder()
-    encoder.copy_buffer_to_buffer(staging, 0, gpu_buffer.buffer, 0, size_bytes)
-    pool_state.device.wgpu_device.queue.submit([encoder.finish()])
+    encoder = poolstate.device.wgpu_device.create_command_encoder()
+    encoder.copy_buffer_to_buffer(staging, 0, gpubuffer.buffer, 0, size_bytes)
+    poolstate.device.wgpu_device.queue.submit([encoder.finish()])
 
 
 def staging_download_data(

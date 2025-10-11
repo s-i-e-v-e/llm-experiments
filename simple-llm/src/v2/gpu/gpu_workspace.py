@@ -166,8 +166,11 @@ def workspace_clear_all(manager: WorkspaceManager) -> None:
         workspace_release(manager, *key)
 
 
-def workspace_release_lru(manager: WorkspaceManager, keep_count: int = 2) -> int:
-    """Release least recently used workspaces (mutation).
+def workspace_release_lru(
+    manager: WorkspaceManager, keep_count: Optional[int] = None
+) -> int:
+    """
+    Release least recently used workspaces (mutation)
 
     This implements LRU eviction to prevent unbounded memory growth during training.
     Currently uses workspace size (batch_size * seq_len) as a proxy for LRU.
@@ -177,7 +180,8 @@ def workspace_release_lru(manager: WorkspaceManager, keep_count: int = 2) -> int
 
     Args:
         manager: Workspace manager state (MUTATED)
-        keep_count: Number of workspaces to keep (most recently accessed)
+        keep_count: Number of workspaces to keep (most recently accessed).
+                   If None, uses manager.device.config.workspace_lru_keep_count
 
     Returns:
         Number of workspaces released
@@ -185,6 +189,10 @@ def workspace_release_lru(manager: WorkspaceManager, keep_count: int = 2) -> int
     Raises:
         ValueError: If keep_count is negative
     """
+    # Use config default if not provided
+    if keep_count is None:
+        keep_count = manager.device.config.workspace_lru_keep_count
+
     if keep_count < 0:
         raise ValueError(f"keep_count must be non-negative, got {keep_count}")
 

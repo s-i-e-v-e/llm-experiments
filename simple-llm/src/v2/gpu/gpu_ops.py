@@ -233,7 +233,7 @@ def _dispatch_compute_internal(
 
 
 def dispatch_simple_compute(
-    pipeline_cache: PipelineCache,
+    pipelinecache: PipelineCache,
     kernel_code: str,
     params: np.ndarray,
     buffers: List[GPUBufferAny],
@@ -241,41 +241,63 @@ def dispatch_simple_compute(
     workgroups_y: int = 1,
     workgroups_z: int = 1,
 ) -> None:
-    """Unified compute dispatch - eliminates repetitive pipeline/bind group/dispatch pattern.
+    """
+    Unified compute dispatch - eliminates repetitive pipeline/bind group/dispatch pattern
 
-    This function may MUTATE pipeline_cache by adding cached pipelines.
+    This function may MUTATE pipelinecache by adding cached pipelines.
     This function does NOT mutate params or buffers.
 
     Memory management: Uniform parameter buffer is created temporarily and automatically
     freed by WGPU after GPU completes execution. No memory leak.
 
     Args:
-        pipeline_cache: Pipeline cache state (may be MUTATED for caching)
+        pipelinecache: Pipeline cache state (may be MUTATED for caching)
         kernel_code: WGSL kernel source code
         params: Numpy array of parameters (uploaded as uniform buffer at binding 0)
         buffers: List of GPU buffers to bind (sequential bindings starting at 1)
         workgroups_x: Number of workgroups in X dimension
-        workgroups_y: Number of workgroups in Y dimension (default: 1)
-        workgroups_z: Number of workgroups in Z dimension (default: 1)
+        workgroups_y: Number of workgroups in Y dimension (default 1)
+        workgroups_z: Number of workgroups in Z dimension (default 1)
+
+    Raises:
+        ValueError: If workgroup counts exceed device limits
     """
+    # Validate workgroup counts against config limits
+    max_workgroups = pipelinecache.device.config.max_workgroups_per_dim
+
+    if workgroups_x > max_workgroups:
+        raise ValueError(
+            f"workgroups_x ({workgroups_x}) exceeds maximum ({max_workgroups}). "
+            f"Consider tiling the computation."
+        )
+
+    if workgroups_y > max_workgroups:
+        raise ValueError(
+            f"workgroups_y ({workgroups_y}) exceeds maximum ({max_workgroups})"
+        )
+
+    if workgroups_z > max_workgroups:
+        raise ValueError(
+            f"workgroups_z ({workgroups_z}) exceeds maximum ({max_workgroups})"
+        )
+
     # Create uniform buffer for parameters
-    params_buffer = _create_uniform_buffer_internal(pipeline_cache, params)
+    params_buffer = _create_uniform_buffer_internal(pipelinecache, params)
 
     # Get or create pipeline
-    pipeline = get_or_create_pipeline(pipeline_cache, kernel_code)
+    pipeline = get_or_create_pipeline(pipelinecache, kernel_code)
 
     # Build bind group entries: binding 0 is params, rest are buffers
     entries = [BindGroupEntry(0, params_buffer, 0, params.nbytes)]
-
     for i, buf in enumerate(buffers):
         binding_index = i + 1
         entries.append(BindGroupEntry(binding_index, buf.buffer, 0, buf.size * 4))
 
-    bind_group = _create_bind_group_internal(pipeline_cache, pipeline, entries)
+    bindgroup = _create_bind_group_internal(pipelinecache, pipeline, entries)
 
     # Dispatch compute
     _dispatch_compute_internal(
-        pipeline_cache, pipeline, bind_group, workgroups_x, workgroups_y, workgroups_z
+        pipelinecache, pipeline, bindgroup, workgroups_x, workgroups_y, workgroups_z
     )
 
 
@@ -305,12 +327,13 @@ def _validate_buffer_shapes(
 
 
 def create_command_batch(device: Device, enable_profiling: bool = False) -> BatchState:
-    """Create command batch state for batched GPU operations.
+    """
+    Create command batch state for batched GPU operations
 
     This function does NOT mutate device.
 
     Memory management: Uniform buffers created during batch operations are retained
-    in batch_state.retained_buffers to keep them alive until submit_batch() is called.
+    in batch_state.retained_buffers to keep them alive until submit_batch is called.
 
     Args:
         device: GPU device state
@@ -318,8 +341,12 @@ def create_command_batch(device: Device, enable_profiling: bool = False) -> Batc
 
     Returns:
         New batch state with encoder ready for operations
+
+    Raises:
+        RuntimeError: If device not initialized or batch limit exceeded
     """
     encoder = device.wgpu_device.create_command_encoder()
+
     return BatchState(
         device=device,
         encoder=encoder,
@@ -377,7 +404,7 @@ def _create_bind_group_for_batch_internal(
 
 
 def _add_compute_to_batch_internal(
-    pipeline_cache: PipelineCache,
+    pipelinecache: PipelineCache,
     batch_state: BatchState,
     kernel_code: str,
     params: np.ndarray,
@@ -386,12 +413,13 @@ def _add_compute_to_batch_internal(
     workgroups_y: int = 1,
     workgroups_z: int = 1,
 ) -> None:
-    """Internal: Add compute operation to batch encoder (mutation).
+    """
+    Internal: Add compute operation to batch encoder (mutation)
 
     This function MUTATES batch_state by adding operation and retaining uniform buffer.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
+        pipelinecache: Pipeline cache for kernel compilation
         batch_state: Batch state (MUTATED)
         kernel_code: WGSL kernel source
         params: Parameter array
@@ -399,9 +427,34 @@ def _add_compute_to_batch_internal(
         workgroups_x: Workgroups in X
         workgroups_y: Workgroups in Y
         workgroups_z: Workgroups in Z
+
+    Raises:
+        RuntimeError: If batch operation limit exceeded
     """
+    # Check batch operation limit from config
+    max_ops = batch_state.device.config.max_batch_operations
+
+    if batch_state.operation_count >= max_ops:
+        raise RuntimeError(
+            f"Batch operation limit ({max_ops}) exceeded. "
+            f"Call submit_batch() to flush operations."
+        )
+
+    # Validate workgroup counts
+    max_workgroups = batch_state.device.config.max_workgroups_per_dim
+
+    if (
+        workgroups_x > max_workgroups
+        or workgroups_y > max_workgroups
+        or workgroups_z > max_workgroups
+    ):
+        raise ValueError(
+            f"Workgroup counts ({workgroups_x}, {workgroups_y}, {workgroups_z}) "
+            f"exceed maximum ({max_workgroups})"
+        )
+
     params_buffer = _create_and_retain_uniform_buffer_internal(batch_state, params)
-    pipeline = get_or_create_pipeline(pipeline_cache, kernel_code)
+    pipeline = get_or_create_pipeline(pipelinecache, kernel_code)
 
     # Build bind group entries
     entries = [BindGroupEntry(0, params_buffer, 0, params.nbytes)]
@@ -409,11 +462,11 @@ def _add_compute_to_batch_internal(
         binding_index = i + 1
         entries.append(BindGroupEntry(binding_index, buf.buffer, 0, buf.size * 4))
 
-    bind_group = _create_bind_group_for_batch_internal(batch_state, pipeline, entries)
+    bindgroup = _create_bind_group_for_batch_internal(batch_state, pipeline, entries)
 
     compute_pass = batch_state.encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
-    compute_pass.set_bind_group(0, bind_group)
+    compute_pass.set_bind_group(0, bindgroup)
     compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, workgroups_z)
     compute_pass.end()
 

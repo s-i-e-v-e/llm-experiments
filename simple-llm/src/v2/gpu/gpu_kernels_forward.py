@@ -6,7 +6,24 @@
 
 
 def create_optimized_matmul_kernel(tile_size: int = 16) -> str:
-    """Generate matmul kernel with configurable tile size for different GPUs"""
+    """
+    Generate matmul kernel with configurable tile size for different GPUs
+
+    Args:
+        tile_size: Tile dimension (must be power of 2, typically 8, 16, or 32)
+
+    Returns:
+        WGSL kernel source code as string
+
+    Raises:
+        ValueError: If tile_size is invalid
+    """
+    if tile_size <= 0 or (tile_size & (tile_size - 1)) != 0:
+        raise ValueError(f"tile_size must be power of 2, got {tile_size}")
+
+    if tile_size > 32:
+        raise ValueError(f"tile_size too large: {tile_size}. Maximum is 32.")
+
     return f"""
 // Adaptive tiled matrix multiplication: C = A @ B
 // Tile size: {tile_size}x{tile_size}
@@ -39,6 +56,7 @@ fn main(
     let local_col = local_id.x;
 
     var sum = 0.0;
+
     let num_tiles = (params.K + TILE_SIZE - 1u) / TILE_SIZE;
 
     for (var t = 0u; t < num_tiles; t++) {{
@@ -83,7 +101,8 @@ fn main(
 # FORWARD PASS KERNELS
 # ============================================================================
 
-# Matrix multiplication kernel (default 16x16 tiles)
+# Matrix multiplication kernel - default 16x16 tiles
+# To use custom tile size, call create_optimized_matmul_kernel(tile_size)
 TILED_MATMUL_KERNEL = create_optimized_matmul_kernel(16)
 
 LAYERNORM_KERNEL = """

@@ -539,7 +539,7 @@ def batch_add_matmul_backward_b(
 
 
 def batch_add_layernorm_backward(
-    pipeline_cache: PipelineCache,
+    pipelinecache: PipelineCache,
     batch_state: BatchState,
     input_buf: GPUBuffer2D,
     gamma: GPUBuffer1D,
@@ -547,33 +547,40 @@ def batch_add_layernorm_backward(
     grad_input: GPUBuffer2D,
     grad_gamma: GPUBuffer1D,
     grad_beta: GPUBuffer1D,
+    accumulate: bool = False,
 ) -> None:
-    """Add layernorm backward to batch (mutation).
+    """
+    Add layernorm backward to batch (mutation)
 
-    This function MUTATES batch_state by adding an operation.
-    Also MUTATES grad_gamma and grad_beta by zeroing them first.
+    This function MUTATES batch_state by adding operations.
+    Also MUTATES grad_gamma and grad_beta (conditionally zeros based on accumulate flag).
     Returns None to signal mutation.
 
-    NOTE: This function automatically zeros grad_gamma and grad_beta before
-    adding the operation, so caller does not need to pre-zero them.
+    NOTE: For batched operations with accumulate=True, temporary buffers are NOT supported.
+    This is a limitation of the batch API - partial gradients must be computed and reduced
+    in separate submissions. For gradient accumulation, prefer the non-batch API.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        pipelinecache: Pipeline cache for kernel compilation
+        batch_state: Batch state - MUTATED
         input_buf: Input from forward pass (n_elements, size)
         gamma: Scale parameters from forward pass (size,)
         grad_output: Gradient of loss w.r.t. output (n_elements, size)
         grad_input: Output gradient w.r.t. input (n_elements, size)
-        grad_gamma: Output gradient w.r.t. gamma (size,) (MUTATED, auto-zeroed)
-        grad_beta: Output gradient w.r.t. beta (size,) (MUTATED, auto-zeroed)
+        grad_gamma: Output gradient w.r.t. gamma (size,)
+        grad_beta: Output gradient w.r.t. beta (size,)
+        accumulate: If False (default), zeros grad_gamma/grad_beta before operation.
+                   If True, uses atomic accumulation (requires WGSL atomics support).
 
     Raises:
         ValueError: If buffer shapes don't match
+        NotImplementedError: If accumulate=True (not supported in batch mode yet)
     """
+
     n_elements, size = input_buf.shape
 
-    if n_elements <= 0 or size <= 0:
-        raise ValueError(f"Invalid input shape: ({n_elements}, {size})")
+    if n_elements == 0 or size == 0:
+        raise ValueError(f"Invalid input shape: {(n_elements, size)}")
 
     validate_buffer_shape_1d(gamma, size, "gamma")
     validate_buffer_shape_2d(grad_output, (n_elements, size), "grad_output")
@@ -581,13 +588,22 @@ def batch_add_layernorm_backward(
     validate_buffer_shape_1d(grad_gamma, size, "grad_gamma")
     validate_buffer_shape_1d(grad_beta, size, "grad_beta")
 
-    # Zero accumulation buffers (safer API)
+    if accumulate:
+        # Batch mode doesn't support temporary buffer management required for accumulation
+        # Users should use non-batch API for gradient accumulation
+        raise NotImplementedError(
+            "Gradient accumulation (accumulate=True) not supported in batch mode. "
+            "Use run_layernorm_backward() instead for gradient accumulation."
+        )
+
+    # Zero accumulation buffers
     clear_buffer(grad_gamma)
     clear_buffer(grad_beta)
 
     params = np.array([size, n_elements], dtype=np.uint32)
+
     _add_compute_to_batch_internal(
-        pipeline_cache,
+        pipelinecache,
         batch_state,
         LAYERNORM_BACKWARD_KERNEL,
         params,
@@ -642,37 +658,45 @@ def batch_add_gelu_backward(
 
 
 def batch_add_bias_backward(
-    pipeline_cache: PipelineCache,
+    pipelinecache: PipelineCache,
     batch_state: BatchState,
     grad_output: GPUBuffer2D,
     grad_bias: GPUBuffer1D,
+    accumulate: bool = False,
 ) -> None:
-    """Add bias backward to batch (mutation).
+    """
+    Add bias backward to batch (mutation)
 
     This function MUTATES batch_state by adding an operation.
     Returns None to signal mutation.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        pipelinecache: Pipeline cache for kernel compilation
+        batch_state: Batch state - MUTATED
         grad_output: Gradient of loss w.r.t. output (n_elements, dim)
         grad_bias: Output gradient w.r.t. bias (dim,)
+        accumulate: If False (default), zeros grad_bias before operation.
+                   If True, accumulates into existing grad_bias values.
 
     Raises:
         ValueError: If buffer shapes don't match
     """
     n_elements, dim = grad_output.shape
 
-    if n_elements <= 0 or dim <= 0:
-        raise ValueError(f"Invalid grad_output shape: ({n_elements}, {dim})")
+    if n_elements == 0 or dim == 0:
+        raise ValueError(f"Invalid grad_output shape: {(n_elements, dim)}")
 
     validate_buffer_shape_1d(grad_bias, dim, "grad_bias")
 
-    total_size = n_elements * dim
+    # Zero accumulation buffer only if not accumulating
+    if not accumulate:
+        clear_buffer(grad_bias)
 
+    total_size = n_elements * dim
     params = np.array([total_size, dim], dtype=np.uint32)
+
     _add_compute_to_batch_internal(
-        pipeline_cache,
+        pipelinecache,
         batch_state,
         BIAS_BACKWARD_KERNEL,
         params,

@@ -119,106 +119,118 @@ def run_matmul_backward_b(
 
 
 def run_layernorm_backward(
-    pipeline_cache: PipelineCache,
+    pipelinecache: PipelineCache,
     input_buf: GPUBuffer2D,
     gamma: GPUBuffer1D,
     grad_output: GPUBuffer2D,
     grad_input: GPUBuffer2D,
     grad_gamma: GPUBuffer1D,
     grad_beta: GPUBuffer1D,
+    accumulate: bool = False,
 ) -> None:
-    """Backward pass for layer normalization (mutation).
+    """
+    Backward pass for layer normalization (mutation)
 
     This function MUTATES grad_input, grad_gamma, and grad_beta by writing gradients.
     Returns None to signal mutation.
-
-    NOTE: This function automatically zeros grad_gamma and grad_beta before
-    accumulating gradients, so caller does not need to pre-zero them.
 
     IMPLEMENTATION: Uses two-stage reduction to avoid race conditions:
     - Stage 1: Each workgroup computes partial gamma/beta gradients
     - Stage 2: Reduction kernel sums partial gradients into final result
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        input_buf: Input from forward pass (nelements, size)
+        pipelinecache: Pipeline cache for kernel compilation
+        input_buf: Input from forward pass (n_elements, size)
         gamma: Scale parameters from forward pass (size,)
-        grad_output: Gradient of loss w.r.t. output (nelements, size)
-        grad_input: Output gradient w.r.t. input (nelements, size) (MUTATED)
-        grad_gamma: Output gradient w.r.t. gamma (size,) (MUTATED, auto-zeroed)
-        grad_beta: Output gradient w.r.t. beta (size,) (MUTATED, auto-zeroed)
+        grad_output: Gradient of loss w.r.t. output (n_elements, size)
+        grad_input: Output gradient w.r.t. input (n_elements, size) - MUTATED
+        grad_gamma: Output gradient w.r.t. gamma (size,) - MUTATED
+        grad_beta: Output gradient w.r.t. beta (size,) - MUTATED
+        accumulate: If False (default), zeros grad_gamma/grad_beta before accumulation.
+                   If True, accumulates into existing values using GPU-native atomic operations.
+                   Use True for gradient accumulation across mini-batches.
+                   Note: grad_input is always overwritten (never accumulated).
 
     Raises:
         ValueError: If shapes are incompatible
+
+    Example:
+        # Standard usage (single batch)
+        run_layernorm_backward(cache, x, gamma, grad_out, grad_in, grad_g, grad_b)
+
+        # Gradient accumulation (multiple mini-batches)
+        run_layernorm_backward(cache, x1, gamma, grad_out1, grad_in1, grad_g, grad_b, accumulate=False)
+        run_layernorm_backward(cache, x2, gamma, grad_out2, grad_in2, grad_g, grad_b, accumulate=True)
     """
     from gpu_buffer import pool_release_buffer, pool_take_buffer_2d
     from gpu_kernels_backward import (
+        LAYERNORM_BACKWARD_REDUCE_ACCUMULATE_KERNEL,
         LAYERNORM_BACKWARD_REDUCE_KERNEL,
     )
 
-    nelements, size = input_buf.shape
+    n_elements, size = input_buf.shape
 
-    if nelements <= 0 or size <= 0:
-        raise ValueError(f"Invalid input_buf shape: ({nelements}, {size})")
+    if n_elements == 0 or size == 0:
+        raise ValueError(f"Invalid input_buf shape: {(n_elements, size)}")
 
     if gamma.shape != (size,):
         raise ValueError(
-            f"gamma shape {gamma.shape} doesn't match input size ({size},)"
+            f"gamma shape {gamma.shape} doesn't match input size {(size,)}"
         )
 
-    if grad_output.shape != (nelements, size):
+    if grad_output.shape != (n_elements, size):
         raise ValueError(
-            f"grad_output shape {grad_output.shape} doesn't match input_buf shape ({nelements}, {size})"
+            f"grad_output shape {grad_output.shape} doesn't match input_buf shape {(n_elements, size)}"
         )
 
-    if grad_input.shape != (nelements, size):
+    if grad_input.shape != (n_elements, size):
         raise ValueError(
-            f"grad_input shape {grad_input.shape} doesn't match input_buf shape ({nelements}, {size})"
+            f"grad_input shape {grad_input.shape} doesn't match input_buf shape {(n_elements, size)}"
         )
 
     if grad_gamma.shape != (size,):
         raise ValueError(
-            f"grad_gamma shape {grad_gamma.shape} doesn't match expected ({size},)"
+            f"grad_gamma shape {grad_gamma.shape} doesn't match expected {(size,)}"
         )
 
     if grad_beta.shape != (size,):
         raise ValueError(
-            f"grad_beta shape {grad_beta.shape} doesn't match expected ({size},)"
+            f"grad_beta shape {grad_beta.shape} doesn't match expected {(size,)}"
         )
 
     # Allocate temporary buffers for partial gradients
-    # These will be automatically released after use
     buffer_pool = (
-        pipeline_cache.device.buffer_pool
-        if hasattr(pipeline_cache.device, "buffer_pool")
+        pipelinecache.device.buffer_pool
+        if hasattr(pipelinecache.device, "buffer_pool")
         else None
     )
 
     if buffer_pool is not None:
-        partial_grad_gamma = pool_take_buffer_2d(buffer_pool, nelements, size)
-        partial_grad_beta = pool_take_buffer_2d(buffer_pool, nelements, size)
+        partial_grad_gamma = pool_take_buffer_2d(buffer_pool, n_elements, size)
+        partial_grad_beta = pool_take_buffer_2d(buffer_pool, n_elements, size)
     else:
         # Fallback: create temporary buffers directly
         import numpy as np
         from gpu_buffer import create_gpu_buffer_2d
 
         partial_grad_gamma = create_gpu_buffer_2d(
-            pipeline_cache.device,
-            nelements,
+            pipelinecache.device,
+            n_elements,
             size,
-            np.zeros((nelements, size), dtype=np.float32),
+            np.zeros((n_elements, size), dtype=np.float32),
         )
         partial_grad_beta = create_gpu_buffer_2d(
-            pipeline_cache.device,
-            nelements,
+            pipelinecache.device,
+            n_elements,
             size,
-            np.zeros((nelements, size), dtype=np.float32),
+            np.zeros((n_elements, size), dtype=np.float32),
         )
 
     # Stage 1: Compute partial gradients (one workgroup per element)
-    params = np.array([size, nelements], dtype=np.uint32)
+    params = np.array([size, n_elements], dtype=np.uint32)
+
     dispatch_simple_compute(
-        pipeline_cache,
+        pipelinecache,
         LAYERNORM_BACKWARD_KERNEL,
         params,
         [
@@ -229,17 +241,27 @@ def run_layernorm_backward(
             partial_grad_gamma,
             partial_grad_beta,
         ],
-        nelements,  # One workgroup per element
+        n_elements,  # One workgroup per element
     )
 
     # Stage 2: Reduce partial gradients into final gamma/beta gradients
-    params_reduce = np.array([size, nelements], dtype=np.uint32)
+    # Choose kernel based on accumulation mode
+    if accumulate:
+        # Use atomic accumulation kernel (GPU-native, no CPU roundtrip)
+        reduction_kernel = LAYERNORM_BACKWARD_REDUCE_ACCUMULATE_KERNEL
+    else:
+        # Zero first, then use normal reduction
+        clear_buffer(grad_gamma)
+        clear_buffer(grad_beta)
+        reduction_kernel = LAYERNORM_BACKWARD_REDUCE_KERNEL
+
+    params_reduce = np.array([size, n_elements], dtype=np.uint32)
     dispatch_simple_compute(
-        pipeline_cache,
-        LAYERNORM_BACKWARD_REDUCE_KERNEL,
+        pipelinecache,
+        reduction_kernel,
         params_reduce,
         [partial_grad_gamma, partial_grad_beta, grad_gamma, grad_beta],
-        (size + 255) // 256,  # One workgroup per 256 dimensions
+        (size + 255) // 256,
     )
 
     # Release temporary buffers
@@ -291,45 +313,56 @@ def run_gelu_backward(
 
 
 def run_bias_backward(
-    pipeline_cache: PipelineCache,
+    pipelinecache: PipelineCache,
     grad_output: GPUBuffer2D,
     grad_bias: GPUBuffer1D,
+    accumulate: bool = False,
 ) -> None:
-    """Backward pass for bias - sum gradients over batch (mutation).
+    """
+    Backward pass for bias - sum gradients over batch (mutation)
 
-    This function MUTATES grad_bias by writing accumulated gradients.
+    This function MUTATES grad_bias by writing or accumulating gradients.
     Returns None to signal mutation.
 
-    NOTE: This function automatically zeros grad_bias before accumulating
-    gradients, so caller does not need to pre-zero it. This ensures
-    consistency with run_layernorm_backward.
-
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
+        pipelinecache: Pipeline cache for kernel compilation
         grad_output: Gradient of loss w.r.t. output (n_elements, dim)
-        grad_bias: Output gradient w.r.t. bias (dim,) (MUTATED, auto-zeroed)
+        grad_bias: Output gradient w.r.t. bias (dim,) - MUTATED
+        accumulate: If False (default), zeros grad_bias before accumulation.
+                   If True, accumulates into existing grad_bias values.
+                   Use True for gradient accumulation across mini-batches.
 
     Raises:
         ValueError: If shapes are incompatible
+
+    Example:
+        # Standard usage (single batch)
+        run_bias_backward(cache, grad_out, grad_bias)
+
+        # Gradient accumulation (multiple mini-batches)
+        run_bias_backward(cache, grad_out1, grad_bias, accumulate=False)  # First batch
+        run_bias_backward(cache, grad_out2, grad_bias, accumulate=True)   # Accumulate
+        run_bias_backward(cache, grad_out3, grad_bias, accumulate=True)   # Accumulate
     """
     n_elements, dim = grad_output.shape
 
-    if n_elements <= 0 or dim <= 0:
-        raise ValueError(f"Invalid grad_output shape: ({n_elements}, {dim})")
+    if n_elements == 0 or dim == 0:
+        raise ValueError(f"Invalid grad_output shape: {(n_elements, dim)}")
 
     if grad_bias.shape != (dim,):
         raise ValueError(
-            f"grad_bias shape {grad_bias.shape} doesn't match expected ({dim},)"
+            f"grad_bias shape {grad_bias.shape} doesn't match expected {(dim,)}"
         )
 
-    # Zero accumulation buffer (consistent API - all accumulation buffers auto-zeroed)
-    clear_buffer(grad_bias)
+    # Zero accumulation buffer only if not accumulating
+    if not accumulate:
+        clear_buffer(grad_bias)
 
     total_size = n_elements * dim
-
     params = np.array([total_size, dim], dtype=np.uint32)
+
     dispatch_simple_compute(
-        pipeline_cache,
+        pipelinecache,
         BIAS_BACKWARD_KERNEL,
         params,
         [grad_output, grad_bias],

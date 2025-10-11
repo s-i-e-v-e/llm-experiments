@@ -52,11 +52,15 @@ def create_bind_group_entries(entries: List[BindGroupEntry]) -> List[Dict]:
 # ============================================================================
 
 
-def create_device() -> Optional[Device]:
-    """Create a new WGPU device.
+def create_device(config: Optional["GPUConfig"] = None) -> Optional[Device]:
+    """
+    Create a new WGPU device
 
     Attempts to initialize WGPU with high-performance adapter.
     Falls back to default adapter if high-performance is unavailable.
+
+    Args:
+        config: Optional GPU configuration. If None, default config is created.
 
     Returns:
         Device state if successful, None if WGPU unavailable or initialization fails
@@ -70,8 +74,31 @@ def create_device() -> Optional[Device]:
     try:
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
         wgpu_device = adapter.request_device_sync()
+
+        # Get device name for auto-tuning if config not provided
+        if config is None:
+            try:
+                adapter_info = adapter.request_adapter_info()
+                device_name = getattr(adapter_info, "device", None) or getattr(
+                    adapter_info, "name", None
+                )
+            except:
+                device_name = None
+
+            from gpu_config import create_config_for_device, validate_config
+
+            config = create_config_for_device(device_name)
+            validate_config(config)
+
         print("WGPU device initialized")
-        return Device(wgpu_device=wgpu_device, adapter=adapter)
+        if config is not None:
+            print(
+                f"Configuration: tile_size={config.matmul_tile_size}, "
+                f"buffer_pool_max={config.buffer_pool_max_mb}MB, "
+                f"workgroup_size={config.default_workgroup_size}"
+            )
+
+        return Device(wgpu_device=wgpu_device, adapter=adapter, config=config)
     except Exception as e:
         print(f"WGPU initialization failed: {e}")
         return None
