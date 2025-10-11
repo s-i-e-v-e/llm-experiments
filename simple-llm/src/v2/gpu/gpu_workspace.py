@@ -1,4 +1,18 @@
-"""Workspace buffer management"""
+"""Workspace buffer management
+
+WORKSPACE LIFECYCLE:
+1. Create manager: create_workspace_manager(device, buffer_pool)
+2. Get/create workspace: workspace_get_or_create(manager, model_params, batch_size, seq_len)
+3. Use workspace buffers for forward/backward passes
+4. Optionally release: workspace_release(manager, batch_size, seq_len)
+5. LRU eviction: workspace_release_lru(manager, keep_count)
+
+MEMORY MANAGEMENT:
+- Workspaces are cached by (batch_size, seq_len) for reuse
+- Buffers are taken from pool on creation, returned on release
+- LRU eviction prevents unbounded memory growth
+- All workspaces automatically released on manager cleanup
+"""
 
 from dataclasses import fields
 from typing import Dict
@@ -32,24 +46,28 @@ def create_workspace_manager(
     return WorkspaceManager(device=device, buffer_pool=buffer_pool)
 
 
-def workspace_ensure_allocated(
+def workspace_get_or_create(
     manager: WorkspaceManager,
     model_params: GPUModelParams,
     batch_size: int,
     seq_len: int,
-) -> None:
-    """Ensure workspace exists for given batch/sequence dimensions (mutation).
+) -> WorkspaceBuffers:
+    """Get existing workspace or create new one (mutation).
 
-    This function MUTATES manager.active_workspaces by creating a new workspace
-    if one doesn't exist. Returns None to signal mutation.
+    This function MUTATES manager.active_workspaces if workspace doesn't exist.
+    Returns workspace buffers for use in forward/backward passes.
 
-    Must be called before workspace_get_buffers().
+    This is the preferred API for workspace access - combines allocation
+    and retrieval into a single call.
 
     Args:
         manager: Workspace manager state (MUTATED if workspace doesn't exist)
         model_params: Model parameters (for determining buffer sizes)
         batch_size: Batch size for this workspace
         seq_len: Sequence length for this workspace
+
+    Returns:
+        Workspace buffers for the specified dimensions
 
     Raises:
         ValueError: If batch_size or seq_len are invalid
@@ -63,9 +81,9 @@ def workspace_ensure_allocated(
 
     key = (batch_size, seq_len)
 
-    # If workspace already exists, nothing to do
+    # If workspace already exists, return it
     if key in manager.active_workspaces:
-        return
+        return manager.active_workspaces[key]
 
     # Validate model_params
     if model_params.embedding.shape[0] <= 0 or model_params.embedding.shape[1] <= 0:
@@ -111,48 +129,7 @@ def workspace_ensure_allocated(
 
     # Store in manager (mutation)
     manager.active_workspaces[key] = workspace
-
-
-def workspace_get_buffers(
-    manager: WorkspaceManager,
-    batch_size: int,
-    seq_len: int,
-) -> WorkspaceBuffers:
-    """Get workspace buffers for given dimensions (read-only access).
-
-    IMPORTANT: workspace_ensure_allocated() must be called first.
-    This function does NOT mutate manager - it only reads from it.
-
-    Returns WorkspaceBuffers that are stored in manager, but caller
-    should treat this as read-only access to shared state.
-
-    Args:
-        manager: Workspace manager state (not mutated)
-        batch_size: Batch size for workspace lookup
-        seq_len: Sequence length for workspace lookup
-
-    Returns:
-        Workspace buffers for the specified dimensions
-
-    Raises:
-        KeyError: If workspace not allocated for these dimensions
-        ValueError: If batch_size or seq_len are invalid
-    """
-    if batch_size <= 0:
-        raise ValueError(f"batch_size must be positive, got {batch_size}")
-
-    if seq_len <= 0:
-        raise ValueError(f"seq_len must be positive, got {seq_len}")
-
-    key = (batch_size, seq_len)
-
-    if key not in manager.active_workspaces:
-        raise KeyError(
-            f"Workspace not allocated for batch_size={batch_size}, seq_len={seq_len}. "
-            f"Call workspace_ensure_allocated() first."
-        )
-
-    return manager.active_workspaces[key]
+    return workspace
 
 
 def workspace_release(manager: WorkspaceManager, batch_size: int, seq_len: int) -> None:

@@ -1,4 +1,13 @@
-"""Backward pass operations - individual kernel dispatches"""
+"""Backward pass operations - individual kernel dispatches
+
+MUTATION SEMANTICS:
+- All backward operations MUTATE their output gradient buffers
+- Accumulation buffers (grad_gamma, grad_beta, grad_bias) are automatically
+  zeroed before kernel dispatch - caller does NOT need to pre-zero them
+- Workspace buffers (grad_input, etc.) are NOT auto-zeroed - caller must
+  ensure these are properly initialized if reusing buffers
+- Functions return None to signal mutation
+"""
 
 import numpy as np
 from gpu_buffer import clear_buffer
@@ -35,8 +44,7 @@ def run_matmul_backward_a(
         grad_A: Output gradient w.r.t. A (M, K) (MUTATED)
 
     Raises:
-        AssertionError: If dimensions are incompatible
-        ValueError: If shapes are invalid
+        ValueError: If dimensions are incompatible or invalid
     """
     M, N = grad_C.shape
     K, N2 = B.shape
@@ -44,12 +52,13 @@ def run_matmul_backward_a(
     if M <= 0 or N <= 0 or K <= 0:
         raise ValueError(f"Invalid dimensions: grad_C=({M}, {N}), B=({K}, {N2})")
 
+    if N != N2:
+        raise ValueError(f"Dimension mismatch: grad_C.shape[1]={N} != B.shape[1]={N2}")
+
     if grad_A.shape != (M, K):
         raise ValueError(
             f"grad_A shape {grad_A.shape} doesn't match expected ({M}, {K})"
         )
-
-    assert N == N2, f"Dimension mismatch: grad_C.shape[1]={N} != B.shape[1]={N2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
     dispatch_simple_compute(
@@ -81,8 +90,7 @@ def run_matmul_backward_b(
         grad_B: Output gradient w.r.t. B (K, N) (MUTATED)
 
     Raises:
-        AssertionError: If dimensions are incompatible
-        ValueError: If shapes are invalid
+        ValueError: If dimensions are incompatible or invalid
     """
     M, K = A.shape
     M2, N = grad_C.shape
@@ -90,12 +98,13 @@ def run_matmul_backward_b(
     if M <= 0 or K <= 0 or N <= 0:
         raise ValueError(f"Invalid dimensions: A=({M}, {K}), grad_C=({M2}, {N})")
 
+    if M != M2:
+        raise ValueError(f"Dimension mismatch: A.shape[0]={M} != grad_C.shape[0]={M2}")
+
     if grad_B.shape != (K, N):
         raise ValueError(
             f"grad_B shape {grad_B.shape} doesn't match expected ({K}, {N})"
         )
-
-    assert M == M2, f"Dimension mismatch: A.shape[0]={M} != grad_C.shape[0]={M2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
     dispatch_simple_compute(
@@ -126,6 +135,10 @@ def run_layernorm_backward(
     NOTE: This function automatically zeros grad_gamma and grad_beta before
     accumulating gradients, so caller does not need to pre-zero them.
 
+    IMPLEMENTATION: Uses two-stage reduction to avoid race conditions:
+    - Stage 1: Each workgroup computes partial gamma/beta gradients
+    - Stage 2: Reduction kernel sums partial gradients into final result
+
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         input_buf: Input from forward pass (nelements, size)
@@ -138,6 +151,11 @@ def run_layernorm_backward(
     Raises:
         ValueError: If shapes are incompatible
     """
+    from gpu_buffer import pool_release_buffer, pool_take_buffer_2d
+    from gpu_kernels_backward import (
+        LAYERNORM_BACKWARD_REDUCE_KERNEL,
+    )
+
     nelements, size = input_buf.shape
 
     if nelements <= 0 or size <= 0:
@@ -168,18 +186,66 @@ def run_layernorm_backward(
             f"grad_beta shape {grad_beta.shape} doesn't match expected ({size},)"
         )
 
-    # Zero accumulation buffers (safer API - caller doesn't need to remember)
-    clear_buffer(grad_gamma)
-    clear_buffer(grad_beta)
+    # Allocate temporary buffers for partial gradients
+    # These will be automatically released after use
+    buffer_pool = (
+        pipeline_cache.device.buffer_pool
+        if hasattr(pipeline_cache.device, "buffer_pool")
+        else None
+    )
 
+    if buffer_pool is not None:
+        partial_grad_gamma = pool_take_buffer_2d(buffer_pool, nelements, size)
+        partial_grad_beta = pool_take_buffer_2d(buffer_pool, nelements, size)
+    else:
+        # Fallback: create temporary buffers directly
+        import numpy as np
+        from gpu_buffer import create_gpu_buffer_2d
+
+        partial_grad_gamma = create_gpu_buffer_2d(
+            pipeline_cache.device,
+            nelements,
+            size,
+            np.zeros((nelements, size), dtype=np.float32),
+        )
+        partial_grad_beta = create_gpu_buffer_2d(
+            pipeline_cache.device,
+            nelements,
+            size,
+            np.zeros((nelements, size), dtype=np.float32),
+        )
+
+    # Stage 1: Compute partial gradients (one workgroup per element)
     params = np.array([size, nelements], dtype=np.uint32)
     dispatch_simple_compute(
         pipeline_cache,
         LAYERNORM_BACKWARD_KERNEL,
         params,
-        [input_buf, gamma, grad_output, grad_input, grad_gamma, grad_beta],
-        nelements,
+        [
+            input_buf,
+            gamma,
+            grad_output,
+            grad_input,
+            partial_grad_gamma,
+            partial_grad_beta,
+        ],
+        nelements,  # One workgroup per element
     )
+
+    # Stage 2: Reduce partial gradients into final gamma/beta gradients
+    params_reduce = np.array([size, nelements], dtype=np.uint32)
+    dispatch_simple_compute(
+        pipeline_cache,
+        LAYERNORM_BACKWARD_REDUCE_KERNEL,
+        params_reduce,
+        [partial_grad_gamma, partial_grad_beta, grad_gamma, grad_beta],
+        (size + 255) // 256,  # One workgroup per 256 dimensions
+    )
+
+    # Release temporary buffers
+    if buffer_pool is not None:
+        pool_release_buffer(buffer_pool, partial_grad_gamma)
+        pool_release_buffer(buffer_pool, partial_grad_beta)
 
 
 def run_gelu_backward(
@@ -234,10 +300,14 @@ def run_bias_backward(
     This function MUTATES grad_bias by writing accumulated gradients.
     Returns None to signal mutation.
 
+    NOTE: This function automatically zeros grad_bias before accumulating
+    gradients, so caller does not need to pre-zero it. This ensures
+    consistency with run_layernorm_backward.
+
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         grad_output: Gradient of loss w.r.t. output (n_elements, dim)
-        grad_bias: Output gradient w.r.t. bias (dim,) (MUTATED)
+        grad_bias: Output gradient w.r.t. bias (dim,) (MUTATED, auto-zeroed)
 
     Raises:
         ValueError: If shapes are incompatible
@@ -251,6 +321,9 @@ def run_bias_backward(
         raise ValueError(
             f"grad_bias shape {grad_bias.shape} doesn't match expected ({dim},)"
         )
+
+    # Zero accumulation buffer (consistent API - all accumulation buffers auto-zeroed)
+    clear_buffer(grad_bias)
 
     total_size = n_elements * dim
 

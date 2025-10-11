@@ -139,22 +139,13 @@ fn main(
 """
 
 LAYERNORM_BACKWARD_KERNEL = """
-// Backward pass for layer normalization
+// Backward pass for layer normalization - STAGE 1: Compute per-element contributions
 //
-// KNOWN ISSUE: Race condition in gamma/beta gradient accumulation
-// The lines:
-//     grad_gamma[tid] += gamma_grad_acc;
-//     grad_beta[tid] += beta_grad_acc;
+// FIXED: Two-stage algorithm eliminates race condition
+// Stage 1 (this kernel): Each workgroup computes partial gradients for gamma/beta
+// Stage 2 (separate kernel): Reduction combines partial gradients
 //
-// Can have race conditions when multiple workgroups write to same indices.
-//
-// WORKAROUND: The Python wrapper pre-zeros these buffers and the kernel
-// is dispatched with n_workgroups = n_elements, ensuring each workgroup
-// processes a different element. This means no two workgroups write to
-// the same gamma/beta indices simultaneously, avoiding the race.
-//
-// PROPER FIX (future): Use atomic operations when WGSL adds support, or
-// use a two-pass algorithm with intermediate buffers.
+// This kernel outputs PARTIAL gradients that must be reduced in stage 2.
 
 struct NormParams {
     size: u32,
@@ -166,8 +157,8 @@ struct NormParams {
 @group(0) @binding(2) var<storage, read> gamma: array<f32>;
 @group(0) @binding(3) var<storage, read> grad_output: array<f32>;
 @group(0) @binding(4) var<storage, read_write> grad_input: array<f32>;
-@group(0) @binding(5) var<storage, read_write> grad_gamma: array<f32>;
-@group(0) @binding(6) var<storage, read_write> grad_beta: array<f32>;
+@group(0) @binding(5) var<storage, read_write> partial_grad_gamma: array<f32>;  // [n_elements, size]
+@group(0) @binding(6) var<storage, read_write> partial_grad_beta: array<f32>;   // [n_elements, size]
 
 const EPS: f32 = 1e-5;
 const BLOCK_SIZE: u32 = 256u;
@@ -221,23 +212,22 @@ fn main(
     let variance = shared_data[0] / f32(params.size);
     let inv_std = 1.0 / sqrt(variance + EPS);
 
-    // Compute gradients for gamma and beta
-    // SAFE: Each workgroup handles ONE element, so each workgroup writes to
-    // DIFFERENT gamma/beta indices (tid within [0, params.size-1])
-    // No race condition because workgroups don't overlap.
+    // Compute PARTIAL gradients for gamma and beta (no accumulation, just write)
+    // Each workgroup handles ONE element, writes to its own slice of partial buffers
+    // SAFE: No race condition because each workgroup writes to different memory locations
     if (tid < params.size) {
         let x_norm = (input[offset + tid] - mean) * inv_std;
         let gamma_grad = grad_output[offset + tid] * x_norm;
         let beta_grad = grad_output[offset + tid];
 
-        // These writes are safe - each workgroup handles different elem_idx
-        // so different workgroups never write to same gamma/beta indices
-        grad_gamma[tid] += gamma_grad;
-        grad_beta[tid] += beta_grad;
+        // Write partial gradients (will be reduced in stage 2)
+        let partial_offset = elem_idx * params.size + tid;
+        partial_grad_gamma[partial_offset] = gamma_grad;
+        partial_grad_beta[partial_offset] = beta_grad;
     }
     workgroupBarrier();
 
-    // Compute gradient w.r.t. input
+    // Compute gradient w.r.t. input (unchanged from original)
     var dxhat_sum = 0.0;
     var dxhat_xhat_sum = 0.0;
 
@@ -276,6 +266,48 @@ fn main(
     }
 }
 """
+
+LAYERNORM_BACKWARD_REDUCE_KERNEL = """
+// Backward pass for layer normalization - STAGE 2: Reduce partial gradients
+//
+// Reduces partial gamma/beta gradients from stage 1 across all elements.
+// Each thread handles one feature dimension, summing across all batch elements.
+
+struct ReduceParams {
+    size: u32,
+    n_elements: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: ReduceParams;
+@group(0) @binding(1) var<storage, read> partial_grad_gamma: array<f32>;  // [n_elements, size]
+@group(0) @binding(2) var<storage, read> partial_grad_beta: array<f32>;   // [n_elements, size]
+@group(0) @binding(3) var<storage, read_write> grad_gamma: array<f32>;    // [size]
+@group(0) @binding(4) var<storage, read_write> grad_beta: array<f32>;     // [size]
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let dim_idx = global_id.x;
+
+    if (dim_idx >= params.size) {
+        return;
+    }
+
+    // Sum partial gradients across all elements for this dimension
+    var gamma_sum = 0.0;
+    var beta_sum = 0.0;
+
+    for (var elem_idx = 0u; elem_idx < params.n_elements; elem_idx++) {
+        let partial_offset = elem_idx * params.size + dim_idx;
+        gamma_sum += partial_grad_gamma[partial_offset];
+        beta_sum += partial_grad_beta[partial_offset];
+    }
+
+    // Write final gradients
+    grad_gamma[dim_idx] = gamma_sum;
+    grad_beta[dim_idx] = beta_sum;
+}
+"""
+
 
 GELU_BACKWARD_KERNEL = """
 // Backward pass for GELU activation
