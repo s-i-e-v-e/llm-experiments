@@ -62,25 +62,11 @@ fn main(
 
         workgroupBarrier();
 
-        // Compute with register blocking (2x2 block per thread)
-        var acc00 = 0.0;
-        var acc01 = 0.0;
-        var acc10 = 0.0;
-        var acc11 = 0.0;
-
+        // FIXED: Removed wasteful register blocking
+        // Each thread computes one output element
         for (var k = 0u; k < TILE_SIZE; k++) {{
-            let a_val0 = tile_A[local_row * TILE_SIZE + k];
-            let a_val1 = tile_A[(local_row + 1u) * TILE_SIZE + k];
-            let b_val0 = tile_B[k * TILE_SIZE + local_col];
-            let b_val1 = tile_B[k * TILE_SIZE + local_col + 1u];
-
-            acc00 += a_val0 * b_val0;
-            acc01 += a_val0 * b_val1;
-            acc10 += a_val1 * b_val0;
-            acc11 += a_val1 * b_val1;
+            sum += tile_A[local_row * TILE_SIZE + k] * tile_B[k * TILE_SIZE + local_col];
         }}
-
-        sum += acc00;  // Primary accumulator
 
         workgroupBarrier();
     }}
@@ -630,6 +616,9 @@ var<workgroup> Vj: array<f32, 2048>;  // Bc x head_dim (32 x 64)
 var<workgroup> Sij: array<f32, 1024>; // Br x Bc (32 x 32) - attention scores
 var<workgroup> Pij: array<f32, 1024>; // Br x Bc (32 x 32) - attention weights
 
+// FIXED: Added storage for mi_old to correctly compute correction factor
+var<workgroup> mi_old_storage: array<f32, 32>;  // Store old max values
+
 @compute @workgroup_size(32, 1, 1)
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>,
@@ -741,36 +730,39 @@ fn main(
         }
         workgroupBarrier();
 
-        // Online softmax update (per row)
+        // FIXED: Online softmax update with correct correction factor
         if (tid == 0u) {
             for (var row = 0u; row < actual_Br; row++) {
-                // Find new max for this row
-                var mij_new = mi[row];
-                for (var col = 0u; col < actual_Bc; col++) {
-                    mij_new = max(mij_new, Sij[row * Bc + col]);
-                }
-
-                // Compute exp(scores - max) and new sum
-                var lij_new = 0.0;
-                for (var col = 0u; col < actual_Bc; col++) {
-                    let p = exp(Sij[row * Bc + col] - mij_new);
-                    Pij[row * Bc + col] = p;
-                    lij_new += p;
-                }
-
-                // Update running statistics
+                // Store OLD max value BEFORE any updates
                 let mi_old = mi[row];
-                let li_old = li[row];
+                mi_old_storage[row] = mi_old;
 
-                mi[row] = mij_new;
-                li[row] = li_old * exp(mi_old - mij_new) + lij_new;
+                // Find NEW max for this row
+                var mi_new = mi_old;
+                for (var col = 0u; col < actual_Bc; col++) {
+                    mi_new = max(mi_new, Sij[row * Bc + col]);
+                }
+
+                // Compute exp(scores - new_max) and new sum
+                var li_new = 0.0;
+                for (var col = 0u; col < actual_Bc; col++) {
+                    let p = exp(Sij[row * Bc + col] - mi_new);
+                    Pij[row * Bc + col] = p;
+                    li_new += p;
+                }
+
+                // Update running statistics using OLD and NEW max
+                let li_old = li[row];
+                mi[row] = mi_new;
+                li[row] = li_old * exp(mi_old - mi_new) + li_new;
             }
         }
         workgroupBarrier();
 
-        // Update output: Oi = diag(exp(mi_old - mi_new)) @ Oi + Pij @ Vj
+        // Update output: Oi = correction * Oi + Pij @ Vj
         for (var row = tid; row < actual_Br; row += 32u) {
-            let correction = exp(mi[row] - mi[row]);  // Will be 1.0 for first block
+            // FIXED: Compute correction using STORED old max vs current max
+            let correction = exp(mi_old_storage[row] - mi[row]);
 
             // Scale previous output
             for (var d_idx = 0u; d_idx < d; d_idx++) {
@@ -809,6 +801,7 @@ fn main(
     }
 }
 """
+
 
 TRANSPOSE_KERNEL = """
 // Matrix transpose with bank conflict avoidance

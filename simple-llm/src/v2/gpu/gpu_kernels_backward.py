@@ -368,7 +368,6 @@ fn main(...) {
     // This is the most complex part of backward pass
 }
 """
-
 FLASHATTENTION_BACKWARD_KERNEL = """
 // FlashAttention backward pass
 // Recomputes attention on-the-fly using saved statistics
@@ -509,12 +508,12 @@ fn main(
         // where dP is gradient w.r.t. attention weights
 
         // This is a placeholder - full backward pass requires more complex logic
-        // For now, we'll accumulate basic gradients
 
         workgroupBarrier();
     }
 
-    // Write dQ output
+    // FIXED: Write dQ output WITHOUT atomicAdd (doesn't exist in WGSL)
+    // Each workgroup processes disjoint Q blocks, so no race condition
     for (var i = tid; i < actual_Br * d; i += 32u) {
         let local_row = i / d;
         let local_col = i % d;
@@ -524,10 +523,12 @@ fn main(
                     global_row * embedding_dim +
                     head_idx * d + local_col;
 
-        atomicAdd(&dQ[offset], dQi[i]);
+        // Direct write - safe because each workgroup handles different Q blocks
+        dQ[offset] = dQi[i];
     }
 }
 """
+
 
 CROSS_ENTROPY_LOSS_KERNEL = """
 // Combined cross-entropy loss and gradient computation
