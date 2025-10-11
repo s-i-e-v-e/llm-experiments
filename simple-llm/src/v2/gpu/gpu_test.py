@@ -4,32 +4,20 @@ import numpy as np
 from gpu_buffer import create_gpu_buffer_1d, create_gpu_buffer_2d, gpu_to_numpy
 from gpu_device import create_device, create_pipeline_cache
 from gpu_ops_forward import run_layernorm, run_matmul
-
-try:
-    import wgpu
-
-    WGPU_AVAILABLE = True
-except ImportError:
-    WGPU_AVAILABLE = False
-
+from gpu_types import Device
 
 # ============================================================================
 # TEST FUNCTIONS
 # ============================================================================
 
 
-def test_matmul() -> bool:
+def test_matmul(device: Device) -> bool:
     """Test matrix multiplication"""
     print("Testing tiled matmul...")
     M, K, N = 64, 128, 64
     A_data = np.random.randn(M, K).astype(np.float32)
     B_data = np.random.randn(K, N).astype(np.float32)
     C_expected = A_data @ B_data
-
-    device = create_device()
-    if device is None:
-        print("  ⚠️ Could not create device")
-        return False
 
     pipeline_cache = create_pipeline_cache(device)
 
@@ -51,7 +39,7 @@ def test_matmul() -> bool:
         return False
 
 
-def test_layernorm() -> bool:
+def test_layernorm(device: Device) -> bool:
     """Test layer normalization"""
     print("\nTesting layer normalization...")
     batch, dim = 32, 128
@@ -63,11 +51,6 @@ def test_layernorm() -> bool:
     mean = x_data.mean(axis=1, keepdims=True)
     var = x_data.var(axis=1, keepdims=True)
     x_norm_expected = (x_data - mean) / np.sqrt(var + 1e-5)
-
-    device = create_device()
-    if device is None:
-        print("  ⚠️ Could not create device")
-        return False
 
     pipeline_cache = create_pipeline_cache(device)
 
@@ -92,15 +75,13 @@ def test_layernorm() -> bool:
 
 def run_all_tests() -> None:
     """Run all GPU operation tests"""
-    if not WGPU_AVAILABLE:
-        print("⚠️ wgpu not available, skipping tests")
-        return
+    device = create_device()
 
     print("\n🧪 Testing GPU Operations\n")
 
     results = []
-    results.append(test_matmul())
-    results.append(test_layernorm())
+    results.append(test_matmul(device))
+    results.append(test_layernorm(device))
 
     print(f"\n{'=' * 50}")
     passed = sum(results)

@@ -58,7 +58,7 @@ class GPUBuffer3D:
 
 
 # Union type for when we need to accept any buffer dimension
-GPUBuffer = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
+GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
 
 
 # ============================================================================

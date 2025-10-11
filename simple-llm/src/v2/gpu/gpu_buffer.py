@@ -1,17 +1,9 @@
 """Buffer creation and pool management"""
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import numpy as np
-
-try:
-    import wgpu
-
-    WGPU_AVAILABLE = True
-except ImportError:
-    WGPU_AVAILABLE = False
-    wgpu = None
-
+from gpu_device import wgpu
 from gpu_types import (
     BufferInfo,
     BufferPool,
@@ -21,10 +13,6 @@ from gpu_types import (
     GPUBuffer3D,
     StagingPool,
 )
-
-# Type alias for any GPU buffer
-GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
-
 
 # ============================================================================
 # BASIC BUFFER OPERATIONS

@@ -3,16 +3,12 @@
 from typing import List
 
 import numpy as np
-
-try:
-    import wgpu
-
-    WGPU_AVAILABLE = True
-except ImportError:
-    WGPU_AVAILABLE = False
-    wgpu = None
-
-from gpu_device import BindGroupEntry, create_bind_group_entries, get_or_create_pipeline
+from gpu_device import (
+    BindGroupEntry,
+    create_bind_group_entries,
+    get_or_create_pipeline,
+    wgpu,
+)
 from gpu_kernels_backward import (
     BIAS_BACKWARD_KERNEL,
     GELU_BACKWARD_KERNEL,
