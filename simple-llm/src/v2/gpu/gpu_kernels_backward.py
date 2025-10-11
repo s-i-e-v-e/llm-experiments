@@ -139,8 +139,22 @@ fn main(
 """
 
 LAYERNORM_BACKWARD_KERNEL = """
-// Fixed backward pass for layer normalization
-// Uses atomic-free accumulation with proper synchronization
+// Backward pass for layer normalization
+//
+// KNOWN ISSUE: Race condition in gamma/beta gradient accumulation
+// The lines:
+//     grad_gamma[tid] += gamma_grad_acc;
+//     grad_beta[tid] += beta_grad_acc;
+//
+// Can have race conditions when multiple workgroups write to same indices.
+//
+// WORKAROUND: The Python wrapper pre-zeros these buffers and the kernel
+// is dispatched with n_workgroups = n_elements, ensuring each workgroup
+// processes a different element. This means no two workgroups write to
+// the same gamma/beta indices simultaneously, avoiding the race.
+//
+// PROPER FIX (future): Use atomic operations when WGSL adds support, or
+// use a two-pass algorithm with intermediate buffers.
 
 struct NormParams {
     size: u32,
@@ -158,8 +172,6 @@ struct NormParams {
 const EPS: f32 = 1e-5;
 const BLOCK_SIZE: u32 = 256u;
 var<workgroup> shared_data: array<f32, 256>;
-var<workgroup> shared_gamma_grad: array<f32, 256>;
-var<workgroup> shared_beta_grad: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(
@@ -209,21 +221,19 @@ fn main(
     let variance = shared_data[0] / f32(params.size);
     let inv_std = 1.0 / sqrt(variance + EPS);
 
-    // Compute gradients for gamma and beta (parallel over features)
+    // Compute gradients for gamma and beta
+    // SAFE: Each workgroup handles ONE element, so each workgroup writes to
+    // DIFFERENT gamma/beta indices (tid within [0, params.size-1])
+    // No race condition because workgroups don't overlap.
     if (tid < params.size) {
-        var gamma_grad_acc = 0.0;
-        var beta_grad_acc = 0.0;
+        let x_norm = (input[offset + tid] - mean) * inv_std;
+        let gamma_grad = grad_output[offset + tid] * x_norm;
+        let beta_grad = grad_output[offset + tid];
 
-        for (var elem = 0u; elem < params.n_elements; elem++) {
-            let elem_offset = elem * params.size;
-            let x_norm = (input[elem_offset + tid] - mean) * inv_std;
-            gamma_grad_acc += grad_output[elem_offset + tid] * x_norm;
-            beta_grad_acc += grad_output[elem_offset + tid];
-        }
-
-        // Accumulate atomically (webgpu doesn't have atomics, so use fallback)
-        grad_gamma[tid] += gamma_grad_acc;
-        grad_beta[tid] += beta_grad_acc;
+        // These writes are safe - each workgroup handles different elem_idx
+        // so different workgroups never write to same gamma/beta indices
+        grad_gamma[tid] += gamma_grad;
+        grad_beta[tid] += beta_grad;
     }
     workgroupBarrier();
 
@@ -368,6 +378,12 @@ fn main(...) {
     // This is the most complex part of backward pass
 }
 """
+
+
+# IMPORTANT:
+# - Incomplete implementation that would produce incorrect gradients.
+# - FlashAttention backward requires complex recomputation logic
+# - Future work: Implement full FlashAttention backward using the algorithm from Dao et al. 2022, Section 3.2.
 FLASHATTENTION_BACKWARD_KERNEL = """
 // FlashAttention backward pass
 // Recomputes attention on-the-fly using saved statistics

@@ -10,17 +10,74 @@ from gpu_kernels_backward import (
 )
 from gpu_kernels_forward import (
     BIAS_ADD_KERNEL,
+    CROSS_ENTROPY_LOSS_KERNEL,
+    EMBEDDING_KERNEL,
     GELU_KERNEL,
     LAYERNORM_KERNEL,
+    MULTIHEAD_ATTENTION_KERNEL,
     RESIDUAL_ADD_KERNEL,
     TILED_MATMUL_KERNEL,
 )
+from gpu_kernels_opt import ADAMW_OPTIMIZER_KERNEL
 from gpu_ops import _add_compute_to_batch_internal
 from gpu_types import BatchState, GPUBuffer1D, GPUBuffer2D, PipelineCache
 
 # ============================================================================
 # FORWARD PASS BATCH OPERATIONS
 # ============================================================================
+
+
+def batch_add_embedding(
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    embedding_table: GPUBuffer2D,
+    pos_encoding: GPUBuffer2D,
+    input_ids: GPUBuffer1D,
+    output: GPUBuffer2D,
+    batch_size: int,
+    seq_len: int,
+) -> None:
+    """Add embedding lookup to batch"""
+    vocab_size, embedding_dim = embedding_table.shape
+
+    params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
+    _add_compute_to_batch_internal(
+        pipeline_cache,
+        batch_state,
+        EMBEDDING_KERNEL,
+        params,
+        [embedding_table, pos_encoding, input_ids, output],
+        (batch_size * seq_len + 255) // 256,
+    )
+
+
+def batch_add_attention(
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    Q: GPUBuffer2D,
+    K: GPUBuffer2D,
+    V: GPUBuffer2D,
+    output: GPUBuffer2D,
+    batch_size: int,
+    seq_len: int,
+    n_heads: int,
+    head_dim: int,
+) -> None:
+    """Add multi-head attention to batch"""
+    assert seq_len <= 512, f"Sequence length {seq_len} exceeds kernel limit 512"
+    assert head_dim <= 64, f"Head dimension {head_dim} exceeds kernel limit 64"
+
+    params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
+    _add_compute_to_batch_internal(
+        pipeline_cache,
+        batch_state,
+        MULTIHEAD_ATTENTION_KERNEL,
+        params,
+        [Q, K, V, output],
+        workgroups_x=seq_len,
+        workgroups_y=n_heads,
+        workgroups_z=batch_size,
+    )
 
 
 def batch_add_matmul(
@@ -130,6 +187,31 @@ def batch_add_residual(
         params,
         [input_a, input_b, output],
         (total_size + 255) // 256,
+    )
+
+
+def batch_add_cross_entropy_loss(
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    logits: GPUBuffer2D,
+    targets: GPUBuffer1D,
+    loss_output: GPUBuffer1D,
+    grad_logits: GPUBuffer2D,
+    batch_size: int,
+    seq_len: int,
+) -> None:
+    """Add cross-entropy loss computation to batch"""
+    total_predictions = batch_size * seq_len
+    vocab_size = logits.shape[1]
+
+    params = np.array([batch_size, seq_len, vocab_size], dtype=np.uint32)
+    _add_compute_to_batch_internal(
+        pipeline_cache,
+        batch_state,
+        CROSS_ENTROPY_LOSS_KERNEL,
+        params,
+        [logits, targets, loss_output, grad_logits],
+        (total_predictions + 255) // 256,
     )
 
 
@@ -273,6 +355,83 @@ def batch_add_bias_backward(
         params,
         [grad_output, grad_bias],
         (dim + 255) // 256,
+    )
+
+
+# ============================================================================
+# OPTIMIZER BATCH OPERATIONS
+# ============================================================================
+
+
+def batch_add_adamw_update(
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    gradients: GPUBuffer2D,
+    weights: GPUBuffer2D,
+    m: GPUBuffer2D,
+    v: GPUBuffer2D,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    weight_decay: float,
+    eps: float,
+    step: int,
+) -> None:
+    """Add AdamW optimizer update to batch"""
+    assert gradients.shape == weights.shape, "Shape mismatch"
+    assert weights.shape == m.shape == v.shape, "All buffers must have same shape"
+    assert step >= 1, "Step must be >= 1"
+
+    size = weights.size
+
+    params = np.array(
+        [lr, beta1, beta2, weight_decay, eps, float(step), size],
+        dtype=np.float32,
+    )
+
+    _add_compute_to_batch_internal(
+        pipeline_cache,
+        batch_state,
+        ADAMW_OPTIMIZER_KERNEL,
+        params,
+        [gradients, weights, m, v],
+        (size + 255) // 256,
+    )
+
+
+def batch_add_adamw_update_1d(
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    gradients: GPUBuffer1D,
+    weights: GPUBuffer1D,
+    m: GPUBuffer1D,
+    v: GPUBuffer1D,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    weight_decay: float,
+    eps: float,
+    step: int,
+) -> None:
+    """Add AdamW optimizer update for 1D buffers to batch"""
+    assert gradients.size == weights.size, "Size mismatch"
+    assert weights.size == m.size == v.size, "All buffers must have same size"
+    assert step >= 1, "Step must be >= 1"
+
+    size = weights.size
+
+    params = np.array(
+        [lr, beta1, beta2, weight_decay, eps, float(step), size],
+        dtype=np.float32,
+    )
+
+    _add_compute_to_batch_internal(
+        pipeline_cache,
+        batch_state,
+        ADAMW_OPTIMIZER_KERNEL,
+        params,
+        [gradients, weights, m, v],
+        (size + 255) // 256,
     )
 
 

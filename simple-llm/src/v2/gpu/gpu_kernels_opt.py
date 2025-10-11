@@ -5,14 +5,7 @@
 # ============================================================================
 
 ADAMW_OPTIMIZER_KERNEL = """
-// AdamW optimizer update kernel
-// Performs: weight update with momentum and adaptive learning rates
-// (All AdamW optimizer kernel code here)
-"""
-
-
-ADAMW_OPTIMIZER_KERNEL = """
-// Fused AdamW optimizer update
+// Fused AdamW optimizer update with decoupled weight decay
 
 struct OptimizerParams {
     lr: f32,
@@ -21,6 +14,7 @@ struct OptimizerParams {
     weight_decay: f32,
     eps: f32,
     step: f32,
+    size: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: OptimizerParams;
@@ -28,13 +22,12 @@ struct OptimizerParams {
 @group(0) @binding(2) var<storage, read_write> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> m: array<f32>;
 @group(0) @binding(4) var<storage, read_write> v: array<f32>;
-@group(0) @binding(5) var<uniform> size: u32;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let idx = global_id.x;
 
-    if (idx >= size) {
+    if (idx >= params.size) {
         return;
     }
 

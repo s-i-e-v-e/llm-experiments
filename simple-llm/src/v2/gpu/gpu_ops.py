@@ -31,7 +31,12 @@ GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
 def _create_uniform_buffer_internal(
     pipeline_cache: PipelineCache, data: np.ndarray
 ) -> WGPUBuffer:
-    """Internal: Create uniform buffer for parameters"""
+    """
+    Internal: Create uniform buffer for parameters.
+
+    Memory management: Buffer is automatically freed by WGPU after GPU finishes
+    using it (typically after queue submission completes). No explicit cleanup needed.
+    """
     return pipeline_cache.device.wgpu_device.create_buffer_with_data(
         data=data, usage=wgpu.BufferUsage.UNIFORM
     )
@@ -66,6 +71,9 @@ def _dispatch_compute_internal(
     compute_pass.end()
     pipeline_cache.device.wgpu_device.queue.submit([encoder.finish()])
 
+    # Note: uniform buffers created in this function are automatically freed
+    # by WGPU after the queue submission completes. No explicit cleanup needed.
+
 
 def dispatch_simple_compute(
     pipeline_cache: PipelineCache,
@@ -79,6 +87,9 @@ def dispatch_simple_compute(
     """
     Unified compute dispatch - eliminates repetitive pipeline/bind group/dispatch pattern.
 
+    Memory management: Uniform parameter buffer is created temporarily and automatically
+    freed by WGPU after GPU completes execution. No memory leak.
+
     Args:
         pipeline_cache: Pipeline cache state
         kernel_code: WGSL kernel source code
@@ -89,6 +100,7 @@ def dispatch_simple_compute(
         workgroups_z: Number of workgroups in Z dimension (default: 1)
     """
     # Create uniform buffer for parameters
+    # Memory: This buffer is automatically freed by WGPU after queue.submit() completes
     params_buffer = _create_uniform_buffer_internal(pipeline_cache, params)
 
     # Get or create pipeline
@@ -108,6 +120,8 @@ def dispatch_simple_compute(
         pipeline_cache, pipeline, bind_group, workgroups_x, workgroups_y, workgroups_z
     )
 
+    # params_buffer goes out of scope here, but WGPU keeps it alive until GPU finishes
+
 
 # ============================================================================
 # COMMAND BATCH STATE
@@ -115,7 +129,13 @@ def dispatch_simple_compute(
 
 
 def create_command_batch(device: Device, enable_profiling: bool = False) -> BatchState:
-    """Create command batch state for batched GPU operations"""
+    """
+    Create command batch state for batched GPU operations.
+
+    Memory management: Uniform buffers created during batch operations are retained
+    in batch_state.retained_buffers to keep them alive until submit_batch() is called.
+    After submission, they are automatically freed by WGPU.
+    """
     encoder = device.wgpu_device.create_command_encoder()
     return BatchState(
         device=device,
@@ -129,7 +149,12 @@ def create_command_batch(device: Device, enable_profiling: bool = False) -> Batc
 def _create_and_retain_uniform_buffer_internal(
     batch_state: BatchState, data: np.ndarray
 ) -> WGPUBuffer:
-    """Internal: Create uniform buffer and add to retained list"""
+    """
+    Internal: Create uniform buffer and add to retained list.
+
+    Memory management: Buffer is kept alive by batch_state.retained_buffers
+    until submit_batch() is called. After submission, WGPU automatically frees it.
+    """
     buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=data, usage=wgpu.BufferUsage.UNIFORM
     )
@@ -162,7 +187,8 @@ def _add_compute_to_batch_internal(
     """
     Internal: Add compute operation to batch encoder.
 
-    Similar to dispatch_simple_compute but adds to batch instead of immediate dispatch.
+    Memory management: Uniform buffer is retained in batch_state.retained_buffers
+    to keep it alive until submit_batch() is called.
     """
     params_buffer = _create_and_retain_uniform_buffer_internal(batch_state, params)
     pipeline = get_or_create_pipeline(pipeline_cache, kernel_code)
@@ -182,3 +208,23 @@ def _add_compute_to_batch_internal(
     compute_pass.end()
 
     batch_state.operation_count += 1
+
+
+def submit_batch(batch_state: BatchState) -> None:
+    """
+    Submit all batched operations.
+
+    Memory management: After submission, retained_buffers list is cleared.
+    WGPU automatically frees uniform buffers after GPU finishes execution.
+    """
+    if batch_state.encoder is None:
+        raise RuntimeError("Batch already submitted or not initialized")
+
+    command_buffer = batch_state.encoder.finish()
+    batch_state.device.wgpu_device.queue.submit([command_buffer])
+
+    # Clear encoder and buffers
+    # Note: Clearing Python references allows WGPU to automatically free uniform buffers
+    # after GPU completes execution. No memory leak.
+    batch_state.encoder = None
+    batch_state.retained_buffers.clear()

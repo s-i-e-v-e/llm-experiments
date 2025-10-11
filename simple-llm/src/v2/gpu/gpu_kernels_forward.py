@@ -432,8 +432,8 @@ fn main(
 """
 
 MULTIHEAD_ATTENTION_KERNEL = """
-// Simplified multi-head self-attention with causal masking
-// Processes one query position across all heads
+// Multi-head self-attention with causal masking
+// FIXED: Removed hardcoded array sizes - dynamically computes everything
 
 struct AttentionParams {
     batch_size: u32,
@@ -443,11 +443,12 @@ struct AttentionParams {
 }
 
 @group(0) @binding(0) var<uniform> params: AttentionParams;
-@group(0) @binding(1) var<storage, read> Q: array<f32>;  // [B*S, n_heads*head_dim]
-@group(0) @binding(2) var<storage, read> K: array<f32>;  // [B*S, n_heads*head_dim]
-@group(0) @binding(3) var<storage, read> V: array<f32>;  // [B*S, n_heads*head_dim]
-@group(0) @binding(4) var<storage, read_write> output: array<f32>;  // [B*S, n_heads*head_dim]
+@group(0) @binding(1) var<storage, read> Q: array<f32>;
+@group(0) @binding(2) var<storage, read> K: array<f32>;
+@group(0) @binding(3) var<storage, read> V: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
+const BLOCK_SIZE: u32 = 256u;
 var<workgroup> shared_scores: array<f32, 256>;
 
 @compute @workgroup_size(256)
@@ -475,28 +476,21 @@ fn main(
                    q_pos * embedding_dim +
                    head_idx * head_dim;
 
-    // Load query into registers (small enough for head_dim <= 64)
-    var q_local: array<f32, 64>;
-    for (var d = 0u; d < head_dim; d++) {
-        q_local[d] = Q[q_offset + d];
-    }
-
-    // Compute attention scores for positions up to q_pos (causal mask)
+    // Phase 1: Compute attention scores and find max (for numerical stability)
+    // Process keys in chunks handled by threads
     var max_score = -1e9;
-    var scores: array<f32, 512>;  // Max seq_len
 
-    // Each thread computes a subset of scores
-    for (var k_pos = tid; k_pos <= q_pos; k_pos += 256u) {
+    for (var k_pos = tid; k_pos <= q_pos; k_pos += BLOCK_SIZE) {
         let k_offset = batch_idx * seq_len * embedding_dim +
                       k_pos * embedding_dim +
                       head_idx * head_dim;
 
+        // Compute dot product Q · K
         var score = 0.0;
         for (var d = 0u; d < head_dim; d++) {
-            score += q_local[d] * K[k_offset + d];
+            score += Q[q_offset + d] * K[k_offset + d];
         }
         score *= scale;
-        scores[k_pos] = score;
         max_score = max(max_score, score);
     }
 
@@ -504,70 +498,81 @@ fn main(
     shared_scores[tid] = max_score;
     workgroupBarrier();
 
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s && tid + s < 256u) {
+    for (var s = BLOCK_SIZE / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) {
             shared_scores[tid] = max(shared_scores[tid], shared_scores[tid + s]);
         }
         workgroupBarrier();
     }
     max_score = shared_scores[0];
+    workgroupBarrier();
 
-    // Compute exp and sum for softmax
+    // Phase 2: Compute exp(scores - max) and sum
     var sum_exp = 0.0;
-    for (var k_pos = tid; k_pos <= q_pos; k_pos += 256u) {
-        let exp_score = exp(scores[k_pos] - max_score);
-        scores[k_pos] = exp_score;
-        sum_exp += exp_score;
+
+    for (var k_pos = tid; k_pos <= q_pos; k_pos += BLOCK_SIZE) {
+        let k_offset = batch_idx * seq_len * embedding_dim +
+                      k_pos * embedding_dim +
+                      head_idx * head_dim;
+
+        var score = 0.0;
+        for (var d = 0u; d < head_dim; d++) {
+            score += Q[q_offset + d] * K[k_offset + d];
+        }
+        score = score * scale - max_score;
+        sum_exp += exp(score);
     }
 
     // Reduce sum across threads
     shared_scores[tid] = sum_exp;
     workgroupBarrier();
 
-    for (var s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s && tid + s < 256u) {
+    for (var s = BLOCK_SIZE / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) {
             shared_scores[tid] += shared_scores[tid + s];
         }
         workgroupBarrier();
     }
     sum_exp = shared_scores[0];
+    workgroupBarrier();
 
-    // Compute weighted sum of values
-    var output_local: array<f32, 64>;
-    for (var d = 0u; d < head_dim; d++) {
-        output_local[d] = 0.0;
-    }
+    // Phase 3: Compute weighted sum of values
+    // Each thread computes contribution for subset of dimensions
+    let dims_per_thread = (head_dim + BLOCK_SIZE - 1u) / BLOCK_SIZE;
 
-    for (var k_pos = tid; k_pos <= q_pos; k_pos += 256u) {
-        let attn_weight = scores[k_pos] / sum_exp;
-        let v_offset = batch_idx * seq_len * embedding_dim +
-                      k_pos * embedding_dim +
-                      head_idx * head_dim;
-
-        for (var d = 0u; d < head_dim; d++) {
-            output_local[d] += attn_weight * V[v_offset + d];
+    for (var d_block = 0u; d_block < dims_per_thread; d_block++) {
+        let d = tid + d_block * BLOCK_SIZE;
+        if (d >= head_dim) {
+            continue;
         }
-    }
 
-    // Reduce across threads for each dimension
-    for (var d = 0u; d < head_dim; d++) {
-        shared_scores[tid] = output_local[d];
-        workgroupBarrier();
+        var output_val = 0.0;
 
-        for (var s = 128u; s > 0u; s >>= 1u) {
-            if (tid < s && tid + s < 256u) {
-                shared_scores[tid] += shared_scores[tid + s];
+        // Iterate over all keys up to q_pos (causal mask)
+        for (var k_pos = 0u; k_pos <= q_pos; k_pos++) {
+            let k_offset = batch_idx * seq_len * embedding_dim +
+                          k_pos * embedding_dim +
+                          head_idx * head_dim;
+
+            // Recompute attention weight
+            var score = 0.0;
+            for (var dd = 0u; dd < head_dim; dd++) {
+                score += Q[q_offset + dd] * K[k_offset + dd];
             }
-            workgroupBarrier();
+            let attn_weight = exp(score * scale - max_score) / sum_exp;
+
+            // Weighted value
+            let v_offset = batch_idx * seq_len * embedding_dim +
+                          k_pos * embedding_dim +
+                          head_idx * head_dim;
+            output_val += attn_weight * V[v_offset + d];
         }
 
-        if (tid == 0u) {
-            let out_offset = batch_idx * seq_len * embedding_dim +
-                           q_pos * embedding_dim +
-                           head_idx * head_dim;
-            output[out_offset + d] = shared_scores[0];
-        }
-        workgroupBarrier();
+        // Write output
+        let out_offset = batch_idx * seq_len * embedding_dim +
+                        q_pos * embedding_dim +
+                        head_idx * head_dim;
+        output[out_offset + d] = output_val;
     }
 }
 """
