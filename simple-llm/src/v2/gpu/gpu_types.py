@@ -1,7 +1,7 @@
 """Core data types - plain dataclasses only"""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 # ============================================================================
 # WGPU TYPE ALIASES
@@ -29,10 +29,13 @@ WGPUShaderModule = Any  # wgpu.GPUShaderModule
 
 @dataclass
 class Device:
-    """GPU device wrapper"""
+    """GPU device wrapper
+
+    This dataclass is immutable - do not modify fields after creation.
+    """
 
     wgpu_device: WGPUDevice  # The actual wgpu.Device object
-    adapter: WGPUAdapter = None  # Optional adapter reference
+    adapter: Optional[WGPUAdapter] = None  # Optional adapter reference
 
 
 # ============================================================================
@@ -42,7 +45,10 @@ class Device:
 
 @dataclass
 class BindGroupEntry:
-    """Type-safe bind group entry specification"""
+    """Type-safe bind group entry specification
+
+    This dataclass is immutable - do not modify fields after creation.
+    """
 
     binding: int
     buffer: WGPUBuffer
@@ -58,7 +64,11 @@ class BindGroupEntry:
 
 @dataclass
 class GPUBuffer1D:
-    """1D GPU buffer - for vectors like biases, layer norm params"""
+    """1D GPU buffer - for vectors like biases, layer norm params
+
+    This dataclass is immutable - do not modify fields after creation.
+    The underlying GPU buffer contents may be mutated by operations.
+    """
 
     buffer: WGPUBuffer
     shape: Tuple[int]
@@ -68,7 +78,11 @@ class GPUBuffer1D:
 
 @dataclass
 class GPUBuffer2D:
-    """2D GPU buffer - for matrices like weight matrices"""
+    """2D GPU buffer - for matrices like weight matrices
+
+    This dataclass is immutable - do not modify fields after creation.
+    The underlying GPU buffer contents may be mutated by operations.
+    """
 
     buffer: WGPUBuffer
     shape: Tuple[int, int]
@@ -78,7 +92,11 @@ class GPUBuffer2D:
 
 @dataclass
 class GPUBuffer3D:
-    """3D GPU buffer - for batched sequences (batch, seq, dim)"""
+    """3D GPU buffer - for batched sequences (batch, seq, dim)
+
+    This dataclass is immutable - do not modify fields after creation.
+    The underlying GPU buffer contents may be mutated by operations.
+    """
 
     buffer: WGPUBuffer
     shape: Tuple[int, int, int]
@@ -97,32 +115,46 @@ GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
 
 @dataclass
 class BufferInfo:
-    """Information about a pooled buffer"""
+    """Information about a pooled buffer
+
+    This dataclass is immutable - do not modify fields after creation.
+    """
 
     buffer: WGPUBuffer
 
 
 @dataclass
 class BufferPool:
-    """Memory pool state for reusable GPU buffers"""
+    """Memory pool state for reusable GPU buffers
+
+    MUTATION SEMANTICS:
+    - pools: MUTABLE - buffers are added/removed during pool operations
+    - in_use: MUTABLE - tracks which buffers are currently taken
+    - total_memory_bytes: MUTABLE - updated as buffers are allocated/freed
+    - Other fields: immutable configuration
+    """
 
     device: Device
     max_size: int  # Max size per individual buffer
     pools: Dict[int, List[BufferInfo]] = field(default_factory=dict)
     in_use: Set[int] = field(default_factory=set)
-    # NEW: Total memory tracking
     total_memory_bytes: int = 0  # Current total memory allocated
     max_total_memory_bytes: int = 0  # Maximum total memory allowed (0 = unlimited)
 
 
 @dataclass
 class StagingPool:
-    """Staging buffer pool state for CPU-GPU transfers"""
+    """Staging buffer pool state for CPU-GPU transfers
+
+    MUTATION SEMANTICS:
+    - staging_buffers: MUTABLE - buffers are added during upload/download operations
+    - Other fields: immutable configuration
+    """
 
     device: Device
     staging_buffers: Dict[int, WGPUBuffer] = field(default_factory=dict)
     max_size: int = 0
-    max_entries: int = 8  # NEW: Limit number of different sized buffers
+    max_entries: int = 8  # Limit number of different sized buffers
 
 
 # ============================================================================
@@ -132,7 +164,13 @@ class StagingPool:
 
 @dataclass
 class PipelineCache:
-    """Cache for compiled GPU pipelines"""
+    """Cache for compiled GPU pipelines
+
+    MUTATION SEMANTICS:
+    - pipelines: MUTABLE - compiled pipelines are cached on first use
+    - bind_groups: MUTABLE - bind groups are cached
+    - device: immutable reference
+    """
 
     device: Device
     pipelines: Dict[str, WGPUComputePipeline] = field(default_factory=dict)
@@ -146,10 +184,17 @@ class PipelineCache:
 
 @dataclass
 class BatchState:
-    """State for batched GPU operations"""
+    """State for batched GPU operations
+
+    MUTATION SEMANTICS:
+    - encoder: MUTABLE - set to None after submit_batch is called
+    - retained_buffers: MUTABLE - accumulates buffers during batch operations, cleared after submit
+    - operation_count: MUTABLE - incremented for each operation added
+    - Other fields: immutable configuration
+    """
 
     device: Device
-    encoder: WGPUCommandEncoder
+    encoder: Optional[WGPUCommandEncoder]
     retained_buffers: List[WGPUBuffer] = field(default_factory=list)
     enable_profiling: bool = False
     operation_count: int = 0
@@ -162,16 +207,23 @@ class BatchState:
 
 @dataclass
 class GPULayerParams:
-    """Parameters for a single transformer layer"""
+    """Parameters for a single transformer layer
 
+    This dataclass is immutable - do not modify fields after creation.
+    The underlying GPU buffer contents may be mutated by training operations.
+    """
+
+    # Attention weights
     attn_wq: GPUBuffer2D  # (dim, dim)
     attn_wk: GPUBuffer2D  # (dim, dim)
     attn_wv: GPUBuffer2D  # (dim, dim)
     attn_wo: GPUBuffer2D  # (dim, dim)
+    # Feed-forward weights
     ff_w1: GPUBuffer2D  # (dim, 4*dim)
     ff_b1: GPUBuffer1D  # (4*dim,)
     ff_w2: GPUBuffer2D  # (4*dim, dim)
     ff_b2: GPUBuffer1D  # (dim,)
+    # Layer norm parameters
     ln_gamma1: GPUBuffer1D  # (dim,)
     ln_beta1: GPUBuffer1D  # (dim,)
     ln_gamma2: GPUBuffer1D  # (dim,)
@@ -180,7 +232,11 @@ class GPULayerParams:
 
 @dataclass
 class GPUModelParams:
-    """Complete model parameters"""
+    """Complete model parameters
+
+    This dataclass is immutable - do not modify fields after creation.
+    The underlying GPU buffer contents may be mutated by training operations.
+    """
 
     embedding: GPUBuffer2D  # (vocab_size, embedding_dim)
     pos_encoding: GPUBuffer2D  # (context_size, embedding_dim)
@@ -189,7 +245,13 @@ class GPUModelParams:
 
 @dataclass
 class GPUOptimizerState:
-    """Optimizer state for AdamW"""
+    """Optimizer state for AdamW
+
+    MUTATION SEMANTICS:
+    - All buffer contents are MUTABLE - updated during optimizer steps
+    - step: MUTABLE - incremented after each optimizer step
+    - List structure: immutable (same length as model layers)
+    """
 
     m_embedding: GPUBuffer2D  # momentum
     v_embedding: GPUBuffer2D  # variance
@@ -205,9 +267,13 @@ class GPUOptimizerState:
 
 @dataclass
 class WorkspaceBuffers:
-    """Typed workspace buffers for a specific batch/sequence size"""
+    """Typed workspace buffers for a specific batch/sequence size
 
-    # Forward pass buffers - 3D tensors [batch*seq, dim] treated as 2D
+    This dataclass is immutable - do not modify fields after creation.
+    The underlying GPU buffer contents are MUTABLE and reused across operations.
+    """
+
+    # Forward pass buffers - 3D tensors (batch*seq, dim) treated as 2D
     x_buffer_a: GPUBuffer2D
     x_buffer_b: GPUBuffer2D
     x_norm1: GPUBuffer2D
@@ -224,7 +290,6 @@ class WorkspaceBuffers:
     ffn_out: GPUBuffer2D
     ffn_out_bias: GPUBuffer2D
     logits: GPUBuffer2D
-
     # Backward pass buffers
     grad_logits: GPUBuffer2D
     grad_embedding: GPUBuffer2D
@@ -237,7 +302,12 @@ class WorkspaceBuffers:
 
 @dataclass
 class WorkspaceManager:
-    """Workspace buffer manager state"""
+    """Workspace buffer manager state
+
+    MUTATION SEMANTICS:
+    - active_workspaces: MUTABLE - workspaces are allocated/released during training
+    - device, buffer_pool: immutable references
+    """
 
     device: Device
     buffer_pool: BufferPool
@@ -253,7 +323,10 @@ class WorkspaceManager:
 
 @dataclass
 class KernelTimeStats:
-    """Statistics for a single kernel's execution times"""
+    """Statistics for a single kernel's execution times
+
+    This dataclass is immutable - do not modify fields after creation.
+    """
 
     count: int
     total_ms: float
@@ -264,7 +337,10 @@ class KernelTimeStats:
 
 @dataclass
 class PerfStats:
-    """Performance statistics snapshot"""
+    """Performance statistics snapshot
+
+    This dataclass is immutable - do not modify fields after creation.
+    """
 
     total_submissions: int
     kernel_times: Dict[str, KernelTimeStats]
@@ -272,7 +348,13 @@ class PerfStats:
 
 @dataclass
 class PerfMonitor:
-    """Performance monitoring state"""
+    """Performance monitoring state
+
+    MUTATION SEMANTICS:
+    - kernel_times: MUTABLE - timing data is accumulated during profiling
+    - memory_usage: MUTABLE - memory stats are recorded
+    - submission_count: MUTABLE - incremented on each submission
+    """
 
     kernel_times: Dict[str, List[float]] = field(default_factory=dict)
     memory_usage: Dict[str, Any] = field(default_factory=dict)

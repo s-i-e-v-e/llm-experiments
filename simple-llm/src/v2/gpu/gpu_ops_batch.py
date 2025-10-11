@@ -1,6 +1,7 @@
 """Command batching"""
 
 import numpy as np
+from gpu_buffer import clear_buffer
 from gpu_kernels_backward import (
     BIAS_BACKWARD_KERNEL,
     GELU_BACKWARD_KERNEL,
@@ -19,7 +20,14 @@ from gpu_kernels_forward import (
     TILED_MATMUL_KERNEL,
 )
 from gpu_kernels_opt import ADAMW_OPTIMIZER_KERNEL
-from gpu_ops import _add_compute_to_batch_internal
+from gpu_ops import (
+    _add_compute_to_batch_internal,
+    _validate_buffer_shapes,
+    validate_buffer_shape_1d,
+    validate_buffer_shape_2d,
+    validate_matmul_shapes,
+    validate_optimizer_buffers,
+)
 from gpu_types import BatchState, GPUBuffer1D, GPUBuffer2D, PipelineCache
 
 # ============================================================================
@@ -37,8 +45,43 @@ def batch_add_embedding(
     batch_size: int,
     seq_len: int,
 ) -> None:
-    """Add embedding lookup to batch"""
+    """Add embedding lookup to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        embedding_table: Token embedding table (vocab_size, embedding_dim)
+        pos_encoding: Positional encoding table (context_size, embedding_dim)
+        input_ids: Input token IDs (batch_size * seq_len,)
+        output: Output embeddings (batch_size * seq_len, embedding_dim)
+        batch_size: Batch size
+        seq_len: Sequence length
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
+    if batch_size <= 0 or seq_len <= 0:
+        raise ValueError(f"Invalid batch_size={batch_size} or seq_len={seq_len}")
+
     vocab_size, embedding_dim = embedding_table.shape
+    context_size, embedding_dim2 = pos_encoding.shape
+
+    if embedding_dim != embedding_dim2:
+        raise ValueError(
+            f"Embedding dimension mismatch: table has {embedding_dim}, "
+            f"pos_encoding has {embedding_dim2}"
+        )
+    if seq_len > context_size:
+        raise ValueError(
+            f"Sequence length {seq_len} exceeds context size {context_size}"
+        )
+
+    total_tokens = batch_size * seq_len
+    validate_buffer_shape_1d(input_ids, total_tokens, "input_ids")
+    validate_buffer_shape_2d(output, (total_tokens, embedding_dim), "output")
 
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
     _add_compute_to_batch_internal(
@@ -47,7 +90,7 @@ def batch_add_embedding(
         EMBEDDING_KERNEL,
         params,
         [embedding_table, pos_encoding, input_ids, output],
-        (batch_size * seq_len + 255) // 256,
+        (total_tokens + 255) // 256,
     )
 
 
@@ -63,9 +106,43 @@ def batch_add_attention(
     n_heads: int,
     head_dim: int,
 ) -> None:
-    """Add multi-head attention to batch"""
-    assert seq_len <= 512, f"Sequence length {seq_len} exceeds kernel limit 512"
-    assert head_dim <= 64, f"Head dimension {head_dim} exceeds kernel limit 64"
+    """Add multi-head attention to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        Q: Query matrix (batch_size * seq_len, n_heads * head_dim)
+        K: Key matrix (batch_size * seq_len, n_heads * head_dim)
+        V: Value matrix (batch_size * seq_len, n_heads * head_dim)
+        output: Output matrix (batch_size * seq_len, n_heads * head_dim)
+        batch_size: Batch size
+        seq_len: Sequence length
+        n_heads: Number of attention heads
+        head_dim: Dimension per head
+
+    Raises:
+        ValueError: If buffer shapes don't match or dimensions invalid
+    """
+    if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
+        raise ValueError(
+            f"Invalid dimensions: batch_size={batch_size}, seq_len={seq_len}, "
+            f"n_heads={n_heads}, head_dim={head_dim}"
+        )
+
+    embedding_dim = n_heads * head_dim
+    total_tokens = batch_size * seq_len
+
+    _validate_buffer_shapes(
+        [
+            (Q, (total_tokens, embedding_dim), "Q"),
+            (K, (total_tokens, embedding_dim), "K"),
+            (V, (total_tokens, embedding_dim), "V"),
+            (output, (total_tokens, embedding_dim), "output"),
+        ]
+    )
 
     params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
     _add_compute_to_batch_internal(
@@ -87,10 +164,22 @@ def batch_add_matmul(
     B: GPUBuffer2D,
     C: GPUBuffer2D,
 ) -> None:
-    """Add matmul to batch"""
-    M, K = A.shape
-    K2, N = B.shape
-    assert K == K2, f"Dimension mismatch: {K} != {K2}"
+    """Add matmul to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        A: Input matrix (M, K)
+        B: Input matrix (K, N)
+        C: Output matrix (M, N)
+
+    Raises:
+        ValueError: If dimensions are incompatible
+    """
+    M, K, N = validate_matmul_shapes(A, B, C, "batch_add_matmul")
 
     params = np.array([M, K, N], dtype=np.uint32)
     _add_compute_to_batch_internal(
@@ -113,8 +202,30 @@ def batch_add_layernorm(
     beta: GPUBuffer1D,
     output: GPUBuffer2D,
 ) -> None:
-    """Add layernorm to batch"""
+    """Add layernorm to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        input_buf: Input tensor (n_elements, size)
+        gamma: Scale parameters (size,)
+        beta: Shift parameters (size,)
+        output: Output tensor (n_elements, size)
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
     n_elements, size = input_buf.shape
+
+    if n_elements <= 0 or size <= 0:
+        raise ValueError(f"Invalid input shape: ({n_elements}, {size})")
+
+    validate_buffer_shape_1d(gamma, size, "gamma")
+    validate_buffer_shape_1d(beta, size, "beta")
+    validate_buffer_shape_2d(output, (n_elements, size), "output")
 
     params = np.array([size, n_elements], dtype=np.uint32)
     _add_compute_to_batch_internal(
@@ -133,7 +244,25 @@ def batch_add_gelu(
     input_buf: GPUBuffer2D,
     output: GPUBuffer2D,
 ) -> None:
-    """Add GELU to batch"""
+    """Add GELU to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        input_buf: Input tensor
+        output: Output tensor
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
+    if input_buf.shape != output.shape:
+        raise ValueError(
+            f"Input/output shape mismatch: {input_buf.shape} != {output.shape}"
+        )
+
     total_size = input_buf.size
 
     params = np.array([total_size], dtype=np.uint32)
@@ -154,9 +283,30 @@ def batch_add_bias_add(
     bias: GPUBuffer1D,
     output: GPUBuffer2D,
 ) -> None:
-    """Add bias addition to batch"""
+    """Add bias addition to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        input_buf: Input tensor (n_elements, dim)
+        bias: Bias vector (dim,)
+        output: Output tensor (n_elements, dim)
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
     n_elements, dim = input_buf.shape
+
+    if n_elements <= 0 or dim <= 0:
+        raise ValueError(f"Invalid input shape: ({n_elements}, {dim})")
+
     total_size = n_elements * dim
+
+    validate_buffer_shape_1d(bias, dim, "bias")
+    validate_buffer_shape_2d(output, (n_elements, dim), "output")
 
     params = np.array([total_size, dim], dtype=np.uint32)
     _add_compute_to_batch_internal(
@@ -176,7 +326,27 @@ def batch_add_residual(
     input_b: GPUBuffer2D,
     output: GPUBuffer2D,
 ) -> None:
-    """Add residual connection to batch"""
+    """Add residual connection to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        input_a: First input tensor
+        input_b: Second input tensor
+        output: Output tensor
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
+    if not (input_a.shape == input_b.shape == output.shape):
+        raise ValueError(
+            f"Shape mismatch: input_a={input_a.shape}, "
+            f"input_b={input_b.shape}, output={output.shape}"
+        )
+
     total_size = input_a.size
 
     params = np.array([total_size], dtype=np.uint32)
@@ -200,9 +370,36 @@ def batch_add_cross_entropy_loss(
     batch_size: int,
     seq_len: int,
 ) -> None:
-    """Add cross-entropy loss computation to batch"""
+    """Add cross-entropy loss computation to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        logits: Model predictions (batch_size * seq_len, vocab_size)
+        targets: Target token IDs (batch_size * seq_len,)
+        loss_output: Loss for each prediction (batch_size * seq_len,)
+        grad_logits: Gradient w.r.t. logits (batch_size * seq_len, vocab_size)
+        batch_size: Batch size
+        seq_len: Sequence length
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
+    if batch_size <= 0 or seq_len <= 0:
+        raise ValueError(f"Invalid batch_size={batch_size} or seq_len={seq_len}")
+
     total_predictions = batch_size * seq_len
     vocab_size = logits.shape[1]
+
+    validate_buffer_shape_2d(logits, (total_predictions, vocab_size), "logits")
+    validate_buffer_shape_1d(targets, total_predictions, "targets")
+    validate_buffer_shape_1d(loss_output, total_predictions, "loss_output")
+    validate_buffer_shape_2d(
+        grad_logits, (total_predictions, vocab_size), "grad_logits"
+    )
 
     params = np.array([batch_size, seq_len, vocab_size], dtype=np.uint32)
     _add_compute_to_batch_internal(
@@ -218,10 +415,22 @@ def batch_add_cross_entropy_loss(
 def batch_add_copy(
     batch_state: BatchState, source: GPUBuffer2D, dest: GPUBuffer2D
 ) -> None:
-    """Add buffer copy operation to batch"""
-    assert source.size == dest.size, (
-        f"Buffer sizes must match: {source.size} != {dest.size}"
-    )
+    """Add buffer copy operation to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        batch_state: Batch state (MUTATED)
+        source: Source buffer
+        dest: Destination buffer
+
+    Raises:
+        ValueError: If buffer sizes don't match
+        RuntimeError: If batch not initialized
+    """
+    if source.size != dest.size:
+        raise ValueError(f"Buffer sizes must match: {source.size} != {dest.size}")
 
     if batch_state.encoder is None:
         raise RuntimeError("Must call create_command_batch before adding operations")
@@ -244,10 +453,31 @@ def batch_add_matmul_backward_a(
     B: GPUBuffer2D,
     grad_A: GPUBuffer2D,
 ) -> None:
-    """Add matmul backward A to batch"""
+    """Add matmul backward A to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        grad_C: Gradient of loss w.r.t. C (M, N)
+        B: Forward pass B matrix (K, N)
+        grad_A: Output gradient w.r.t. A (M, K)
+
+    Raises:
+        ValueError: If dimensions are incompatible
+    """
     M, N = grad_C.shape
     K, N2 = B.shape
-    assert N == N2, f"Dimension mismatch: {N} != {N2}"
+
+    if M <= 0 or N <= 0 or K <= 0:
+        raise ValueError(f"Invalid dimensions: grad_C=({M}, {N}), B=({K}, {N2})")
+
+    if N != N2:
+        raise ValueError(f"Dimension mismatch: grad_C.shape[1]={N} != B.shape[1]={N2}")
+
+    validate_buffer_shape_2d(grad_A, (M, K), "grad_A")
 
     params = np.array([M, K, N], dtype=np.uint32)
     _add_compute_to_batch_internal(
@@ -269,10 +499,31 @@ def batch_add_matmul_backward_b(
     grad_C: GPUBuffer2D,
     grad_B: GPUBuffer2D,
 ) -> None:
-    """Add matmul backward B to batch"""
+    """Add matmul backward B to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        A: Forward pass A matrix (M, K)
+        grad_C: Gradient of loss w.r.t. C (M, N)
+        grad_B: Output gradient w.r.t. B (K, N)
+
+    Raises:
+        ValueError: If dimensions are incompatible
+    """
     M, K = A.shape
     M2, N = grad_C.shape
-    assert M == M2, f"Dimension mismatch: {M} != {M2}"
+
+    if M <= 0 or K <= 0 or N <= 0:
+        raise ValueError(f"Invalid dimensions: A=({M}, {K}), grad_C=({M2}, {N})")
+
+    if M != M2:
+        raise ValueError(f"Dimension mismatch: A.shape[0]={M} != grad_C.shape[0]={M2}")
+
+    validate_buffer_shape_2d(grad_B, (K, N), "grad_B")
 
     params = np.array([M, K, N], dtype=np.uint32)
     _add_compute_to_batch_internal(
@@ -297,13 +548,42 @@ def batch_add_layernorm_backward(
     grad_gamma: GPUBuffer1D,
     grad_beta: GPUBuffer1D,
 ) -> None:
-    """Add layernorm backward to batch"""
+    """Add layernorm backward to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Also MUTATES grad_gamma and grad_beta by zeroing them first.
+    Returns None to signal mutation.
+
+    NOTE: This function automatically zeros grad_gamma and grad_beta before
+    adding the operation, so caller does not need to pre-zero them.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        input_buf: Input from forward pass (n_elements, size)
+        gamma: Scale parameters from forward pass (size,)
+        grad_output: Gradient of loss w.r.t. output (n_elements, size)
+        grad_input: Output gradient w.r.t. input (n_elements, size)
+        grad_gamma: Output gradient w.r.t. gamma (size,) (MUTATED, auto-zeroed)
+        grad_beta: Output gradient w.r.t. beta (size,) (MUTATED, auto-zeroed)
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
     n_elements, size = input_buf.shape
 
-    # Zero out gamma and beta gradients (kernel accumulates)
-    zero_data = np.zeros(grad_gamma.size, dtype=np.float32)
-    batch_state.device.wgpu_device.queue.write_buffer(grad_gamma.buffer, 0, zero_data)
-    batch_state.device.wgpu_device.queue.write_buffer(grad_beta.buffer, 0, zero_data)
+    if n_elements <= 0 or size <= 0:
+        raise ValueError(f"Invalid input shape: ({n_elements}, {size})")
+
+    validate_buffer_shape_1d(gamma, size, "gamma")
+    validate_buffer_shape_2d(grad_output, (n_elements, size), "grad_output")
+    validate_buffer_shape_2d(grad_input, (n_elements, size), "grad_input")
+    validate_buffer_shape_1d(grad_gamma, size, "grad_gamma")
+    validate_buffer_shape_1d(grad_beta, size, "grad_beta")
+
+    # Zero accumulation buffers (safer API)
+    clear_buffer(grad_gamma)
+    clear_buffer(grad_beta)
 
     params = np.array([size, n_elements], dtype=np.uint32)
     _add_compute_to_batch_internal(
@@ -323,7 +603,31 @@ def batch_add_gelu_backward(
     grad_output: GPUBuffer2D,
     grad_input: GPUBuffer2D,
 ) -> None:
-    """Add GELU backward to batch"""
+    """Add GELU backward to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        input_buf: Input from forward pass
+        grad_output: Gradient of loss w.r.t. output
+        grad_input: Output gradient w.r.t. input
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
+    if input_buf.shape != grad_output.shape:
+        raise ValueError(
+            f"input_buf shape {input_buf.shape} doesn't match grad_output shape {grad_output.shape}"
+        )
+
+    if grad_input.shape != input_buf.shape:
+        raise ValueError(
+            f"grad_input shape {grad_input.shape} doesn't match input_buf shape {input_buf.shape}"
+        )
+
     total_size = input_buf.size
 
     params = np.array([total_size], dtype=np.uint32)
@@ -343,8 +647,27 @@ def batch_add_bias_backward(
     grad_output: GPUBuffer2D,
     grad_bias: GPUBuffer1D,
 ) -> None:
-    """Add bias backward to batch"""
+    """Add bias backward to batch (mutation).
+
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        grad_output: Gradient of loss w.r.t. output (n_elements, dim)
+        grad_bias: Output gradient w.r.t. bias (dim,)
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
     n_elements, dim = grad_output.shape
+
+    if n_elements <= 0 or dim <= 0:
+        raise ValueError(f"Invalid grad_output shape: ({n_elements}, {dim})")
+
+    validate_buffer_shape_1d(grad_bias, dim, "grad_bias")
+
     total_size = n_elements * dim
 
     params = np.array([total_size, dim], dtype=np.uint32)
@@ -377,12 +700,30 @@ def batch_add_adamw_update(
     eps: float,
     step: int,
 ) -> None:
-    """Add AdamW optimizer update to batch"""
-    assert gradients.shape == weights.shape, "Shape mismatch"
-    assert weights.shape == m.shape == v.shape, "All buffers must have same shape"
-    assert step >= 1, "Step must be >= 1"
+    """Add AdamW optimizer update to batch (mutation).
 
-    size = weights.size
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        gradients: Gradient buffer (same shape as weights)
+        weights: Parameter buffer
+        m: First moment (momentum) buffer
+        v: Second moment (variance) buffer
+        lr: Learning rate
+        beta1: Exponential decay rate for first moment
+        beta2: Exponential decay rate for second moment
+        weight_decay: Weight decay coefficient
+        eps: Small constant for numerical stability
+        step: Current training step (1-indexed)
+
+    Raises:
+        AssertionError: If buffer shapes don't match
+        ValueError: If step is invalid
+    """
+    size = validate_optimizer_buffers(gradients, weights, m, v, step)
 
     params = np.array(
         [lr, beta1, beta2, weight_decay, eps, float(step), size],
@@ -413,12 +754,30 @@ def batch_add_adamw_update_1d(
     eps: float,
     step: int,
 ) -> None:
-    """Add AdamW optimizer update for 1D buffers to batch"""
-    assert gradients.size == weights.size, "Size mismatch"
-    assert weights.size == m.size == v.size, "All buffers must have same size"
-    assert step >= 1, "Step must be >= 1"
+    """Add AdamW optimizer update for 1D buffers to batch (mutation).
 
-    size = weights.size
+    This function MUTATES batch_state by adding an operation.
+    Returns None to signal mutation.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state (MUTATED)
+        gradients: Gradient buffer (same size as weights)
+        weights: Parameter buffer
+        m: First moment (momentum) buffer
+        v: Second moment (variance) buffer
+        lr: Learning rate
+        beta1: Exponential decay rate for first moment
+        beta2: Exponential decay rate for second moment
+        weight_decay: Weight decay coefficient
+        eps: Small constant for numerical stability
+        step: Current training step (1-indexed)
+
+    Raises:
+        AssertionError: If buffer sizes don't match
+        ValueError: If step is invalid
+    """
+    size = validate_optimizer_buffers(gradients, weights, m, v, step)
 
     params = np.array(
         [lr, beta1, beta2, weight_decay, eps, float(step), size],
@@ -441,13 +800,23 @@ def batch_add_adamw_update_1d(
 
 
 def submit_batch(batch_state: BatchState) -> None:
-    """Submit all batched operations"""
+    """Submit all batched operations (mutation).
+
+    This function MUTATES batch_state by submitting and clearing the encoder.
+    Returns None to signal mutation.
+
+    Args:
+        batch_state: Batch state (MUTATED)
+
+    Raises:
+        RuntimeError: If batch not initialized or already submitted
+    """
     if batch_state.encoder is None:
         raise RuntimeError("Batch already submitted or not initialized")
 
     command_buffer = batch_state.encoder.finish()
     batch_state.device.wgpu_device.queue.submit([command_buffer])
 
-    # Clear encoder to prevent reuse
+    # Clear encoder to prevent reuse (mutation)
     batch_state.encoder = None
     batch_state.retained_buffers.clear()

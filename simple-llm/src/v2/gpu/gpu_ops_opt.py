@@ -2,7 +2,7 @@
 
 import numpy as np
 from gpu_kernels_opt import ADAMW_OPTIMIZER_KERNEL
-from gpu_ops import dispatch_simple_compute
+from gpu_ops import dispatch_simple_compute, validate_optimizer_buffers
 from gpu_types import GPUBuffer1D, GPUBuffer2D, PipelineCache
 
 # ============================================================================
@@ -23,11 +23,11 @@ def run_adamw_update(
     eps: float,
     step: int,
 ) -> None:
-    """
-    Apply AdamW optimizer update to weights.
+    """Apply AdamW optimizer update to weights (mutation).
 
     This function MUTATES weights, m (momentum), and v (variance).
     Uses decoupled weight decay as described in Loshchilov & Hutter 2019.
+    Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
@@ -41,14 +41,12 @@ def run_adamw_update(
         weight_decay: Weight decay coefficient (typically 0.01)
         eps: Small constant for numerical stability (typically 1e-8)
         step: Current training step (1-indexed, for bias correction)
-    """
-    assert gradients.shape == weights.shape, (
-        f"Shape mismatch: {gradients.shape} != {weights.shape}"
-    )
-    assert weights.shape == m.shape == v.shape, "All buffers must have same shape"
-    assert step >= 1, "Step must be >= 1"
 
-    size = weights.size
+    Raises:
+        AssertionError: If buffer shapes don't match
+        ValueError: If step is invalid
+    """
+    size = validate_optimizer_buffers(gradients, weights, m, v, step)
 
     # Pack optimizer hyperparameters
     params = np.array(
@@ -78,10 +76,11 @@ def run_adamw_update_1d(
     eps: float,
     step: int,
 ) -> None:
-    """
-    Apply AdamW optimizer update to 1D parameters (biases, layer norm params).
+    """Apply AdamW optimizer update to 1D parameters (mutation).
 
+    Used for biases and layer norm parameters.
     This function MUTATES weights, m (momentum), and v (variance).
+    Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
@@ -95,14 +94,12 @@ def run_adamw_update_1d(
         weight_decay: Weight decay coefficient (typically 0.01)
         eps: Small constant for numerical stability (typically 1e-8)
         step: Current training step (1-indexed, for bias correction)
-    """
-    assert gradients.size == weights.size, (
-        f"Size mismatch: {gradients.size} != {weights.size}"
-    )
-    assert weights.size == m.size == v.size, "All buffers must have same size"
-    assert step >= 1, "Step must be >= 1"
 
-    size = weights.size
+    Raises:
+        AssertionError: If buffer sizes don't match
+        ValueError: If step is invalid
+    """
+    size = validate_optimizer_buffers(gradients, weights, m, v, step)
 
     # Pack optimizer hyperparameters
     params = np.array(

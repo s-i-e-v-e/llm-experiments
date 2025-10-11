@@ -11,7 +11,13 @@ from gpu_kernels_forward import (
     RESIDUAL_ADD_KERNEL,
     TILED_MATMUL_KERNEL,
 )
-from gpu_ops import _validate_buffer_shapes, dispatch_simple_compute
+from gpu_ops import (
+    _validate_buffer_shapes,
+    dispatch_simple_compute,
+    validate_buffer_shape_1d,
+    validate_buffer_shape_2d,
+    validate_matmul_shapes,
+)
 from gpu_types import GPUBuffer1D, GPUBuffer2D, PipelineCache
 
 # ============================================================================
@@ -25,30 +31,24 @@ def run_matmul(
     B: GPUBuffer2D,
     C: GPUBuffer2D,
 ) -> None:
-    """
-    Matrix multiplication: C = A @ B.
+    """Matrix multiplication: C = A @ B (mutation).
 
     Uses tiled algorithm for efficiency. For matrices larger than
     ~1M x 1M, automatically tiles into multiple kernel launches.
 
-    This function MUTATES C.
+    This function MUTATES C. Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         A: Input matrix (M, K)
         B: Input matrix (K, N)
-        C: Output matrix (M, N) - MUTATED
+        C: Output matrix (M, N) (MUTATED)
 
     Raises:
         ValueError: If dimensions are incompatible
+        NotImplementedError: If matrix exceeds maximum supported size
     """
-    M, K = A.shape
-    K2, N = B.shape
-
-    if K != K2:
-        raise ValueError(f"Dimension mismatch: A is ({M}, {K}) but B is ({K2}, {N})")
-    if C.shape != (M, N):
-        raise ValueError(f"Output shape mismatch: C is {C.shape}, expected ({M}, {N})")
+    M, K, N = validate_matmul_shapes(A, B, C, "run_matmul")
 
     # Workgroup limit in WGSL
     MAX_WORKGROUPS = 65535
@@ -72,27 +72,14 @@ def run_matmul(
             1,
         )
     else:
-        # Need to tile the computation
-        # Tile in chunks that fit within workgroup limits
+        # Matrix too large
         M_tile_size = MAX_WORKGROUPS * TILE_SIZE
         N_tile_size = MAX_WORKGROUPS * TILE_SIZE
-
-        for m_start in range(0, M, M_tile_size):
-            m_end = min(m_start + M_tile_size, M)
-            m_size = m_end - m_start
-
-            for n_start in range(0, N, N_tile_size):
-                n_end = min(n_start + N_tile_size, N)
-                n_size = n_end - n_start
-
-                # Create views into buffers (conceptual - would need offset support in kernels)
-                # For now, raise error for very large matrices
-                if M > M_tile_size or N > N_tile_size:
-                    raise NotImplementedError(
-                        f"Matrix too large: ({M}, {K}) @ ({K}, {N}). "
-                        f"Maximum supported size is ({M_tile_size}, K) @ (K, {N_tile_size}). "
-                        f"Consider splitting the computation manually or using a different backend."
-                    )
+        raise NotImplementedError(
+            f"Matrix too large: ({M}, {K}) @ ({K}, {N}). "
+            f"Maximum supported size is ({M_tile_size}, K) @ (K, {N_tile_size}). "
+            f"Consider splitting the computation manually or using a different backend."
+        )
 
 
 def run_embedding(
@@ -104,24 +91,26 @@ def run_embedding(
     batch_size: int,
     seq_len: int,
 ) -> None:
-    """
-    Embedding lookup with positional encoding.
+    """Embedding lookup with positional encoding (mutation).
 
     Looks up token embeddings and adds positional encodings.
-    This function MUTATES output.
+    This function MUTATES output. Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         embedding_table: Token embedding table (vocab_size, embedding_dim)
         pos_encoding: Positional encoding table (context_size, embedding_dim)
         input_ids: Input token IDs (batch_size * seq_len,) - stored as uint32
-        output: Output embeddings (batch_size * seq_len, embedding_dim) - MUTATED
+        output: Output embeddings (batch_size * seq_len, embedding_dim) (MUTATED)
         batch_size: Batch size
         seq_len: Sequence length
 
     Raises:
         ValueError: If buffer shapes don't match or seq_len exceeds context_size
     """
+    if batch_size <= 0 or seq_len <= 0:
+        raise ValueError(f"Invalid batch_size={batch_size} or seq_len={seq_len}")
+
     vocab_size, embedding_dim = embedding_table.shape
     context_size, embedding_dim2 = pos_encoding.shape
 
@@ -134,16 +123,10 @@ def run_embedding(
         raise ValueError(
             f"Sequence length {seq_len} exceeds context size {context_size}"
         )
-    if input_ids.size != batch_size * seq_len:
-        raise ValueError(
-            f"Input IDs size mismatch: got {input_ids.size}, "
-            f"expected {batch_size * seq_len}"
-        )
-    if output.shape != (batch_size * seq_len, embedding_dim):
-        raise ValueError(
-            f"Output shape mismatch: got {output.shape}, "
-            f"expected ({batch_size * seq_len}, {embedding_dim})"
-        )
+
+    total_tokens = batch_size * seq_len
+    validate_buffer_shape_1d(input_ids, total_tokens, "input_ids")
+    validate_buffer_shape_2d(output, (total_tokens, embedding_dim), "output")
 
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
     dispatch_simple_compute(
@@ -151,7 +134,7 @@ def run_embedding(
         EMBEDDING_KERNEL,
         params,
         [embedding_table, pos_encoding, input_ids, output],
-        (batch_size * seq_len + 255) // 256,
+        (total_tokens + 255) // 256,
     )
 
 
@@ -166,25 +149,19 @@ def run_multihead_attention(
     n_heads: int,
     head_dim: int,
 ) -> None:
-    """
-    Multi-head self-attention with causal masking.
+    """Multi-head self-attention with causal masking (mutation).
 
     Computes scaled dot-product attention for each head, with causal masking
     to prevent attending to future positions.
 
-    This function MUTATES output.
-
-    PERFORMANCE NOTES:
-    - Works for any seq_len and head_dim (no hardcoded limits)
-    - Recomputes attention scores multiple times (tradeoff: memory vs compute)
-    - For very long sequences (>2048), consider tiling or FlashAttention
+    This function MUTATES output. Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         Q: Query matrix (batch_size * seq_len, n_heads * head_dim)
         K: Key matrix (batch_size * seq_len, n_heads * head_dim)
         V: Value matrix (batch_size * seq_len, n_heads * head_dim)
-        output: Output matrix (batch_size * seq_len, n_heads * head_dim) - MUTATED
+        output: Output matrix (batch_size * seq_len, n_heads * head_dim) (MUTATED)
         batch_size: Batch size
         seq_len: Sequence length (no upper limit)
         n_heads: Number of attention heads
@@ -193,6 +170,12 @@ def run_multihead_attention(
     Raises:
         ValueError: If buffer shapes don't match
     """
+    if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
+        raise ValueError(
+            f"Invalid dimensions: batch_size={batch_size}, seq_len={seq_len}, "
+            f"n_heads={n_heads}, head_dim={head_dim}"
+        )
+
     embedding_dim = n_heads * head_dim
     total_tokens = batch_size * seq_len
 
@@ -207,16 +190,14 @@ def run_multihead_attention(
 
     params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
 
-    # Dispatch one workgroup per (batch, head, query_position)
-    # Each workgroup processes one query position for one head
     dispatch_simple_compute(
         pipeline_cache,
         MULTIHEAD_ATTENTION_KERNEL,
         params,
         [Q, K, V, output],
-        workgroups_x=seq_len,  # One workgroup per query position
-        workgroups_y=n_heads,  # One per head
-        workgroups_z=batch_size,  # One per batch
+        workgroups_x=seq_len,
+        workgroups_y=n_heads,
+        workgroups_z=batch_size,
     )
 
 
@@ -227,31 +208,28 @@ def run_layernorm(
     beta: GPUBuffer1D,
     output: GPUBuffer2D,
 ) -> None:
-    """
-    Layer normalization with affine transformation.
+    """Layer normalization with affine transformation (mutation).
 
-    This function MUTATES output.
+    This function MUTATES output. Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         input_buf: Input tensor (n_elements, size)
         gamma: Scale parameters (size,)
         beta: Shift parameters (size,)
-        output: Output tensor (n_elements, size) - MUTATED
+        output: Output tensor (n_elements, size) (MUTATED)
 
     Raises:
         ValueError: If buffer shapes don't match
     """
     n_elements, size = input_buf.shape
 
-    # Validate all buffer shapes
-    _validate_buffer_shapes(
-        [
-            (gamma, (size,), "gamma"),
-            (beta, (size,), "beta"),
-            (output, (n_elements, size), "output"),
-        ]
-    )
+    if n_elements <= 0 or size <= 0:
+        raise ValueError(f"Invalid input shape: ({n_elements}, {size})")
+
+    validate_buffer_shape_1d(gamma, size, "gamma")
+    validate_buffer_shape_1d(beta, size, "beta")
+    validate_buffer_shape_2d(output, (n_elements, size), "output")
 
     params = np.array([size, n_elements], dtype=np.uint32)
     dispatch_simple_compute(
@@ -268,20 +246,18 @@ def run_gelu(
     input_buf: GPUBuffer2D,
     output: GPUBuffer2D,
 ) -> None:
-    """
-    GELU activation function.
+    """GELU activation function (mutation).
 
-    This function MUTATES output.
+    This function MUTATES output. Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         input_buf: Input tensor
-        output: Output tensor - MUTATED
+        output: Output tensor (MUTATED)
 
     Raises:
         ValueError: If buffer shapes don't match
     """
-    # Validate shapes match
     if input_buf.shape != output.shape:
         raise ValueError(
             f"Input/output shape mismatch: {input_buf.shape} != {output.shape}"
@@ -305,30 +281,29 @@ def run_bias_add(
     bias: GPUBuffer1D,
     output: GPUBuffer2D,
 ) -> None:
-    """
-    Add bias to input tensor (broadcast over first dimension).
+    """Add bias to input tensor (mutation).
 
-    This function MUTATES output.
+    Broadcasts bias over first dimension.
+    This function MUTATES output. Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         input_buf: Input tensor (n_elements, dim)
         bias: Bias vector (dim,)
-        output: Output tensor (n_elements, dim) - MUTATED
+        output: Output tensor (n_elements, dim) (MUTATED)
 
     Raises:
         ValueError: If buffer shapes don't match
     """
     n_elements, dim = input_buf.shape
+
+    if n_elements <= 0 or dim <= 0:
+        raise ValueError(f"Invalid input shape: ({n_elements}, {dim})")
+
     total_size = n_elements * dim
 
-    # Validate shapes
-    _validate_buffer_shapes(
-        [
-            (bias, (dim,), "bias"),
-            (output, (n_elements, dim), "output"),
-        ]
-    )
+    validate_buffer_shape_1d(bias, dim, "bias")
+    validate_buffer_shape_2d(output, (n_elements, dim), "output")
 
     params = np.array([total_size, dim], dtype=np.uint32)
     dispatch_simple_compute(
@@ -346,21 +321,19 @@ def run_residual_add(
     input_b: GPUBuffer2D,
     output: GPUBuffer2D,
 ) -> None:
-    """
-    Element-wise addition for residual connections.
+    """Element-wise addition for residual connections (mutation).
 
-    This function MUTATES output.
+    This function MUTATES output. Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         input_a: First input tensor
         input_b: Second input tensor
-        output: Output tensor - MUTATED
+        output: Output tensor (MUTATED)
 
     Raises:
         ValueError: If buffer shapes don't match
     """
-    # Validate all shapes match
     if not (input_a.shape == input_b.shape == output.shape):
         raise ValueError(
             f"Shape mismatch: input_a={input_a.shape}, "
@@ -388,46 +361,35 @@ def run_cross_entropy_loss(
     batch_size: int,
     seq_len: int,
 ) -> None:
-    """
-    Combined cross-entropy loss and gradient computation.
+    """Combined cross-entropy loss and gradient computation (mutation).
 
     Computes both loss values and gradients in one pass for efficiency.
-    This function MUTATES loss_output and grad_logits.
+    This function MUTATES loss_output and grad_logits. Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
         logits: Model predictions (batch_size * seq_len, vocab_size)
         targets: Target token IDs (batch_size * seq_len,) - uint32
-        loss_output: Loss for each prediction (batch_size * seq_len,) - MUTATED
-        grad_logits: Gradient w.r.t. logits (batch_size * seq_len, vocab_size) - MUTATED
+        loss_output: Loss for each prediction (batch_size * seq_len,) (MUTATED)
+        grad_logits: Gradient w.r.t. logits (batch_size * seq_len, vocab_size) (MUTATED)
         batch_size: Batch size
         seq_len: Sequence length
 
     Raises:
         ValueError: If buffer shapes don't match
     """
+    if batch_size <= 0 or seq_len <= 0:
+        raise ValueError(f"Invalid batch_size={batch_size} or seq_len={seq_len}")
+
     total_predictions = batch_size * seq_len
     vocab_size = logits.shape[1]
 
-    if logits.shape != (total_predictions, vocab_size):
-        raise ValueError(
-            f"Logits shape mismatch: got {logits.shape}, "
-            f"expected ({total_predictions}, {vocab_size})"
-        )
-    if targets.size != total_predictions:
-        raise ValueError(
-            f"Targets size mismatch: got {targets.size}, expected {total_predictions}"
-        )
-    if loss_output.size != total_predictions:
-        raise ValueError(
-            f"Loss output size mismatch: got {loss_output.size}, "
-            f"expected {total_predictions}"
-        )
-    if grad_logits.shape != (total_predictions, vocab_size):
-        raise ValueError(
-            f"Grad logits shape mismatch: got {grad_logits.shape}, "
-            f"expected ({total_predictions}, {vocab_size})"
-        )
+    validate_buffer_shape_2d(logits, (total_predictions, vocab_size), "logits")
+    validate_buffer_shape_1d(targets, total_predictions, "targets")
+    validate_buffer_shape_1d(loss_output, total_predictions, "loss_output")
+    validate_buffer_shape_2d(
+        grad_logits, (total_predictions, vocab_size), "grad_logits"
+    )
 
     params = np.array([batch_size, seq_len, vocab_size], dtype=np.uint32)
     dispatch_simple_compute(
