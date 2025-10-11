@@ -49,7 +49,12 @@ def batch_add_matmul(
     B: GPUBuffer,
     C: GPUBuffer,
 ) -> BatchState:
-    """Add matmul to batch. Returns updated batch_state."""
+    """
+    Add matmul to batch. Returns updated batch_state.
+
+    Note: Mutates batch_state in-place for performance,
+    but returns it for method chaining.
+    """
     M, K = A.shape
     K2, N = B.shape
 

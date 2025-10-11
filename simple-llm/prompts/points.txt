@@ -1,0 +1,24 @@
+- The GPUBuffer shape handling could be more type-safe
+- Bind group creation pattern repeated everywhere with slight variations
+- Functions like batch_add_matmul return modified BatchState. But internally mutate .retainedbuffers list and .operationcount. Inconsistent with pure functional style (mutation + return pattern)
+- active_workspaces: Dict[tuple, dict] in WorkspaceManager - nested dicts. Should use typed data classes
+- Many functions in gpu_batch.py have partial typing. Return types often missing
+
+
+Logical Bugs to Investigate
+=======================
+Layer Norm Backward (gpu_ops_backward.py)
+- Zeroes out gradgamma and gradbeta buffers BEFORE kernel
+- Kernel comments say "Uses atomic-free accumulation"
+- But WebGPU comment says "doesn't have atomics, so use fallback"
+- Potential race condition if multiple elements write to same gamma/beta grads
+
+Attention Kernel Sizing
+- MULTIHEADATTENTIONKERNEL has hardcoded array sizes: var scores: array<f32, 512>
+- Will fail if seqlen > 512
+- FLASHATTENTIONFORWARDKERNEL has similar issue with const Bc = 32u; const Br = 32u
+
+Buffer Pool Release Logic (gpu_buffer.py)
+- pool_release_buffer checks if bufferid in poolstate.inuse but doesn't handle case where it's NOT in use
+- Could silently fail to return buffers
+

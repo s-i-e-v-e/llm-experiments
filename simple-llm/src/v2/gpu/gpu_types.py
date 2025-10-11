@@ -22,6 +22,23 @@ class PipelineCache:
     )  # (device_id, shader_hash) -> pipeline
 
 
+# FUTURE: Separate types per dimensionality. Will replace GPUBuffer eventually
+@dataclass
+class GPUBuffer1D:
+    buffer: object
+    shape: Tuple[int]
+    size: int
+    device: Device
+
+
+@dataclass
+class GPUBuffer2D:
+    buffer: object
+    shape: Tuple[int, int]
+    size: int
+    device: Device
+
+
 @dataclass
 class GPUBuffer:
     buffer: object
