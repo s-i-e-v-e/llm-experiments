@@ -1,5 +1,7 @@
 """Command batching"""
 
+from typing import List
+
 import numpy as np
 
 try:
@@ -10,20 +12,22 @@ except ImportError:
     WGPU_AVAILABLE = False
     wgpu = None
 
-from gpu_device import get_or_create_pipeline
-from gpu_kernels import (
-    BIAS_ADD_KERNEL,
+from gpu_device import BindGroupEntry, create_bind_group_entries, get_or_create_pipeline
+from gpu_kernels_backward import (
     BIAS_BACKWARD_KERNEL,
     GELU_BACKWARD_KERNEL,
-    GELU_KERNEL,
     LAYERNORM_BACKWARD_KERNEL,
-    LAYERNORM_KERNEL,
     MATMUL_BACKWARD_A_KERNEL,
     MATMUL_BACKWARD_B_KERNEL,
+)
+from gpu_kernels_forward import (
+    BIAS_ADD_KERNEL,
+    GELU_KERNEL,
+    LAYERNORM_KERNEL,
     RESIDUAL_ADD_KERNEL,
     TILED_MATMUL_KERNEL,
 )
-from gpu_types import BatchState, Device, GPUBuffer, PipelineCache
+from gpu_types import BatchState, Device, GPUBuffer2D, PipelineCache
 
 # ============================================================================
 # COMMAND BATCH STATE
@@ -42,52 +46,57 @@ def create_command_batch(device: Device, enable_profiling: bool = False) -> Batc
     )
 
 
+def _create_and_retain_uniform_buffer(
+    batch_state: BatchState, data: np.ndarray
+) -> object:
+    """Helper: Create uniform buffer and add to retained list"""
+    buffer = batch_state.device.wgpu_device.create_buffer_with_data(
+        data=data, usage=wgpu.BufferUsage.UNIFORM
+    )
+    batch_state.retained_buffers.append(buffer)
+    return buffer
+
+
+def _create_bind_group_for_batch(
+    batch_state: BatchState, pipeline: object, entries: List[BindGroupEntry]
+) -> object:
+    """Helper: Create bind group using type-safe entries"""
+    return batch_state.device.wgpu_device.create_bind_group(
+        layout=pipeline.get_bind_group_layout(0),
+        entries=create_bind_group_entries(entries),
+    )
+
+
+# ============================================================================
+# FORWARD PASS BATCH OPERATIONS
+# ============================================================================
+
+
 def batch_add_matmul(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    A: GPUBuffer,
-    B: GPUBuffer,
-    C: GPUBuffer,
-) -> BatchState:
-    """
-    Add matmul to batch. Returns updated batch_state.
-
-    Note: Mutates batch_state in-place for performance,
-    but returns it for method chaining.
-    """
+    A: GPUBuffer2D,
+    B: GPUBuffer2D,
+    C: GPUBuffer2D,
+) -> None:
+    """Add matmul to batch"""
     M, K = A.shape
     K2, N = B.shape
+    assert K == K2, f"Dimension mismatch: {K} != {K2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
-    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=params, usage=wgpu.BufferUsage.UNIFORM
-    )
-    batch_state.retained_buffers.append(params_buffer)
+    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
 
     pipeline = get_or_create_pipeline(pipeline_cache, TILED_MATMUL_KERNEL)
-    bind_group = batch_state.device.wgpu_device.create_bind_group(
-        layout=pipeline.get_bind_group_layout(0),
-        entries=[
-            {
-                "binding": 0,
-                "resource": {
-                    "buffer": params_buffer,
-                    "offset": 0,
-                    "size": params.nbytes,
-                },
-            },
-            {
-                "binding": 1,
-                "resource": {"buffer": A.buffer, "offset": 0, "size": A.size * 4},
-            },
-            {
-                "binding": 2,
-                "resource": {"buffer": B.buffer, "offset": 0, "size": B.size * 4},
-            },
-            {
-                "binding": 3,
-                "resource": {"buffer": C.buffer, "offset": 0, "size": C.size * 4},
-            },
+
+    bind_group = _create_bind_group_for_batch(
+        batch_state,
+        pipeline,
+        [
+            BindGroupEntry(0, params_buffer, 0, params.nbytes),
+            BindGroupEntry(1, A.buffer, 0, A.size * 4),
+            BindGroupEntry(2, B.buffer, 0, B.size * 4),
+            BindGroupEntry(3, C.buffer, 0, C.size * 4),
         ],
     )
 
@@ -95,77 +104,39 @@ def batch_add_matmul(
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
 
-    # Validate workgroup size against device limits
     workgroups_x = min((N + 15) // 16, 65535)
     workgroups_y = min((M + 15) // 16, 65535)
     compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1)
     compute_pass.end()
 
     batch_state.operation_count += 1
-    return batch_state
 
 
 def batch_add_layernorm(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    input_buf: GPUBuffer,
-    gamma: GPUBuffer,
-    beta: GPUBuffer,
-    output: GPUBuffer,
-) -> BatchState:
-    """Add layernorm to batch. Returns updated batch_state."""
+    input_buf: GPUBuffer2D,
+    gamma: GPUBuffer2D,
+    beta: GPUBuffer2D,
+    output: GPUBuffer2D,
+) -> None:
+    """Add layernorm to batch"""
     n_elements, size = input_buf.shape
 
     params = np.array([size, n_elements], dtype=np.uint32)
-    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=params, usage=wgpu.BufferUsage.UNIFORM
-    )
-    batch_state.retained_buffers.append(params_buffer)
+    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
 
     pipeline = get_or_create_pipeline(pipeline_cache, LAYERNORM_KERNEL)
-    bind_group = batch_state.device.wgpu_device.create_bind_group(
-        layout=pipeline.get_bind_group_layout(0),
-        entries=[
-            {
-                "binding": 0,
-                "resource": {
-                    "buffer": params_buffer,
-                    "offset": 0,
-                    "size": params.nbytes,
-                },
-            },
-            {
-                "binding": 1,
-                "resource": {
-                    "buffer": input_buf.buffer,
-                    "offset": 0,
-                    "size": input_buf.size * 4,
-                },
-            },
-            {
-                "binding": 2,
-                "resource": {
-                    "buffer": gamma.buffer,
-                    "offset": 0,
-                    "size": gamma.size * 4,
-                },
-            },
-            {
-                "binding": 3,
-                "resource": {
-                    "buffer": beta.buffer,
-                    "offset": 0,
-                    "size": beta.size * 4,
-                },
-            },
-            {
-                "binding": 4,
-                "resource": {
-                    "buffer": output.buffer,
-                    "offset": 0,
-                    "size": output.size * 4,
-                },
-            },
+
+    bind_group = _create_bind_group_for_batch(
+        batch_state,
+        pipeline,
+        [
+            BindGroupEntry(0, params_buffer, 0, params.nbytes),
+            BindGroupEntry(1, input_buf.buffer, 0, input_buf.size * 4),
+            BindGroupEntry(2, gamma.buffer, 0, gamma.size * 4),
+            BindGroupEntry(3, beta.buffer, 0, beta.size * 4),
+            BindGroupEntry(4, output.buffer, 0, output.size * 4),
         ],
     )
 
@@ -176,52 +147,29 @@ def batch_add_layernorm(
     compute_pass.end()
 
     batch_state.operation_count += 1
-    return batch_state
 
 
 def batch_add_gelu(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    input_buf: GPUBuffer,
-    output: GPUBuffer,
-) -> BatchState:
-    """Add GELU to batch. Returns updated batch_state."""
+    input_buf: GPUBuffer2D,
+    output: GPUBuffer2D,
+) -> None:
+    """Add GELU to batch"""
     total_size = input_buf.size
 
     params = np.array([total_size], dtype=np.uint32)
-    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=params, usage=wgpu.BufferUsage.UNIFORM
-    )
-    batch_state.retained_buffers.append(params_buffer)
+    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
 
     pipeline = get_or_create_pipeline(pipeline_cache, GELU_KERNEL)
-    bind_group = batch_state.device.wgpu_device.create_bind_group(
-        layout=pipeline.get_bind_group_layout(0),
-        entries=[
-            {
-                "binding": 0,
-                "resource": {
-                    "buffer": params_buffer,
-                    "offset": 0,
-                    "size": params.nbytes,
-                },
-            },
-            {
-                "binding": 1,
-                "resource": {
-                    "buffer": input_buf.buffer,
-                    "offset": 0,
-                    "size": input_buf.size * 4,
-                },
-            },
-            {
-                "binding": 2,
-                "resource": {
-                    "buffer": output.buffer,
-                    "offset": 0,
-                    "size": output.size * 4,
-                },
-            },
+
+    bind_group = _create_bind_group_for_batch(
+        batch_state,
+        pipeline,
+        [
+            BindGroupEntry(0, params_buffer, 0, params.nbytes),
+            BindGroupEntry(1, input_buf.buffer, 0, input_buf.size * 4),
+            BindGroupEntry(2, output.buffer, 0, output.size * 4),
         ],
     )
 
@@ -232,62 +180,32 @@ def batch_add_gelu(
     compute_pass.end()
 
     batch_state.operation_count += 1
-    return batch_state
 
 
 def batch_add_bias_add(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    input_buf: GPUBuffer,
-    bias: GPUBuffer,
-    output: GPUBuffer,
-) -> BatchState:
-    """Add bias addition to batch. Returns updated batch_state."""
+    input_buf: GPUBuffer2D,
+    bias: GPUBuffer2D,
+    output: GPUBuffer2D,
+) -> None:
+    """Add bias addition to batch"""
     n_elements, dim = input_buf.shape
     total_size = n_elements * dim
 
     params = np.array([total_size, dim], dtype=np.uint32)
-    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=params, usage=wgpu.BufferUsage.UNIFORM
-    )
-    batch_state.retained_buffers.append(params_buffer)
+    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
 
     pipeline = get_or_create_pipeline(pipeline_cache, BIAS_ADD_KERNEL)
-    bind_group = batch_state.device.wgpu_device.create_bind_group(
-        layout=pipeline.get_bind_group_layout(0),
-        entries=[
-            {
-                "binding": 0,
-                "resource": {
-                    "buffer": params_buffer,
-                    "offset": 0,
-                    "size": params.nbytes,
-                },
-            },
-            {
-                "binding": 1,
-                "resource": {
-                    "buffer": input_buf.buffer,
-                    "offset": 0,
-                    "size": input_buf.size * 4,
-                },
-            },
-            {
-                "binding": 2,
-                "resource": {
-                    "buffer": bias.buffer,
-                    "offset": 0,
-                    "size": bias.size * 4,
-                },
-            },
-            {
-                "binding": 3,
-                "resource": {
-                    "buffer": output.buffer,
-                    "offset": 0,
-                    "size": output.size * 4,
-                },
-            },
+
+    bind_group = _create_bind_group_for_batch(
+        batch_state,
+        pipeline,
+        [
+            BindGroupEntry(0, params_buffer, 0, params.nbytes),
+            BindGroupEntry(1, input_buf.buffer, 0, input_buf.size * 4),
+            BindGroupEntry(2, bias.buffer, 0, bias.size * 4),
+            BindGroupEntry(3, output.buffer, 0, output.size * 4),
         ],
     )
 
@@ -298,61 +216,31 @@ def batch_add_bias_add(
     compute_pass.end()
 
     batch_state.operation_count += 1
-    return batch_state
 
 
 def batch_add_residual(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    input_a: GPUBuffer,
-    input_b: GPUBuffer,
-    output: GPUBuffer,
-) -> BatchState:
-    """Add residual connection to batch. Returns updated batch_state."""
+    input_a: GPUBuffer2D,
+    input_b: GPUBuffer2D,
+    output: GPUBuffer2D,
+) -> None:
+    """Add residual connection to batch"""
     total_size = input_a.size
 
     params = np.array([total_size], dtype=np.uint32)
-    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=params, usage=wgpu.BufferUsage.UNIFORM
-    )
-    batch_state.retained_buffers.append(params_buffer)
+    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
 
     pipeline = get_or_create_pipeline(pipeline_cache, RESIDUAL_ADD_KERNEL)
-    bind_group = batch_state.device.wgpu_device.create_bind_group(
-        layout=pipeline.get_bind_group_layout(0),
-        entries=[
-            {
-                "binding": 0,
-                "resource": {
-                    "buffer": params_buffer,
-                    "offset": 0,
-                    "size": params.nbytes,
-                },
-            },
-            {
-                "binding": 1,
-                "resource": {
-                    "buffer": input_a.buffer,
-                    "offset": 0,
-                    "size": input_a.size * 4,
-                },
-            },
-            {
-                "binding": 2,
-                "resource": {
-                    "buffer": input_b.buffer,
-                    "offset": 0,
-                    "size": input_b.size * 4,
-                },
-            },
-            {
-                "binding": 3,
-                "resource": {
-                    "buffer": output.buffer,
-                    "offset": 0,
-                    "size": output.size * 4,
-                },
-            },
+
+    bind_group = _create_bind_group_for_batch(
+        batch_state,
+        pipeline,
+        [
+            BindGroupEntry(0, params_buffer, 0, params.nbytes),
+            BindGroupEntry(1, input_a.buffer, 0, input_a.size * 4),
+            BindGroupEntry(2, input_b.buffer, 0, input_b.size * 4),
+            BindGroupEntry(3, output.buffer, 0, output.size * 4),
         ],
     )
 
@@ -363,30 +251,23 @@ def batch_add_residual(
     compute_pass.end()
 
     batch_state.operation_count += 1
-    return batch_state
 
 
 def batch_add_copy(
-    batch_state: BatchState, source: GPUBuffer, dest: GPUBuffer
-) -> BatchState:
-    """Add buffer copy operation to batch. Returns updated batch_state."""
+    batch_state: BatchState, source: GPUBuffer2D, dest: GPUBuffer2D
+) -> None:
+    """Add buffer copy operation to batch"""
     assert source.size == dest.size, (
         f"Buffer sizes must match: {source.size} != {dest.size}"
     )
 
     if batch_state.encoder is None:
-        raise RuntimeError("Must call create_command_batch() before adding operations")
+        raise RuntimeError("Must call create_command_batch before adding operations")
 
     batch_state.encoder.copy_buffer_to_buffer(
-        source.buffer,
-        0,
-        dest.buffer,
-        0,
-        source.size * 4,  # 4 bytes per float32
+        source.buffer, 0, dest.buffer, 0, source.size * 4
     )
-
     batch_state.operation_count += 1
-    return batch_state
 
 
 # ============================================================================
@@ -397,186 +278,106 @@ def batch_add_copy(
 def batch_add_matmul_backward_a(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    grad_C: GPUBuffer,
-    B: GPUBuffer,
-    grad_A: GPUBuffer,
-) -> BatchState:
+    grad_C: GPUBuffer2D,
+    B: GPUBuffer2D,
+    grad_A: GPUBuffer2D,
+) -> None:
     """Add matmul backward w.r.t. A: grad_A = grad_C @ B^T"""
     M, N = grad_C.shape
     K2, N2 = B.shape
     assert N == N2, f"Dimension mismatch: {N} != {N2}"
 
     params = np.array([M, K2, N], dtype=np.uint32)
-    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=params, usage=wgpu.BufferUsage.UNIFORM
-    )
-    batch_state.retained_buffers.append(params_buffer)
+    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
 
     pipeline = get_or_create_pipeline(pipeline_cache, MATMUL_BACKWARD_A_KERNEL)
-    bind_group = batch_state.device.wgpu_device.create_bind_group(
-        layout=pipeline.get_bind_group_layout(0),
-        entries=[
-            {
-                "binding": 0,
-                "resource": {
-                    "buffer": params_buffer,
-                    "offset": 0,
-                    "size": params.nbytes,
-                },
-            },
-            {
-                "binding": 1,
-                "resource": {
-                    "buffer": grad_C.buffer,
-                    "offset": 0,
-                    "size": grad_C.size * 4,
-                },
-            },
-            {
-                "binding": 2,
-                "resource": {"buffer": B.buffer, "offset": 0, "size": B.size * 4},
-            },
-            {
-                "binding": 3,
-                "resource": {
-                    "buffer": grad_A.buffer,
-                    "offset": 0,
-                    "size": grad_A.size * 4,
-                },
-            },
+
+    bind_group = _create_bind_group_for_batch(
+        batch_state,
+        pipeline,
+        [
+            BindGroupEntry(0, params_buffer, 0, params.nbytes),
+            BindGroupEntry(1, grad_C.buffer, 0, grad_C.size * 4),
+            BindGroupEntry(2, B.buffer, 0, B.size * 4),
+            BindGroupEntry(3, grad_A.buffer, 0, grad_A.size * 4),
         ],
     )
 
     compute_pass = batch_state.encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
+
     workgroups_x = min((K2 + 15) // 16, 65535)
     workgroups_y = min((M + 15) // 16, 65535)
     compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1)
     compute_pass.end()
 
     batch_state.operation_count += 1
-    return batch_state
 
 
 def batch_add_matmul_backward_b(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    A: GPUBuffer,
-    grad_C: GPUBuffer,
-    grad_B: GPUBuffer,
-) -> BatchState:
+    A: GPUBuffer2D,
+    grad_C: GPUBuffer2D,
+    grad_B: GPUBuffer2D,
+) -> None:
     """Add matmul backward w.r.t. B: grad_B = A^T @ grad_C"""
     M, K = A.shape
     M2, N = grad_C.shape
     assert M == M2, f"Dimension mismatch: {M} != {M2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
-    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=params, usage=wgpu.BufferUsage.UNIFORM
-    )
-    batch_state.retained_buffers.append(params_buffer)
+    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
 
     pipeline = get_or_create_pipeline(pipeline_cache, MATMUL_BACKWARD_B_KERNEL)
-    bind_group = batch_state.device.wgpu_device.create_bind_group(
-        layout=pipeline.get_bind_group_layout(0),
-        entries=[
-            {
-                "binding": 0,
-                "resource": {
-                    "buffer": params_buffer,
-                    "offset": 0,
-                    "size": params.nbytes,
-                },
-            },
-            {
-                "binding": 1,
-                "resource": {"buffer": A.buffer, "offset": 0, "size": A.size * 4},
-            },
-            {
-                "binding": 2,
-                "resource": {
-                    "buffer": grad_C.buffer,
-                    "offset": 0,
-                    "size": grad_C.size * 4,
-                },
-            },
-            {
-                "binding": 3,
-                "resource": {
-                    "buffer": grad_B.buffer,
-                    "offset": 0,
-                    "size": grad_B.size * 4,
-                },
-            },
+
+    bind_group = _create_bind_group_for_batch(
+        batch_state,
+        pipeline,
+        [
+            BindGroupEntry(0, params_buffer, 0, params.nbytes),
+            BindGroupEntry(1, A.buffer, 0, A.size * 4),
+            BindGroupEntry(2, grad_C.buffer, 0, grad_C.size * 4),
+            BindGroupEntry(3, grad_B.buffer, 0, grad_B.size * 4),
         ],
     )
 
     compute_pass = batch_state.encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
+
     workgroups_x = min((N + 15) // 16, 65535)
     workgroups_y = min((K + 15) // 16, 65535)
     compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1)
     compute_pass.end()
 
     batch_state.operation_count += 1
-    return batch_state
 
 
 def batch_add_gelu_backward(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    input_buf: GPUBuffer,
-    grad_output: GPUBuffer,
-    grad_input: GPUBuffer,
-) -> BatchState:
+    input_buf: GPUBuffer2D,
+    grad_output: GPUBuffer2D,
+    grad_input: GPUBuffer2D,
+) -> None:
     """Add GELU backward to batch"""
     total_size = input_buf.size
-    assert grad_output.size == total_size and grad_input.size == total_size
 
     params = np.array([total_size], dtype=np.uint32)
-    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=params, usage=wgpu.BufferUsage.UNIFORM
-    )
-    batch_state.retained_buffers.append(params_buffer)
+    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
 
     pipeline = get_or_create_pipeline(pipeline_cache, GELU_BACKWARD_KERNEL)
-    bind_group = batch_state.device.wgpu_device.create_bind_group(
-        layout=pipeline.get_bind_group_layout(0),
-        entries=[
-            {
-                "binding": 0,
-                "resource": {
-                    "buffer": params_buffer,
-                    "offset": 0,
-                    "size": params.nbytes,
-                },
-            },
-            {
-                "binding": 1,
-                "resource": {
-                    "buffer": input_buf.buffer,
-                    "offset": 0,
-                    "size": input_buf.size * 4,
-                },
-            },
-            {
-                "binding": 2,
-                "resource": {
-                    "buffer": grad_output.buffer,
-                    "offset": 0,
-                    "size": grad_output.size * 4,
-                },
-            },
-            {
-                "binding": 3,
-                "resource": {
-                    "buffer": grad_input.buffer,
-                    "offset": 0,
-                    "size": grad_input.size * 4,
-                },
-            },
+
+    bind_group = _create_bind_group_for_batch(
+        batch_state,
+        pipeline,
+        [
+            BindGroupEntry(0, params_buffer, 0, params.nbytes),
+            BindGroupEntry(1, input_buf.buffer, 0, input_buf.size * 4),
+            BindGroupEntry(2, grad_output.buffer, 0, grad_output.size * 4),
+            BindGroupEntry(3, grad_input.buffer, 0, grad_input.size * 4),
         ],
     )
 
@@ -587,88 +388,37 @@ def batch_add_gelu_backward(
     compute_pass.end()
 
     batch_state.operation_count += 1
-    return batch_state
 
 
 def batch_add_layernorm_backward(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    input_buf: GPUBuffer,
-    gamma: GPUBuffer,
-    grad_output: GPUBuffer,
-    grad_input: GPUBuffer,
-    grad_gamma: GPUBuffer,
-    grad_beta: GPUBuffer,
-) -> BatchState:
+    input_buf: GPUBuffer2D,
+    gamma: GPUBuffer2D,
+    grad_output: GPUBuffer2D,
+    grad_input: GPUBuffer2D,
+    grad_gamma: GPUBuffer2D,
+    grad_beta: GPUBuffer2D,
+) -> None:
     """Add layernorm backward to batch"""
     n_elements, size = input_buf.shape
 
     params = np.array([size, n_elements], dtype=np.uint32)
-    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=params, usage=wgpu.BufferUsage.UNIFORM
-    )
-    batch_state.retained_buffers.append(params_buffer)
+    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
 
     pipeline = get_or_create_pipeline(pipeline_cache, LAYERNORM_BACKWARD_KERNEL)
-    bind_group = batch_state.device.wgpu_device.create_bind_group(
-        layout=pipeline.get_bind_group_layout(0),
-        entries=[
-            {
-                "binding": 0,
-                "resource": {
-                    "buffer": params_buffer,
-                    "offset": 0,
-                    "size": params.nbytes,
-                },
-            },
-            {
-                "binding": 1,
-                "resource": {
-                    "buffer": input_buf.buffer,
-                    "offset": 0,
-                    "size": input_buf.size * 4,
-                },
-            },
-            {
-                "binding": 2,
-                "resource": {
-                    "buffer": gamma.buffer,
-                    "offset": 0,
-                    "size": gamma.size * 4,
-                },
-            },
-            {
-                "binding": 3,
-                "resource": {
-                    "buffer": grad_output.buffer,
-                    "offset": 0,
-                    "size": grad_output.size * 4,
-                },
-            },
-            {
-                "binding": 4,
-                "resource": {
-                    "buffer": grad_input.buffer,
-                    "offset": 0,
-                    "size": grad_input.size * 4,
-                },
-            },
-            {
-                "binding": 5,
-                "resource": {
-                    "buffer": grad_gamma.buffer,
-                    "offset": 0,
-                    "size": grad_gamma.size * 4,
-                },
-            },
-            {
-                "binding": 6,
-                "resource": {
-                    "buffer": grad_beta.buffer,
-                    "offset": 0,
-                    "size": grad_beta.size * 4,
-                },
-            },
+
+    bind_group = _create_bind_group_for_batch(
+        batch_state,
+        pipeline,
+        [
+            BindGroupEntry(0, params_buffer, 0, params.nbytes),
+            BindGroupEntry(1, input_buf.buffer, 0, input_buf.size * 4),
+            BindGroupEntry(2, gamma.buffer, 0, gamma.size * 4),
+            BindGroupEntry(3, grad_output.buffer, 0, grad_output.size * 4),
+            BindGroupEntry(4, grad_input.buffer, 0, grad_input.size * 4),
+            BindGroupEntry(5, grad_gamma.buffer, 0, grad_gamma.size * 4),
+            BindGroupEntry(6, grad_beta.buffer, 0, grad_beta.size * 4),
         ],
     )
 
@@ -679,53 +429,30 @@ def batch_add_layernorm_backward(
     compute_pass.end()
 
     batch_state.operation_count += 1
-    return batch_state
 
 
 def batch_add_bias_backward(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    grad_output: GPUBuffer,
-    grad_bias: GPUBuffer,
-) -> BatchState:
+    grad_output: GPUBuffer2D,
+    grad_bias: GPUBuffer2D,
+) -> None:
     """Add bias backward to batch - sums gradients over batch dimension"""
     n_elements, dim = grad_output.shape
     total_size = n_elements * dim
 
     params = np.array([total_size, dim], dtype=np.uint32)
-    params_buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=params, usage=wgpu.BufferUsage.UNIFORM
-    )
-    batch_state.retained_buffers.append(params_buffer)
+    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
 
     pipeline = get_or_create_pipeline(pipeline_cache, BIAS_BACKWARD_KERNEL)
-    bind_group = batch_state.device.wgpu_device.create_bind_group(
-        layout=pipeline.get_bind_group_layout(0),
-        entries=[
-            {
-                "binding": 0,
-                "resource": {
-                    "buffer": params_buffer,
-                    "offset": 0,
-                    "size": params.nbytes,
-                },
-            },
-            {
-                "binding": 1,
-                "resource": {
-                    "buffer": grad_output.buffer,
-                    "offset": 0,
-                    "size": grad_output.size * 4,
-                },
-            },
-            {
-                "binding": 2,
-                "resource": {
-                    "buffer": grad_bias.buffer,
-                    "offset": 0,
-                    "size": grad_bias.size * 4,
-                },
-            },
+
+    bind_group = _create_bind_group_for_batch(
+        batch_state,
+        pipeline,
+        [
+            BindGroupEntry(0, params_buffer, 0, params.nbytes),
+            BindGroupEntry(1, grad_output.buffer, 0, grad_output.size * 4),
+            BindGroupEntry(2, grad_bias.buffer, 0, grad_bias.size * 4),
         ],
     )
 
@@ -736,7 +463,6 @@ def batch_add_bias_backward(
     compute_pass.end()
 
     batch_state.operation_count += 1
-    return batch_state
 
 
 # ============================================================================
@@ -744,8 +470,8 @@ def batch_add_bias_backward(
 # ============================================================================
 
 
-def batch_submit(batch_state: BatchState) -> BatchState:
-    """Execute all batched operations and release retained resources. Returns batch_state."""
+def batch_submit(batch_state: BatchState) -> None:
+    """Execute all batched operations and release retained resources"""
     if batch_state.encoder is not None:
         batch_state.device.wgpu_device.queue.submit([batch_state.encoder.finish()])
 
@@ -755,8 +481,5 @@ def batch_submit(batch_state: BatchState) -> BatchState:
             )
 
         batch_state.encoder = None
-
-    batch_state.retained_buffers = []
-    batch_state.operation_count = 0
-
-    return batch_state
+        batch_state.retained_buffers = []
+        batch_state.operation_count = 0

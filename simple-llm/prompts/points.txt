@@ -1,6 +1,5 @@
 - The GPUBuffer shape handling could be more type-safe
 - Bind group creation pattern repeated everywhere with slight variations
-- Functions like batch_add_matmul return modified BatchState. But internally mutate .retainedbuffers list and .operationcount. Inconsistent with pure functional style (mutation + return pattern)
 - active_workspaces: Dict[tuple, dict] in WorkspaceManager - nested dicts. Should use typed data classes
 - Many functions in gpu_batch.py have partial typing. Return types often missing
 
@@ -21,4 +20,3 @@ Attention Kernel Sizing
 Buffer Pool Release Logic (gpu_buffer.py)
 - pool_release_buffer checks if bufferid in poolstate.inuse but doesn't handle case where it's NOT in use
 - Could silently fail to return buffers
-

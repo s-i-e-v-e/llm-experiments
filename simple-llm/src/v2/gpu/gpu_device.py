@@ -1,6 +1,7 @@
 """Device management and pipeline caching"""
 
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
 from gpu_types import Device, PipelineCache
 
@@ -11,6 +12,49 @@ try:
 except ImportError:
     WGPU_AVAILABLE = False
     wgpu = None
+
+
+# ============================================================================
+# Bind Group Helper Types
+# ============================================================================
+
+
+@dataclass
+class BindGroupEntry:
+    """Type-safe bind group entry specification"""
+
+    binding: int
+    buffer: object
+    offset: int
+    size: int
+
+
+def create_bind_group_entries(entries: List[BindGroupEntry]) -> List[Dict]:
+    """
+    Convert typed BindGroupEntry list to wgpu bind group entry format.
+
+    Args:
+        entries: List of BindGroupEntry specifications
+
+    Returns:
+        List of dictionaries in wgpu bind group format
+    """
+    return [
+        {
+            "binding": entry.binding,
+            "resource": {
+                "buffer": entry.buffer,
+                "offset": entry.offset,
+                "size": entry.size,
+            },
+        }
+        for entry in entries
+    ]
+
+
+# ============================================================================
+# Device Management
+# ============================================================================
 
 
 def create_device() -> Optional[Device]:
@@ -99,7 +143,7 @@ def create_tuned_pipeline(
 
 
 def get_or_create_pipeline(pipeline_cache: PipelineCache, shader_code: str) -> object:
-    """Cache compute pipelines"""
+    """Cache compute pipelines to avoid recompilation"""
     device = pipeline_cache.device
     cache_key = (id(device.wgpu_device), hash(shader_code))
 

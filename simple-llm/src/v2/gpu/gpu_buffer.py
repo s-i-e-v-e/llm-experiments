@@ -1,6 +1,6 @@
 """Buffer creation and pool management"""
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import numpy as np
 
@@ -12,19 +12,31 @@ except ImportError:
     WGPU_AVAILABLE = False
     wgpu = None
 
-from gpu_types import BufferInfo, BufferPool, Device, GPUBuffer, StagingPool
+from gpu_types import (
+    BufferInfo,
+    BufferPool,
+    Device,
+    GPUBuffer1D,
+    GPUBuffer2D,
+    GPUBuffer3D,
+    StagingPool,
+)
+
+# Type alias for any GPU buffer
+GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
+
 
 # ============================================================================
 # BASIC BUFFER OPERATIONS
 # ============================================================================
 
 
-def create_gpu_buffer(
+def _create_gpu_buffer_internal(
     device: Device,
     shape: Tuple[int, ...],
     data: Optional[np.ndarray] = None,
-) -> GPUBuffer:
-    """Create GPU buffer"""
+) -> object:
+    """Internal: Create raw GPU buffer of any shape"""
     size = int(np.prod(shape))
     buffer_size = size * 4  # 4 bytes per float32
 
@@ -44,10 +56,48 @@ def create_gpu_buffer(
             | wgpu.BufferUsage.COPY_DST,
         )
 
-    return GPUBuffer(buffer=buffer, shape=shape, size=size, device=device)
+    return buffer
 
 
-def gpu_to_numpy(gpu_buffer: GPUBuffer) -> np.ndarray:
+def create_gpu_buffer_1d(
+    device: Device,
+    size: int,
+    data: Optional[np.ndarray] = None,
+) -> GPUBuffer1D:
+    """Create 1D GPU buffer (for vectors)"""
+    shape = (size,)
+    buffer = _create_gpu_buffer_internal(device, shape, data)
+    return GPUBuffer1D(buffer=buffer, shape=shape, size=size, device=device)
+
+
+def create_gpu_buffer_2d(
+    device: Device,
+    rows: int,
+    cols: int,
+    data: Optional[np.ndarray] = None,
+) -> GPUBuffer2D:
+    """Create 2D GPU buffer (for matrices)"""
+    shape = (rows, cols)
+    size = rows * cols
+    buffer = _create_gpu_buffer_internal(device, shape, data)
+    return GPUBuffer2D(buffer=buffer, shape=shape, size=size, device=device)
+
+
+def create_gpu_buffer_3d(
+    device: Device,
+    dim1: int,
+    dim2: int,
+    dim3: int,
+    data: Optional[np.ndarray] = None,
+) -> GPUBuffer3D:
+    """Create 3D GPU buffer (for batched sequences)"""
+    shape = (dim1, dim2, dim3)
+    size = dim1 * dim2 * dim3
+    buffer = _create_gpu_buffer_internal(device, shape, data)
+    return GPUBuffer3D(buffer=buffer, shape=shape, size=size, device=device)
+
+
+def gpu_to_numpy(gpu_buffer: GPUBufferAny) -> np.ndarray:
     """Read GPU buffer back to CPU"""
     buffer_size = gpu_buffer.size * 4
     read_buffer = gpu_buffer.device.wgpu_device.create_buffer(
@@ -65,7 +115,7 @@ def gpu_to_numpy(gpu_buffer: GPUBuffer) -> np.ndarray:
     return data.reshape(gpu_buffer.shape)
 
 
-def clear_buffer(gpu_buffer: GPUBuffer) -> None:
+def clear_buffer(gpu_buffer: GPUBufferAny) -> None:
     """Zero-initialize a GPU buffer"""
     device = gpu_buffer.device
     zero_data = np.zeros(gpu_buffer.size, dtype=np.float32)
@@ -88,21 +138,16 @@ def create_buffer_pool(device: Device, max_buffer_size_mb: int = 512) -> BufferP
     )
 
 
-def pool_get_buffer(
-    pool_state: BufferPool, shape: Tuple[int, ...]
-) -> Tuple[BufferPool, GPUBuffer]:
-    """Get a buffer from pool or create new. Returns (pool_state, GPUBuffer)"""
-    size = int(np.prod(shape))
-
+def _pool_get_buffer_internal(
+    pool_state: BufferPool,
+    shape: Tuple[int, ...],
+    size: int,
+) -> object:
+    """Internal: Get buffer from pool or create new"""
     if size in pool_state.pools and len(pool_state.pools[size]) > 0:
         buffer_info = pool_state.pools[size].pop()
         pool_state.in_use.add(id(buffer_info.buffer))
-        return pool_state, GPUBuffer(
-            buffer=buffer_info.buffer,
-            shape=shape,
-            size=size,
-            device=pool_state.device,
-        )
+        return buffer_info.buffer
 
     # Create new buffer
     buffer_size = size * 4
@@ -112,17 +157,37 @@ def pool_get_buffer(
         | wgpu.BufferUsage.COPY_SRC
         | wgpu.BufferUsage.COPY_DST,
     )
-
-    gpu_buffer = GPUBuffer(
-        buffer=buffer, shape=shape, size=size, device=pool_state.device
-    )
     pool_state.in_use.add(id(buffer))
+    return buffer
 
-    return pool_state, gpu_buffer
+
+def pool_get_buffer_1d(pool_state: BufferPool, size: int) -> GPUBuffer1D:
+    """Get a 1D buffer from pool or create new"""
+    shape = (size,)
+    buffer = _pool_get_buffer_internal(pool_state, shape, size)
+    return GPUBuffer1D(buffer=buffer, shape=shape, size=size, device=pool_state.device)
 
 
-def pool_release_buffer(pool_state: BufferPool, gpu_buffer: GPUBuffer) -> BufferPool:
-    """Return buffer to pool for reuse. Returns updated pool_state"""
+def pool_get_buffer_2d(pool_state: BufferPool, rows: int, cols: int) -> GPUBuffer2D:
+    """Get a 2D buffer from pool or create new"""
+    shape = (rows, cols)
+    size = rows * cols
+    buffer = _pool_get_buffer_internal(pool_state, shape, size)
+    return GPUBuffer2D(buffer=buffer, shape=shape, size=size, device=pool_state.device)
+
+
+def pool_get_buffer_3d(
+    pool_state: BufferPool, dim1: int, dim2: int, dim3: int
+) -> GPUBuffer3D:
+    """Get a 3D buffer from pool or create new"""
+    shape = (dim1, dim2, dim3)
+    size = dim1 * dim2 * dim3
+    buffer = _pool_get_buffer_internal(pool_state, shape, size)
+    return GPUBuffer3D(buffer=buffer, shape=shape, size=size, device=pool_state.device)
+
+
+def pool_release_buffer(pool_state: BufferPool, gpu_buffer: GPUBufferAny) -> None:
+    """Return buffer to pool for reuse"""
     buffer_id = id(gpu_buffer.buffer)
     if buffer_id in pool_state.in_use:
         pool_state.in_use.remove(buffer_id)
@@ -133,8 +198,6 @@ def pool_release_buffer(pool_state: BufferPool, gpu_buffer: GPUBuffer) -> Buffer
 
         buffer_info = BufferInfo(buffer=gpu_buffer.buffer)
         pool_state.pools[size].append(buffer_info)
-
-    return pool_state
 
 
 # ============================================================================
@@ -151,9 +214,7 @@ def create_staging_pool(device: Device, initial_size_mb: int = 64) -> StagingPoo
     )
 
 
-def staging_get_buffer(
-    pool_state: StagingPool, size_bytes: int
-) -> Tuple[StagingPool, object]:
+def staging_get_buffer(pool_state: StagingPool, size_bytes: int) -> object:
     """Get or create staging buffer for CPU->GPU or GPU->CPU transfers"""
     # Round up to next power of 2 for better pooling
     rounded_size = 2 ** (size_bytes - 1).bit_length()
@@ -170,12 +231,12 @@ def staging_get_buffer(
             )
         )
 
-    return pool_state, pool_state.staging_buffers[rounded_size]
+    return pool_state.staging_buffers[rounded_size]
 
 
 def staging_upload_data(
-    pool_state: StagingPool, gpu_buffer: GPUBuffer, data_np: np.ndarray
-) -> StagingPool:
+    pool_state: StagingPool, gpu_buffer: GPUBufferAny, data_np: np.ndarray
+) -> None:
     """Upload data to GPU using persistent staging buffer"""
     size_bytes = data_np.nbytes
 
@@ -184,10 +245,10 @@ def staging_upload_data(
         pool_state.device.wgpu_device.queue.write_buffer(
             gpu_buffer.buffer, 0, np.ascontiguousarray(data_np, dtype=np.float32)
         )
-        return pool_state
+        return
 
     # For large transfers, use staging buffer
-    pool_state, staging = staging_get_buffer(pool_state, size_bytes)
+    staging = staging_get_buffer(pool_state, size_bytes)
     staging.map_sync(wgpu.MapMode.WRITE)
     staging.write_mapped(np.ascontiguousarray(data_np, dtype=np.float32))
     staging.unmap()
@@ -196,15 +257,13 @@ def staging_upload_data(
     encoder.copy_buffer_to_buffer(staging, 0, gpu_buffer.buffer, 0, size_bytes)
     pool_state.device.wgpu_device.queue.submit([encoder.finish()])
 
-    return pool_state
-
 
 def staging_download_data(
-    pool_state: StagingPool, gpu_buffer: GPUBuffer, shape: Tuple[int, ...]
-) -> Tuple[StagingPool, np.ndarray]:
+    pool_state: StagingPool, gpu_buffer: GPUBufferAny
+) -> np.ndarray:
     """Download data from GPU using persistent staging buffer"""
     size_bytes = gpu_buffer.size * 4
-    pool_state, staging = staging_get_buffer(pool_state, size_bytes)
+    staging = staging_get_buffer(pool_state, size_bytes)
 
     encoder = pool_state.device.wgpu_device.create_command_encoder()
     encoder.copy_buffer_to_buffer(gpu_buffer.buffer, 0, staging, 0, size_bytes)
@@ -216,17 +275,15 @@ def staging_download_data(
     ).copy()
     staging.unmap()
 
-    return pool_state, data.reshape(shape)
+    return data.reshape(gpu_buffer.shape)
 
 
 def gpu_to_numpy_optimized(
-    pool_state: Optional[StagingPool], gpu_buffer: GPUBuffer
+    pool_state: Optional[StagingPool], gpu_buffer: GPUBufferAny
 ) -> np.ndarray:
     """Optimized GPU to numpy with staging buffer pool"""
-
     if pool_state is not None:
-        _, data = staging_download_data(pool_state, gpu_buffer, gpu_buffer.shape)
-        return data
+        return staging_download_data(pool_state, gpu_buffer)
     else:
         # Fallback to original implementation
         return gpu_to_numpy(gpu_buffer)
