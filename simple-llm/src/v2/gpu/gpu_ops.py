@@ -1,14 +1,16 @@
+"""Core GPU operations and compute dispatch"""
+
 from typing import List, Union
 
 import numpy as np
 from gpu_device import (
-    BindGroupEntry,
     create_bind_group_entries,
     get_or_create_pipeline,
     wgpu,
 )
 from gpu_types import (
     BatchState,
+    BindGroupEntry,
     Device,
     GPUBuffer1D,
     GPUBuffer2D,
@@ -16,6 +18,7 @@ from gpu_types import (
     PipelineCache,
     WGPUBindGroup,
     WGPUBuffer,
+    WGPUComputePipeline,
 )
 
 GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
@@ -25,34 +28,36 @@ GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
 # ============================================================================
 
 
-def _create_uniform_buffer(
+def _create_uniform_buffer_internal(
     pipeline_cache: PipelineCache, data: np.ndarray
 ) -> WGPUBuffer:
-    """Helper: Create uniform buffer for parameters"""
+    """Internal: Create uniform buffer for parameters"""
     return pipeline_cache.device.wgpu_device.create_buffer_with_data(
         data=data, usage=wgpu.BufferUsage.UNIFORM
     )
 
 
-def _create_bind_group(
-    pipeline_cache: PipelineCache, pipeline: object, entries: List[BindGroupEntry]
+def _create_bind_group_internal(
+    pipeline_cache: PipelineCache,
+    pipeline: WGPUComputePipeline,
+    entries: List[BindGroupEntry],
 ) -> WGPUBindGroup:
-    """Helper: Create bind group using type-safe entries"""
+    """Internal: Create bind group using type-safe entries"""
     return pipeline_cache.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=create_bind_group_entries(entries),
     )
 
 
-def _dispatch_compute(
+def _dispatch_compute_internal(
     pipeline_cache: PipelineCache,
-    pipeline: object,
-    bind_group: object,
+    pipeline: WGPUComputePipeline,
+    bind_group: WGPUBindGroup,
     workgroups_x: int,
     workgroups_y: int = 1,
     workgroups_z: int = 1,
 ) -> None:
-    """Helper: Create encoder and dispatch compute pass"""
+    """Internal: Create encoder and dispatch compute pass"""
     encoder = pipeline_cache.device.wgpu_device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
@@ -84,7 +89,7 @@ def dispatch_simple_compute(
         workgroups_z: Number of workgroups in Z dimension (default: 1)
     """
     # Create uniform buffer for parameters
-    params_buffer = _create_uniform_buffer(pipeline_cache, params)
+    params_buffer = _create_uniform_buffer_internal(pipeline_cache, params)
 
     # Get or create pipeline
     pipeline = get_or_create_pipeline(pipeline_cache, kernel_code)
@@ -96,10 +101,10 @@ def dispatch_simple_compute(
         binding_index = i + 1
         entries.append(BindGroupEntry(binding_index, buf.buffer, 0, buf.size * 4))
 
-    bind_group = _create_bind_group(pipeline_cache, pipeline, entries)
+    bind_group = _create_bind_group_internal(pipeline_cache, pipeline, entries)
 
     # Dispatch compute
-    _dispatch_compute(
+    _dispatch_compute_internal(
         pipeline_cache, pipeline, bind_group, workgroups_x, workgroups_y, workgroups_z
     )
 
@@ -121,10 +126,10 @@ def create_command_batch(device: Device, enable_profiling: bool = False) -> Batc
     )
 
 
-def _create_and_retain_uniform_buffer(
+def _create_and_retain_uniform_buffer_internal(
     batch_state: BatchState, data: np.ndarray
-) -> object:
-    """Helper: Create uniform buffer and add to retained list"""
+) -> WGPUBuffer:
+    """Internal: Create uniform buffer and add to retained list"""
     buffer = batch_state.device.wgpu_device.create_buffer_with_data(
         data=data, usage=wgpu.BufferUsage.UNIFORM
     )
@@ -132,32 +137,34 @@ def _create_and_retain_uniform_buffer(
     return buffer
 
 
-def _create_bind_group_for_batch(
-    batch_state: BatchState, pipeline: object, entries: List[BindGroupEntry]
-) -> object:
-    """Helper: Create bind group using type-safe entries"""
+def _create_bind_group_for_batch_internal(
+    batch_state: BatchState,
+    pipeline: WGPUComputePipeline,
+    entries: List[BindGroupEntry],
+) -> WGPUBindGroup:
+    """Internal: Create bind group using type-safe entries"""
     return batch_state.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=create_bind_group_entries(entries),
     )
 
 
-def _add_compute_to_batch(
+def _add_compute_to_batch_internal(
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     kernel_code: str,
     params: np.ndarray,
-    buffers: List,
+    buffers: List[GPUBufferAny],
     workgroups_x: int,
     workgroups_y: int = 1,
     workgroups_z: int = 1,
 ) -> None:
     """
-    Helper: Add compute operation to batch encoder.
+    Internal: Add compute operation to batch encoder.
 
     Similar to dispatch_simple_compute but adds to batch instead of immediate dispatch.
     """
-    params_buffer = _create_and_retain_uniform_buffer(batch_state, params)
+    params_buffer = _create_and_retain_uniform_buffer_internal(batch_state, params)
     pipeline = get_or_create_pipeline(pipeline_cache, kernel_code)
 
     # Build bind group entries: binding 0 is params, rest are buffers
@@ -166,7 +173,7 @@ def _add_compute_to_batch(
         binding_index = i + 1
         entries.append(BindGroupEntry(binding_index, buf.buffer, 0, buf.size * 4))
 
-    bind_group = _create_bind_group_for_batch(batch_state, pipeline, entries)
+    bind_group = _create_bind_group_for_batch_internal(batch_state, pipeline, entries)
 
     compute_pass = batch_state.encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)

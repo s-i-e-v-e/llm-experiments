@@ -15,6 +15,7 @@ from gpu_kernels_forward import (
     RESIDUAL_ADD_KERNEL,
     TILED_MATMUL_KERNEL,
 )
+from gpu_ops import _add_compute_to_batch_internal
 from gpu_types import BatchState, GPUBuffer1D, GPUBuffer2D, PipelineCache
 
 # ============================================================================
@@ -35,7 +36,7 @@ def batch_add_matmul(
     assert K == K2, f"Dimension mismatch: {K} != {K2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
-    _add_compute_to_batch(
+    _add_compute_to_batch_internal(
         pipeline_cache,
         batch_state,
         TILED_MATMUL_KERNEL,
@@ -59,7 +60,7 @@ def batch_add_layernorm(
     n_elements, size = input_buf.shape
 
     params = np.array([size, n_elements], dtype=np.uint32)
-    _add_compute_to_batch(
+    _add_compute_to_batch_internal(
         pipeline_cache,
         batch_state,
         LAYERNORM_KERNEL,
@@ -79,7 +80,7 @@ def batch_add_gelu(
     total_size = input_buf.size
 
     params = np.array([total_size], dtype=np.uint32)
-    _add_compute_to_batch(
+    _add_compute_to_batch_internal(
         pipeline_cache,
         batch_state,
         GELU_KERNEL,
@@ -101,7 +102,7 @@ def batch_add_bias_add(
     total_size = n_elements * dim
 
     params = np.array([total_size, dim], dtype=np.uint32)
-    _add_compute_to_batch(
+    _add_compute_to_batch_internal(
         pipeline_cache,
         batch_state,
         BIAS_ADD_KERNEL,
@@ -122,7 +123,7 @@ def batch_add_residual(
     total_size = input_a.size
 
     params = np.array([total_size], dtype=np.uint32)
-    _add_compute_to_batch(
+    _add_compute_to_batch_internal(
         pipeline_cache,
         batch_state,
         RESIDUAL_ADD_KERNEL,
@@ -167,7 +168,7 @@ def batch_add_matmul_backward_a(
     assert N == N2, f"Dimension mismatch: {N} != {N2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
-    _add_compute_to_batch(
+    _add_compute_to_batch_internal(
         pipeline_cache,
         batch_state,
         MATMUL_BACKWARD_A_KERNEL,
@@ -192,7 +193,7 @@ def batch_add_matmul_backward_b(
     assert M == M2, f"Dimension mismatch: {M} != {M2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
-    _add_compute_to_batch(
+    _add_compute_to_batch_internal(
         pipeline_cache,
         batch_state,
         MATMUL_BACKWARD_B_KERNEL,
@@ -223,7 +224,7 @@ def batch_add_layernorm_backward(
     batch_state.device.wgpu_device.queue.write_buffer(grad_beta.buffer, 0, zero_data)
 
     params = np.array([size, n_elements], dtype=np.uint32)
-    _add_compute_to_batch(
+    _add_compute_to_batch_internal(
         pipeline_cache,
         batch_state,
         LAYERNORM_BACKWARD_KERNEL,
@@ -244,7 +245,7 @@ def batch_add_gelu_backward(
     total_size = input_buf.size
 
     params = np.array([total_size], dtype=np.uint32)
-    _add_compute_to_batch(
+    _add_compute_to_batch_internal(
         pipeline_cache,
         batch_state,
         GELU_BACKWARD_KERNEL,
@@ -265,7 +266,7 @@ def batch_add_bias_backward(
     total_size = n_elements * dim
 
     params = np.array([total_size, dim], dtype=np.uint32)
-    _add_compute_to_batch(
+    _add_compute_to_batch_internal(
         pipeline_cache,
         batch_state,
         BIAS_BACKWARD_KERNEL,

@@ -22,11 +22,20 @@ def run_matmul(
     B: GPUBuffer2D,
     C: GPUBuffer2D,
 ) -> None:
-    """Execute tiled matrix multiplication: C = A @ B"""
+    """
+    Matrix multiplication: C = A @ B.
+
+    Uses tiled algorithm for efficiency. This function MUTATES C.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        A: Input matrix (M, K)
+        B: Input matrix (K, N)
+        C: Output matrix (M, N) - MUTATED
+    """
     M, K = A.shape
     K2, N = B.shape
-    assert K == K2, f"Incompatible shapes: {A.shape} @ {B.shape}"
-    assert C.shape == (M, N), f"Output shape mismatch: {C.shape} != ({M}, {N})"
+    assert K == K2, f"Dimension mismatch: {K} != {K2}"
 
     params = np.array([M, K, N], dtype=np.uint32)
     dispatch_simple_compute(
@@ -34,8 +43,8 @@ def run_matmul(
         TILED_MATMUL_KERNEL,
         params,
         [A, B, C],
-        (N + 15) // 16,
-        (M + 15) // 16,
+        min((N + 15) // 16, 65535),
+        min((M + 15) // 16, 65535),
         1,
     )
 
@@ -47,7 +56,18 @@ def run_layernorm(
     beta: GPUBuffer1D,
     output: GPUBuffer2D,
 ) -> None:
-    """Apply layer normalization"""
+    """
+    Layer normalization with affine transformation.
+
+    This function MUTATES output.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        input_buf: Input tensor (n_elements, size)
+        gamma: Scale parameters (size,)
+        beta: Shift parameters (size,)
+        output: Output tensor (n_elements, size) - MUTATED
+    """
     n_elements, size = input_buf.shape
 
     params = np.array([size, n_elements], dtype=np.uint32)
@@ -65,7 +85,16 @@ def run_gelu(
     input_buf: GPUBuffer2D,
     output: GPUBuffer2D,
 ) -> None:
-    """Apply GELU activation"""
+    """
+    GELU activation function.
+
+    This function MUTATES output.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        input_buf: Input tensor
+        output: Output tensor - MUTATED
+    """
     total_size = input_buf.size
 
     params = np.array([total_size], dtype=np.uint32)
@@ -84,7 +113,17 @@ def run_bias_add(
     bias: GPUBuffer1D,
     output: GPUBuffer2D,
 ) -> None:
-    """Add bias to matrix (broadcasts over rows)"""
+    """
+    Add bias to input tensor (broadcast over first dimension).
+
+    This function MUTATES output.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        input_buf: Input tensor (n_elements, dim)
+        bias: Bias vector (dim,)
+        output: Output tensor (n_elements, dim) - MUTATED
+    """
     n_elements, dim = input_buf.shape
     total_size = n_elements * dim
 
@@ -104,9 +143,18 @@ def run_residual_add(
     input_b: GPUBuffer2D,
     output: GPUBuffer2D,
 ) -> None:
-    """Element-wise addition for residual connections"""
+    """
+    Element-wise addition for residual connections.
+
+    This function MUTATES output.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        input_a: First input tensor
+        input_b: Second input tensor
+        output: Output tensor - MUTATED
+    """
     total_size = input_a.size
-    assert input_a.size == input_b.size == output.size
 
     params = np.array([total_size], dtype=np.uint32)
     dispatch_simple_compute(

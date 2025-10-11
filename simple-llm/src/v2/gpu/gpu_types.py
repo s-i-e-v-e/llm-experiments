@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Set, Tuple, Union
 # ============================================================================
 # Type aliases for WGPU objects to improve type safety
 # These represent opaque wgpu-py objects but provide better documentation
+# We use Any because wgpu-py doesn't export stable type stubs
 
 # WGPU device and adapter types
 WGPUDevice = Any  # wgpu.GPUDevice
@@ -32,6 +33,21 @@ class Device:
 
     wgpu_device: WGPUDevice  # The actual wgpu.Device object
     adapter: WGPUAdapter = None  # Optional adapter reference
+
+
+# ============================================================================
+# BIND GROUP HELPER TYPES
+# ============================================================================
+
+
+@dataclass
+class BindGroupEntry:
+    """Type-safe bind group entry specification"""
+
+    binding: int
+    buffer: WGPUBuffer
+    offset: int
+    size: int
 
 
 # ============================================================================
@@ -72,6 +88,67 @@ class GPUBuffer3D:
 
 # Union type for when we need to accept any buffer dimension
 GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
+
+
+# ============================================================================
+# BUFFER POOL TYPES
+# ============================================================================
+
+
+@dataclass
+class BufferInfo:
+    """Information about a pooled buffer"""
+
+    buffer: WGPUBuffer
+
+
+@dataclass
+class BufferPool:
+    """Memory pool state for reusable GPU buffers"""
+
+    device: Device
+    max_size: int
+    pools: Dict[int, List[BufferInfo]] = field(default_factory=dict)
+    in_use: Set[int] = field(default_factory=set)
+
+
+@dataclass
+class StagingPool:
+    """Staging buffer pool state for CPU-GPU transfers"""
+
+    device: Device
+    staging_buffers: Dict[int, WGPUBuffer] = field(default_factory=dict)
+    max_size: int = 0
+
+
+# ============================================================================
+# PIPELINE CACHE TYPES
+# ============================================================================
+
+
+@dataclass
+class PipelineCache:
+    """Cache for compiled GPU pipelines"""
+
+    device: Device
+    pipelines: Dict[str, WGPUComputePipeline] = field(default_factory=dict)
+    bind_groups: Dict[int, WGPUBindGroup] = field(default_factory=dict)
+
+
+# ============================================================================
+# BATCH OPERATION TYPES
+# ============================================================================
+
+
+@dataclass
+class BatchState:
+    """State for batched GPU operations"""
+
+    device: Device
+    encoder: WGPUCommandEncoder
+    retained_buffers: List[WGPUBuffer] = field(default_factory=list)
+    enable_profiling: bool = False
+    operation_count: int = 0
 
 
 # ============================================================================
@@ -118,39 +195,6 @@ class GPUOptimizerState:
 
 
 # ============================================================================
-# PERFORMANCE MONITORING TYPES
-# ============================================================================
-
-
-@dataclass
-class KernelTimeStats:
-    """Statistics for a single kernel's execution times"""
-
-    count: int
-    total_ms: float
-    avg_ms: float
-    min_ms: float
-    max_ms: float
-
-
-@dataclass
-class PerfStats:
-    """Performance statistics snapshot"""
-
-    total_submissions: int
-    kernel_times: Dict[str, KernelTimeStats]
-
-
-@dataclass
-class PerfMonitor:
-    """Performance monitoring state"""
-
-    kernel_times: Dict[str, List[float]] = field(default_factory=dict)
-    memory_usage: Dict[str, Any] = field(default_factory=dict)
-    submission_count: int = 0
-
-
-# ============================================================================
 # WORKSPACE MANAGEMENT TYPES
 # ============================================================================
 
@@ -192,68 +236,40 @@ class WorkspaceManager:
     """Workspace buffer manager state"""
 
     device: Device
-    buffer_pool: "BufferPool"  # forward reference
+    buffer_pool: BufferPool
     active_workspaces: Dict[Tuple[int, int], WorkspaceBuffers] = field(
         default_factory=dict
     )
 
 
 # ============================================================================
-# BATCH OPERATION TYPES
+# PERFORMANCE MONITORING TYPES
 # ============================================================================
 
 
 @dataclass
-class BatchState:
-    """State for batched GPU operations"""
+class KernelTimeStats:
+    """Statistics for a single kernel's execution times"""
 
-    device: Device
-    encoder: WGPUCommandEncoder
-    retained_buffers: List[WGPUBuffer] = field(default_factory=list)
-    enable_profiling: bool = False
-    operation_count: int = 0
-
-
-# ============================================================================
-# PIPELINE CACHE TYPES
-# ============================================================================
+    count: int
+    total_ms: float
+    avg_ms: float
+    min_ms: float
+    max_ms: float
 
 
 @dataclass
-class PipelineCache:
-    """Cache for compiled GPU pipelines"""
+class PerfStats:
+    """Performance statistics snapshot"""
 
-    device: Device
-    pipelines: Dict[str, WGPUComputePipeline] = field(default_factory=dict)
-    bind_groups: Dict[int, WGPUBindGroup] = field(default_factory=dict)
-
-
-# ============================================================================
-# BUFFER POOL TYPES
-# ============================================================================
+    total_submissions: int
+    kernel_times: Dict[str, KernelTimeStats]
 
 
 @dataclass
-class BufferInfo:
-    """Information about a pooled buffer"""
+class PerfMonitor:
+    """Performance monitoring state"""
 
-    buffer: WGPUBuffer
-
-
-@dataclass
-class BufferPool:
-    """Memory pool state for reusable GPU buffers"""
-
-    device: Device
-    max_size: int
-    pools: Dict[int, List[BufferInfo]] = field(default_factory=dict)
-    in_use: Set[int] = field(default_factory=set)
-
-
-@dataclass
-class StagingPool:
-    """Staging buffer pool state for CPU-GPU transfers"""
-
-    device: Device
-    staging_buffers: Dict[int, WGPUBuffer] = field(default_factory=dict)
-    max_size: int = 0
+    kernel_times: Dict[str, List[float]] = field(default_factory=dict)
+    memory_usage: Dict[str, Any] = field(default_factory=dict)
+    submission_count: int = 0
