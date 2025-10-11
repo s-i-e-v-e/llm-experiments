@@ -3,7 +3,7 @@
 from typing import Dict
 
 import numpy as np
-from gpu_buffer import create_gpu_buffer_1d, create_gpu_buffer_2d
+from gpu_buffer import clear_buffer, create_gpu_buffer_1d, create_gpu_buffer_2d
 from gpu_types import Device, GPULayerParams, GPUModelParams, GPUOptimizerState
 
 # ============================================================================
@@ -120,6 +120,7 @@ def create_optimizer_state(model_params: GPUModelParams) -> GPUOptimizerState:
     # Layer moments
     m_layers = []
     v_layers = []
+
     for layer in model_params.layers:
         dim = layer.attn_wq.shape[0]
 
@@ -127,7 +128,7 @@ def create_optimizer_state(model_params: GPUModelParams) -> GPUOptimizerState:
         m_layer = create_gpu_layer_params(device, dim)
         v_layer = create_gpu_layer_params(device, dim)
 
-        # Zero initialize all buffers
+        # Zero initialize all buffers using clear_buffer utility
         for attr in [
             "attn_wq",
             "attn_wk",
@@ -143,13 +144,10 @@ def create_optimizer_state(model_params: GPUModelParams) -> GPUOptimizerState:
             "ln_beta2",
         ]:
             buf = getattr(m_layer, attr)
-            device.wgpu_device.queue.write_buffer(
-                buf.buffer, 0, np.zeros(buf.size, dtype=np.float32)
-            )
+            clear_buffer(buf)
+
             buf = getattr(v_layer, attr)
-            device.wgpu_device.queue.write_buffer(
-                buf.buffer, 0, np.zeros(buf.size, dtype=np.float32)
-            )
+            clear_buffer(buf)
 
         m_layers.append(m_layer)
         v_layers.append(v_layer)

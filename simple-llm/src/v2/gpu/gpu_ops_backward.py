@@ -71,23 +71,35 @@ def run_layernorm_backward(
     grad_gamma: GPUBuffer1D,
     grad_beta: GPUBuffer1D,
 ) -> None:
-    """Backward pass for layer normalization"""
-    n_elements, size = input_buf.shape
+    """
+    Backward pass for layer normalization.
 
-    # Zero out gamma and beta gradients (kernel accumulates)
-    zero_data = np.zeros(grad_gamma.size, dtype=np.float32)
-    pipeline_cache.device.wgpu_device.queue.write_buffer(
-        grad_gamma.buffer, 0, zero_data
-    )
-    pipeline_cache.device.wgpu_device.queue.write_buffer(grad_beta.buffer, 0, zero_data)
+    IMPORTANT: grad_gamma and grad_beta MUST be pre-zeroed before calling
+    this function, as the kernel accumulates gradients.
 
-    params = np.array([size, n_elements], dtype=np.uint32)
+    Use clear_buffer() to zero them:
+        clear_buffer(grad_gamma)
+        clear_buffer(grad_beta)
+        run_layernorm_backward(...)
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        input_buf: Input from forward pass (nelements, size)
+        gamma: Scale parameters from forward pass
+        grad_output: Gradient of loss w.r.t. output
+        grad_input: Output gradient w.r.t. input
+        grad_gamma: Output gradient w.r.t. gamma (MUST BE PRE-ZEROED)
+        grad_beta: Output gradient w.r.t. beta (MUST BE PRE-ZEROED)
+    """
+    nelements, size = input_buf.shape
+    params = np.array([size, nelements], dtype=np.uint32)
+
     dispatch_simple_compute(
         pipeline_cache,
         LAYERNORM_BACKWARD_KERNEL,
         params,
         [input_buf, gamma, grad_output, grad_input, grad_gamma, grad_beta],
-        n_elements,
+        nelements,
     )
 
 

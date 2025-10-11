@@ -14,6 +14,8 @@ from gpu_types import (
     GPUBuffer2D,
     GPUBuffer3D,
     PipelineCache,
+    WGPUBindGroup,
+    WGPUBuffer,
 )
 
 GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
@@ -23,7 +25,9 @@ GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
 # ============================================================================
 
 
-def _create_uniform_buffer(pipeline_cache: PipelineCache, data: np.ndarray) -> object:
+def _create_uniform_buffer(
+    pipeline_cache: PipelineCache, data: np.ndarray
+) -> WGPUBuffer:
     """Helper: Create uniform buffer for parameters"""
     return pipeline_cache.device.wgpu_device.create_buffer_with_data(
         data=data, usage=wgpu.BufferUsage.UNIFORM
@@ -31,8 +35,8 @@ def _create_uniform_buffer(pipeline_cache: PipelineCache, data: np.ndarray) -> o
 
 
 def _create_bind_group(
-    pipeline_cache: PipelineCache, pipeline: object, entries: list[BindGroupEntry]
-) -> object:
+    pipeline_cache: PipelineCache, pipeline: object, entries: List[BindGroupEntry]
+) -> WGPUBindGroup:
     """Helper: Create bind group using type-safe entries"""
     return pipeline_cache.device.wgpu_device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),

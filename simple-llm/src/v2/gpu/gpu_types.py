@@ -3,25 +3,48 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set, Tuple, Union
 
+# ============================================================================
+# WGPU TYPE ALIASES
+# ============================================================================
+# Type aliases for WGPU objects to improve type safety
+# These represent opaque wgpu-py objects but provide better documentation
+
+# WGPU device and adapter types
+WGPUDevice = Any  # wgpu.GPUDevice
+WGPUAdapter = Any  # wgpu.GPUAdapter
+
+# WGPU buffer and command types
+WGPUBuffer = Any  # wgpu.GPUBuffer
+WGPUCommandEncoder = Any  # wgpu.GPUCommandEncoder
+WGPUBindGroup = Any  # wgpu.GPUBindGroup
+WGPUComputePipeline = Any  # wgpu.GPUComputePipeline
+WGPUShaderModule = Any  # wgpu.GPUShaderModule
+
+
+# ============================================================================
+# DEVICE TYPES
+# ============================================================================
+
 
 @dataclass
 class Device:
     """GPU device wrapper"""
 
-    wgpu_device: object  # The actual wgpu.Device object
-    adapter: object = None  # Optional adapter reference
+    wgpu_device: WGPUDevice  # The actual wgpu.Device object
+    adapter: WGPUAdapter = None  # Optional adapter reference
 
 
+# ============================================================================
+# GPU BUFFER TYPES
 # ============================================================================
 # Dimension-specific GPU Buffer Types
-# ============================================================================
 
 
 @dataclass
 class GPUBuffer1D:
     """1D GPU buffer - for vectors like biases, layer norm params"""
 
-    buffer: object
+    buffer: WGPUBuffer
     shape: Tuple[int]
     size: int
     device: Device
@@ -31,7 +54,7 @@ class GPUBuffer1D:
 class GPUBuffer2D:
     """2D GPU buffer - for matrices like weight matrices"""
 
-    buffer: object
+    buffer: WGPUBuffer
     shape: Tuple[int, int]
     size: int
     device: Device
@@ -41,7 +64,7 @@ class GPUBuffer2D:
 class GPUBuffer3D:
     """3D GPU buffer - for batched sequences (batch, seq, dim)"""
 
-    buffer: object
+    buffer: WGPUBuffer
     shape: Tuple[int, int, int]
     size: int
     device: Device
@@ -52,7 +75,7 @@ GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
 
 
 # ============================================================================
-# Model Parameter Types
+# MODEL PARAMETER TYPES
 # ============================================================================
 
 
@@ -87,15 +110,15 @@ class GPUModelParams:
 class GPUOptimizerState:
     """Optimizer state for AdamW"""
 
-    m_embedding: GPUBuffer2D
-    v_embedding: GPUBuffer2D
-    m_layers: List[GPULayerParams]  # momentum
-    v_layers: List[GPULayerParams]  # variance
+    m_embedding: GPUBuffer2D  # momentum
+    v_embedding: GPUBuffer2D  # variance
+    m_layers: List[GPULayerParams]
+    v_layers: List[GPULayerParams]
     step: int
 
 
 # ============================================================================
-# Performance Monitoring Types
+# PERFORMANCE MONITORING TYPES
 # ============================================================================
 
 
@@ -128,7 +151,7 @@ class PerfMonitor:
 
 
 # ============================================================================
-# Workspace Management Types
+# WORKSPACE MANAGEMENT TYPES
 # ============================================================================
 
 
@@ -136,7 +159,7 @@ class PerfMonitor:
 class WorkspaceBuffers:
     """Typed workspace buffers for a specific batch/sequence size"""
 
-    # Forward pass buffers - 3D tensors (batch*seq, dim) treated as 2D
+    # Forward pass buffers - 3D tensors [batch*seq, dim] treated as 2D
     x_buffer_a: GPUBuffer2D
     x_buffer_b: GPUBuffer2D
     x_norm1: GPUBuffer2D
@@ -176,7 +199,7 @@ class WorkspaceManager:
 
 
 # ============================================================================
-# Batch Operation Types
+# BATCH OPERATION TYPES
 # ============================================================================
 
 
@@ -185,14 +208,28 @@ class BatchState:
     """State for batched GPU operations"""
 
     device: Device
-    encoder: object
-    retained_buffers: List[object] = field(default_factory=list)
+    encoder: WGPUCommandEncoder
+    retained_buffers: List[WGPUBuffer] = field(default_factory=list)
     enable_profiling: bool = False
     operation_count: int = 0
 
 
 # ============================================================================
-# Buffer Pool Types
+# PIPELINE CACHE TYPES
+# ============================================================================
+
+
+@dataclass
+class PipelineCache:
+    """Cache for compiled GPU pipelines"""
+
+    device: Device
+    pipelines: Dict[str, WGPUComputePipeline] = field(default_factory=dict)
+    bind_groups: Dict[int, WGPUBindGroup] = field(default_factory=dict)
+
+
+# ============================================================================
+# BUFFER POOL TYPES
 # ============================================================================
 
 
@@ -200,7 +237,7 @@ class BatchState:
 class BufferInfo:
     """Information about a pooled buffer"""
 
-    buffer: object
+    buffer: WGPUBuffer
 
 
 @dataclass
@@ -215,33 +252,8 @@ class BufferPool:
 
 @dataclass
 class StagingPool:
-    """Staging buffer pool state for CPU<->GPU transfers"""
+    """Staging buffer pool state for CPU-GPU transfers"""
 
     device: Device
-    staging_buffers: Dict[int, object] = field(default_factory=dict)
+    staging_buffers: Dict[int, WGPUBuffer] = field(default_factory=dict)
     max_size: int = 0
-
-
-# ============================================================================
-# Pipeline Cache Types (add to existing file)
-# ============================================================================
-
-
-@dataclass
-class BindGroupEntry:
-    """Entry for bind group creation"""
-
-    binding: int
-    buffer: object
-    offset: int
-    size: int
-
-
-@dataclass
-class PipelineCache:
-    """Cache for compiled GPU pipelines"""
-
-    device: object
-    pipelines: Dict[str, object] = field(default_factory=dict)
-    bind_groups: Dict[int, object] = field(default_factory=dict)
-    bind_group_counter: int = 0

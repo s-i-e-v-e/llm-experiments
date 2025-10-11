@@ -2,9 +2,12 @@ I want to refactor some source code. Let me know if you understand my instructio
 
 # PREFERRED CODE STYLE
 
-I prefer pure data classes + functions operating on that data. No object-oriented stuff. No opaque dictionaries.
-
-All functions should have typing information.
+- I prefer pure data classes + functions operating on that data.
+- No object-oriented stuff.
+- No opaque dictionaries.
+- No global variables. All resources/stat must be explicitly passed as parameters.
+- All functions should have typing information.
+- Sometimes, state is mutable for performance reasons. Any such state variables passed in as parameters must not be returned from the function.
 
 # REFACTORING
 

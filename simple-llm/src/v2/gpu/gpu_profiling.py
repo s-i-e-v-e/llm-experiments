@@ -2,6 +2,10 @@
 
 from gpu_types import KernelTimeStats, PerfMonitor, PerfStats
 
+# ============================================================================
+# MONITOR MANAGEMENT
+# ============================================================================
+
 
 def create_perf_monitor() -> PerfMonitor:
     """Create performance monitor state"""

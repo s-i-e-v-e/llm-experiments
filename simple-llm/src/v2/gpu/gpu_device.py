@@ -3,7 +3,12 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from gpu_types import Device, PipelineCache
+from gpu_types import (
+    Device,
+    PipelineCache,
+    WGPUBuffer,
+    WGPUComputePipeline,
+)
 
 try:
     import wgpu
@@ -15,7 +20,7 @@ except ImportError:
 
 
 # ============================================================================
-# Bind Group Helper Types
+# BIND GROUP HELPERS
 # ============================================================================
 
 
@@ -24,7 +29,7 @@ class BindGroupEntry:
     """Type-safe bind group entry specification"""
 
     binding: int
-    buffer: object
+    buffer: WGPUBuffer
     offset: int
     size: int
 
@@ -53,7 +58,7 @@ def create_bind_group_entries(entries: List[BindGroupEntry]) -> List[Dict]:
 
 
 # ============================================================================
-# Device Management
+# DEVICE MANAGEMENT
 # ============================================================================
 
 
@@ -65,10 +70,10 @@ def create_device() -> Optional[Device]:
     try:
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
         wgpu_device = adapter.request_device_sync()
-        print("✅ WGPU device initialized")
+        print("WGPU device initialized")
         return Device(wgpu_device=wgpu_device, adapter=adapter)
     except Exception as e:
-        print(f"⚠️ WGPU initialization failed: {e}")
+        print(f"WGPU initialization failed: {e}")
         return None
 
 
@@ -113,12 +118,11 @@ def select_optimal_tile_size(
 
     # Filter by memory constraints
     valid_sizes = [s for s in candidate_sizes if s <= max_tile_from_memory]
-
     if not valid_sizes:
         return 8
 
     # Prefer 16 for most cases, 32 for large matrices
-    if max(M, N, K) > 2048 and 32 in valid_sizes:
+    if max(M, N, K) >= 2048 and 32 in valid_sizes:
         return 32
     elif 16 in valid_sizes:
         return 16
@@ -130,19 +134,21 @@ def create_tuned_pipeline(
     pipeline_cache: PipelineCache,
     kernel_code: str,
     tune_params: Optional[Dict[str, int]] = None,
-) -> object:
+) -> WGPUComputePipeline:
     """Create pipeline with device-specific tuning"""
     limits = query_device_limits(pipeline_cache.device)
 
     # Apply tuning if provided
     if tune_params:
         for key, value in tune_params.items():
-            kernel_code = kernel_code.replace(f"${key}$", str(value))
+            kernel_code = kernel_code.replace(f"{key}", str(value))
 
     return get_or_create_pipeline(pipeline_cache, kernel_code)
 
 
-def get_or_create_pipeline(pipeline_cache: PipelineCache, shader_code: str) -> object:
+def get_or_create_pipeline(
+    pipeline_cache: PipelineCache, shader_code: str
+) -> WGPUComputePipeline:
     """Cache compute pipelines to avoid recompilation"""
     device = pipeline_cache.device
     cache_key = (id(device.wgpu_device), hash(shader_code))
@@ -150,7 +156,8 @@ def get_or_create_pipeline(pipeline_cache: PipelineCache, shader_code: str) -> o
     if cache_key not in pipeline_cache.pipelines:
         shader_module = device.wgpu_device.create_shader_module(code=shader_code)
         pipeline = device.wgpu_device.create_compute_pipeline(
-            layout="auto", compute={"module": shader_module, "entry_point": "main"}
+            layout="auto",
+            compute={"module": shader_module, "entry_point": "main"},
         )
         pipeline_cache.pipelines[cache_key] = pipeline
 
