@@ -1,17 +1,17 @@
 """Test GPU operations"""
 
 import numpy as np
-from gpu_buffer import create_gpu_buffer_1d, create_gpu_buffer_2d, gpu_to_numpy
-from gpu_device import create_device, create_pipeline_cache
-from gpu_operations import run_layernorm, run_matmul
-from gpu_types import Device
+
+from .gpu_buffer import create_gpu_buffer_1d, create_gpu_buffer_2d, gpu_to_numpy
+from .gpu_device import create_device, create_pipeline_cache
+from .gpu_operations import run_layernorm, run_matmul
 
 # ============================================================================
 # TEST FUNCTIONS
 # ============================================================================
 
 
-def test_matmul(device: Device) -> bool:
+def test_matmul(device: GPUDevice) -> bool:
     """Test matrix multiplication"""
     print("Testing tiled matmul...")
     M, K, N = 64, 128, 64
@@ -39,7 +39,7 @@ def test_matmul(device: Device) -> bool:
         return False
 
 
-def test_layernorm(device: Device) -> bool:
+def test_layernorm(device: GPUDevice) -> bool:
     """Test layer normalization"""
     print("\nTesting layer normalization...")
     batch, dim = 32, 128

@@ -1,26 +1,27 @@
 """Kernel dispatches"""
 
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
-from gpu_device import (
-    get_or_create_pipeline,
+
+from .gpu_device import (
+    pipeline_get_or_create,
     wgpu,
 )
-from gpu_types import (
+from .gpu_kernels import get_transpose_kernel
+from .gpu_types import (
     BatchState,
     BindGroupEntry,
-    Device,
+    GPUBindGroup,
+    GPUBuffer,
     GPUBuffer1D,
     GPUBuffer2D,
     GPUBufferAny,
+    GPUComputePipeline,
+    GPUConfig,
+    GPUDevice,
     PipelineCache,
-    WGPUBindGroup,
-    WGPUBuffer,
-    WGPUComputePipeline,
 )
-
-from .gpu_kernels import get_transpose_kernel
 
 # ============================================================================
 # VALIDATION
@@ -31,8 +32,6 @@ def validate_buffer_shape_1d(
     buffer: GPUBuffer1D, expected_size: int, name: str
 ) -> None:
     """Validate 1D buffer has expected size.
-
-    This function does NOT mutate buffer.
 
     Args:
         buffer: Buffer to validate
@@ -56,8 +55,6 @@ def validate_buffer_shape_2d(
 ) -> None:
     """Validate 2D buffer has expected shape.
 
-    This function does NOT mutate buffer.
-
     Args:
         buffer: Buffer to validate
         expected_shape: Expected (rows, cols)
@@ -79,8 +76,6 @@ def validate_matmul_shapes(
     A: GPUBuffer2D, B: GPUBuffer2D, C: GPUBuffer2D, operation: str
 ) -> Tuple[int, int, int]:
     """Validate shapes for matrix multiplication operations.
-
-    This function does NOT mutate any buffers.
 
     Args:
         A: First input matrix
@@ -122,8 +117,6 @@ def validate_optimizer_buffers(
 ) -> int:
     """Validate optimizer buffer shapes and step.
 
-    This function does NOT mutate any buffers.
-
     Args:
         gradients: Gradient buffer
         weights: Weight buffer
@@ -159,8 +152,6 @@ def validate_optimizer_buffers(
 def create_bind_group_entries(entries: List[BindGroupEntry]) -> List[Dict]:
     """Convert typed BindGroupEntry list to wgpu bind group entry format.
 
-    This function does NOT mutate entries - it creates new dictionaries.
-
     Args:
         entries: List of BindGroupEntry specifications
 
@@ -180,12 +171,13 @@ def create_bind_group_entries(entries: List[BindGroupEntry]) -> List[Dict]:
     ]
 
 
-def _create_uniform_buffer_internal(
-    pipeline_cache: PipelineCache, data: np.ndarray
-) -> WGPUBuffer:
+def INTERNAL__create_uniform_buffer_(
+    device: GPUDevice,
+    config: GPUConfig,
+    pipeline_cache: PipelineCache,
+    data: np.ndarray,
+) -> GPUBuffer:
     """Internal: Create uniform buffer for parameters.
-
-    This function does NOT mutate pipeline_cache or data.
 
     Memory management: Buffer is automatically freed by WGPU after GPU finishes
     using it (typically after queue submission completes). No explicit cleanup needed.
@@ -197,19 +189,17 @@ def _create_uniform_buffer_internal(
     Returns:
         New WGPU uniform buffer
     """
-    return pipeline_cache.device.wgpu_device.create_buffer_with_data(
-        data=data, usage=wgpu.BufferUsage.UNIFORM
-    )
+    return device.create_buffer_with_data(data=data, usage=wgpu.BufferUsage.UNIFORM)
 
 
-def _create_bind_group_internal(
+def INTERNAL__create_bind_group_internal(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
-    pipeline: WGPUComputePipeline,
+    pipeline: GPUComputePipeline,
     entries: List[BindGroupEntry],
-) -> WGPUBindGroup:
+) -> GPUBindGroup:
     """Internal: Create bind group using type-safe entries.
-
-    This function does NOT mutate any inputs.
 
     Args:
         pipeline_cache: Pipeline cache state
@@ -219,16 +209,17 @@ def _create_bind_group_internal(
     Returns:
         New WGPU bind group
     """
-    return pipeline_cache.device.wgpu_device.create_bind_group(
+    return device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=create_bind_group_entries(entries),
     )
 
 
-def _dispatch_compute_internal(
-    pipeline_cache: PipelineCache,
-    pipeline: WGPUComputePipeline,
-    bind_group: WGPUBindGroup,
+def dispatch_compute(
+    device: GPUDevice,
+    config: GPUConfig,
+    pipeline: GPUComputePipeline,
+    bind_group: GPUBindGroup,
     workgroups_x: int,
     workgroups_y: int = 1,
     workgroups_z: int = 1,
@@ -238,30 +229,27 @@ def _dispatch_compute_internal(
     Uiform buffers created in this function are automatically freed
     by WGPU after the queue submission completes. No explicit cleanup needed.
 
-    This function does NOT mutate pipeline_cache.
-
     Args:
-        pipeline_cache: Pipeline cache state
         pipeline: Compute pipeline
         bind_group: Bind group
         workgroups_x: Number of workgroups in X
         workgroups_y: Number of workgroups in Y
         workgroups_z: Number of workgroups in Z
     """
-    encoder = pipeline_cache.device.wgpu_device.create_command_encoder()
+    encoder = device.create_command_encoder()
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bind_group)
     compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, workgroups_z)
     compute_pass.end()
-    pipeline_cache.device.wgpu_device.queue.submit([encoder.finish()])
+    device.queue.submit([encoder.finish()])
 
 
-def create_command_batch(device: Device, enable_profiling: bool = False) -> BatchState:
+def create_command_batch(
+    device: GPUDevice, config: GPUConfig, enable_profiling: bool = False
+) -> BatchState:
     """
     Create command batch state for batched GPU operations
-
-    This function does NOT mutate device.
 
     Memory management: Uniform buffers created during batch operations are retained
     in batch_state.retained_buffers to keep them alive until submit_batch is called.
@@ -276,10 +264,9 @@ def create_command_batch(device: Device, enable_profiling: bool = False) -> Batc
     Raises:
         RuntimeError: If device not initialized or batch limit exceeded
     """
-    encoder = device.wgpu_device.create_command_encoder()
+    encoder = device.create_command_encoder()
 
     return BatchState(
-        device=device,
         encoder=encoder,
         retained_buffers=[],
         enable_profiling=enable_profiling,
@@ -287,38 +274,34 @@ def create_command_batch(device: Device, enable_profiling: bool = False) -> Batc
     )
 
 
-def _create_and_retain_uniform_buffer_internal(
-    batch_state: BatchState, data: np.ndarray
-) -> WGPUBuffer:
-    """Internal: Create uniform buffer and add to retained list (mutation).
-
-    This function MUTATES batch_state.retained_buffers by appending the new buffer.
+def INTERNAL__create_and_retain_uniform_buffer_internal(
+    device: GPUDevice, config: GPUConfig, batch_state: BatchState, data: np.ndarray
+) -> GPUBuffer:
+    """Internal: Create uniform buffer and add to retained list.
 
     Memory management: Buffer is kept alive by batch_state.retained_buffers
     until submit_batch() is called.
 
     Args:
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         data: Numpy array of data
 
     Returns:
         New WGPU uniform buffer
     """
-    buffer = batch_state.device.wgpu_device.create_buffer_with_data(
-        data=data, usage=wgpu.BufferUsage.UNIFORM
-    )
+    buffer = device.create_buffer_with_data(data=data, usage=wgpu.BufferUsage.UNIFORM)
     batch_state.retained_buffers.append(buffer)
     return buffer
 
 
-def _create_bind_group_for_batch_internal(
+def INTERNAL__create_bind_group_for_batch_internal(
+    device: GPUDevice,
+    config: GPUConfig,
     batch_state: BatchState,
-    pipeline: WGPUComputePipeline,
+    pipeline: GPUComputePipeline,
     entries: List[BindGroupEntry],
-) -> WGPUBindGroup:
+) -> GPUBindGroup:
     """Internal: Create bind group using type-safe entries.
-
-    This function does NOT mutate batch_state.
 
     Args:
         batch_state: Batch state
@@ -328,14 +311,16 @@ def _create_bind_group_for_batch_internal(
     Returns:
         New WGPU bind group
     """
-    return batch_state.device.wgpu_device.create_bind_group(
+    return device.create_bind_group(
         layout=pipeline.get_bind_group_layout(0),
         entries=create_bind_group_entries(entries),
     )
 
 
-def _add_compute_to_batch_internal(
-    pipelinecache: PipelineCache,
+def add_compute_to_batch(
+    device: GPUDevice,
+    config: GPUConfig,
+    pipeline_cache: PipelineCache,
     batch_state: BatchState,
     kernel_code: str,
     params: np.ndarray,
@@ -345,13 +330,11 @@ def _add_compute_to_batch_internal(
     workgroups_z: int = 1,
 ) -> None:
     """
-    Internal: Add compute operation to batch encoder (mutation)
-
-    This function MUTATES batch_state by adding operation and retaining uniform buffer.
+    Internal: Add compute operation to batch encoder.
 
     Args:
-        pipelinecache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state
         kernel_code: WGSL kernel source
         params: Parameter array
         buffers: GPU buffers to bind
@@ -363,7 +346,7 @@ def _add_compute_to_batch_internal(
         RuntimeError: If batch operation limit exceeded
     """
     # Check batch operation limit from config
-    max_ops = batch_state.device.config.max_batch_operations
+    max_ops = config.max_batch_operations
 
     if batch_state.operation_count >= max_ops:
         raise RuntimeError(
@@ -372,7 +355,7 @@ def _add_compute_to_batch_internal(
         )
 
     # Validate workgroup counts
-    max_workgroups = batch_state.device.config.max_workgroups_per_dim
+    max_workgroups = config.max_workgroups_per_dim
 
     if (
         workgroups_x > max_workgroups
@@ -384,8 +367,10 @@ def _add_compute_to_batch_internal(
             f"exceed maximum ({max_workgroups})"
         )
 
-    params_buffer = _create_and_retain_uniform_buffer_internal(batch_state, params)
-    pipeline = get_or_create_pipeline(pipelinecache, kernel_code)
+    params_buffer = INTERNAL__create_and_retain_uniform_buffer_internal(
+        device, config, batch_state, params
+    )
+    pipeline = pipeline_get_or_create(device, pipeline_cache, kernel_code)
 
     # Build bind group entries
     entries = [BindGroupEntry(0, params_buffer, 0, params.nbytes)]
@@ -393,8 +378,11 @@ def _add_compute_to_batch_internal(
         binding_index = i + 1
         entries.append(BindGroupEntry(binding_index, buf.buffer, 0, buf.size * 4))
 
-    bindgroup = _create_bind_group_for_batch_internal(batch_state, pipeline, entries)
+    bindgroup = INTERNAL__create_bind_group_for_batch_internal(
+        device, config, batch_state, pipeline, entries
+    )
 
+    assert batch_state.encoder is not None
     compute_pass = batch_state.encoder.begin_compute_pass()
     compute_pass.set_pipeline(pipeline)
     compute_pass.set_bind_group(0, bindgroup)
@@ -404,19 +392,11 @@ def _add_compute_to_batch_internal(
     batch_state.operation_count += 1
 
 
-# ============================================================================
-# BATCH SUBMISSION
-# ============================================================================
-
-
-def submit_batch(batch_state: BatchState) -> None:
-    """Submit all batched operations (mutation).
-
-    This function MUTATES batch_state by clearing encoder and retained buffers.
-    Returns None to signal mutation.
+def submit_batch(device: GPUDevice, batch_state: BatchState) -> None:
+    """Submit all batched operations.
 
     Args:
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
 
     Raises:
         RuntimeError: If batch already submitted or not initialized
@@ -425,32 +405,9 @@ def submit_batch(batch_state: BatchState) -> None:
         raise RuntimeError("Batch already submitted or not initialized")
 
     command_buffer = batch_state.encoder.finish()
-    batch_state.device.wgpu_device.queue.submit([command_buffer])
+    device.queue.submit([command_buffer])
 
-    # Clear encoder and buffers
-    batch_state.encoder = None
-    batch_state.retained_buffers.clear()
-
-
-def submit_batch(batch_state: BatchState) -> None:
-    """Submit all batched operations (mutation).
-
-    This function MUTATES batch_state by submitting and clearing the encoder.
-    Returns None to signal mutation.
-
-    Args:
-        batch_state: Batch state (MUTATED)
-
-    Raises:
-        RuntimeError: If batch not initialized or already submitted
-    """
-    if batch_state.encoder is None:
-        raise RuntimeError("Batch already submitted or not initialized")
-
-    command_buffer = batch_state.encoder.finish()
-    batch_state.device.wgpu_device.queue.submit([command_buffer])
-
-    # Clear encoder to prevent reuse (mutation)
+    # Clear encoder and buffers to prevent reuse
     batch_state.encoder = None
     batch_state.retained_buffers.clear()
 
@@ -458,16 +415,11 @@ def submit_batch(batch_state: BatchState) -> None:
 # ============================================================================
 # COMMON OPERATIONS
 # ============================================================================
-def batch_add_copy(
-    batch_state: BatchState, source: GPUBuffer2D, dest: GPUBuffer2D
-) -> None:
-    """Add buffer copy operation to batch (mutation).
-
-    This function MUTATES batch_state by adding an operation.
-    Returns None to signal mutation.
+def add_copy(batch_state: BatchState, source: GPUBuffer2D, dest: GPUBuffer2D) -> None:
+    """Add buffer copy operation.
 
     Args:
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         source: Source buffer
         dest: Destination buffer
 
@@ -488,6 +440,8 @@ def batch_add_copy(
 
 
 def transpose(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     input_buf: GPUBuffer2D,
@@ -499,9 +453,9 @@ def transpose(
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         input_buf: Input matrix [rows, cols]
-        output: Output matrix [cols, rows] (MUTATED)
+        output: Output matrix [cols, rows]
 
     Raises:
         ValueError: If buffer shapes incompatible for transpose
@@ -517,7 +471,6 @@ def transpose(
             f"input shape ({cols}, {rows})"
         )
 
-    config = pipeline_cache.device.config
     tile_size = config.matmul_tile_size  # Reuse matmul tile size
 
     params = np.array([rows, cols], dtype=np.uint32)
@@ -525,7 +478,9 @@ def transpose(
     workgroups_x = (cols + tile_size - 1) // tile_size
     workgroups_y = (rows + tile_size - 1) // tile_size
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_transpose_kernel(config),

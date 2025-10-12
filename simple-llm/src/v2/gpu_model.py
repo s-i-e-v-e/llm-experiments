@@ -3,32 +3,17 @@
 from typing import Dict
 
 import numpy as np
-from gpu_buffer import clear_buffer, create_gpu_buffer_1d, create_gpu_buffer_2d
-from gpu_types import Device, GPULayerParams, GPUModelParams, GPUOptimizerState
+
+from .gpu_buffer import clear_buffer, create_gpu_buffer_1d, create_gpu_buffer_2d
+from .gpu_types import Device, GPULayerParams, GPUModelParams, GPUOptimizerState
 
 # ============================================================================
 # POSITIONAL ENCODING
 # ============================================================================
 
 
-@dataclass
-class GPUModelParams:
-    """
-    Complete model parameters
-
-    This dataclass is immutable - do not modify fields after creation.
-    The underlying GPU buffer contents may be mutated by training operations.
-    """
-
-    embedding: GPUBuffer2D  # (vocab_size, embedding_dim)
-    pos_encoding: GPUBuffer2D  # (context_size, embedding_dim)
-    layers: List[GPULayerParams]
-
-
 def positional_encoding(seq_len: int, dim: int) -> np.ndarray:
     """Generate sinusoidal positional encoding.
-
-    This is a pure function - does not mutate any state.
 
     Uses sine for even indices and cosine for odd indices,
     following the Transformer paper (Vaswani et al. 2017).
@@ -63,10 +48,8 @@ def positional_encoding(seq_len: int, dim: int) -> np.ndarray:
 # ============================================================================
 
 
-def create_gpu_layer_params(device: Device, embedding_dim: int) -> GPULayerParams:
+def create_gpu_layer_params(device: GPUDevice, embedding_dim: int) -> GPULayerParams:
     """Initialize GPU layer parameters with random weights.
-
-    This function does NOT mutate device.
 
     Creates attention and feedforward weights with normal initialization
     (std=0.02), and layer norm parameters (gamma=1, beta=0).
@@ -123,15 +106,13 @@ def create_gpu_layer_params(device: Device, embedding_dim: int) -> GPULayerParam
 
 
 def create_gpu_model_params(
-    device: Device,
+    device: GPUDevice,
     vocab_size: int,
     embedding_dim: int,
     context_size: int,
     n_layers: int,
 ) -> GPUModelParams:
     """Initialize complete GPU model with random weights.
-
-    This function does NOT mutate device.
 
     Args:
         device: GPU device state
@@ -177,8 +158,6 @@ def create_gpu_model_params(
 
 def create_optimizer_state(model_params: GPUModelParams) -> GPUOptimizerState:
     """Initialize optimizer state with zero moments.
-
-    This function does NOT mutate model_params.
 
     Creates momentum (m) and variance (v) buffers for AdamW,
     all initialized to zero.
@@ -229,8 +208,8 @@ def create_optimizer_state(model_params: GPUModelParams) -> GPUOptimizerState:
             "ln_gamma2",
             "ln_beta2",
         ]:
-            clear_buffer(getattr(m_layer, attr))
-            clear_buffer(getattr(v_layer, attr))
+            clear_buffer(device, getattr(m_layer, attr))
+            clear_buffer(device, getattr(v_layer, attr))
 
         m_layers.append(m_layer)
         v_layers.append(v_layer)
@@ -251,8 +230,6 @@ def create_optimizer_state(model_params: GPUModelParams) -> GPUOptimizerState:
 
 def gpu_layer_to_dict(layer: GPULayerParams) -> Dict[str, np.ndarray]:
     """Convert GPU layer to dictionary for serialization.
-
-    This function does NOT mutate layer.
 
     Args:
         layer: GPU layer parameters
@@ -282,8 +259,6 @@ def dict_to_gpu_layer(
     device: Device, data: Dict[str, np.ndarray], embedding_dim: int
 ) -> GPULayerParams:
     """Create GPU layer from dictionary.
-
-    This function does NOT mutate device or data.
 
     Args:
         device: GPU device state

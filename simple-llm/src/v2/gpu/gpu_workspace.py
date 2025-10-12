@@ -15,12 +15,13 @@ MEMORY MANAGEMENT:
 """
 
 from dataclasses import fields
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
-from gpu_buffer import pool_release_buffer, pool_take_buffer_2d
-from gpu_types import (
+from .gpu_buffer import pool_release_buffer, pool_take_buffer_2d
+from .gpu_types import (
     BufferPool,
-    Device,
+    GPUConfig,
+    GPUDevice,
     GPUModelParams,
     WorkspaceBuffers,
     WorkspaceManager,
@@ -31,9 +32,7 @@ from gpu_types import (
 # ============================================================================
 
 
-def workspace_manager_create(
-    device: Device, buffer_pool: BufferPool
-) -> WorkspaceManager:
+def workspace_manager_create(buffer_pool: BufferPool) -> WorkspaceManager:
     """Create workspace manager state.
 
     Args:
@@ -43,25 +42,23 @@ def workspace_manager_create(
     Returns:
         New workspace manager with empty workspace cache
     """
-    return WorkspaceManager(device=device, buffer_pool=buffer_pool)
+    return WorkspaceManager(buffer_pool=buffer_pool)
 
 
 def workspace_get_or_create(
+    device: GPUDevice,
     manager: WorkspaceManager,
     model_params: GPUModelParams,
     batch_size: int,
     seq_len: int,
 ) -> WorkspaceBuffers:
-    """Get existing workspace or create new one (mutation).
-
-    This function MUTATES manager.active_workspaces if workspace doesn't exist.
-    Returns workspace buffers for use in forward/backward passes.
+    """Get existing workspace or create new one.
 
     This is the preferred API for workspace access - combines allocation
     and retrieval into a single call.
 
     Args:
-        manager: Workspace manager state (MUTATED if workspace doesn't exist)
+        manager: Workspace manager state
         model_params: Model parameters (for determining buffer sizes)
         batch_size: Batch size for this workspace
         seq_len: Sequence length for this workspace
@@ -97,29 +94,35 @@ def workspace_get_or_create(
 
     try:
         workspace = WorkspaceBuffers(
-            x_buffer_a=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            x_buffer_b=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            x_norm1=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            x_norm2=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            Q=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            K=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            V=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            attn_out_pre=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            attn_out=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            x_with_attn=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            hidden=pool_take_buffer_2d(pool, total_tokens, 4 * embedding_dim),
-            hidden_bias=pool_take_buffer_2d(pool, total_tokens, 4 * embedding_dim),
-            hidden_gelu=pool_take_buffer_2d(pool, total_tokens, 4 * embedding_dim),
-            ffn_out=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            ffn_out_bias=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            logits=pool_take_buffer_2d(pool, total_tokens, vocab_size),
-            grad_logits=pool_take_buffer_2d(pool, total_tokens, vocab_size),
-            grad_embedding=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            grad_x=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            grad_attn=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            grad_ffn=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            grad_ln1=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
-            grad_ln2=pool_take_buffer_2d(pool, total_tokens, embedding_dim),
+            x_buffer_a=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            x_buffer_b=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            x_norm1=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            x_norm2=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            Q=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            K=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            V=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            attn_out_pre=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            attn_out=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            x_with_attn=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            hidden=pool_take_buffer_2d(device, pool, total_tokens, 4 * embedding_dim),
+            hidden_bias=pool_take_buffer_2d(
+                device, pool, total_tokens, 4 * embedding_dim
+            ),
+            hidden_gelu=pool_take_buffer_2d(
+                device, pool, total_tokens, 4 * embedding_dim
+            ),
+            ffn_out=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            ffn_out_bias=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            logits=pool_take_buffer_2d(device, pool, total_tokens, vocab_size),
+            grad_logits=pool_take_buffer_2d(device, pool, total_tokens, vocab_size),
+            grad_embedding=pool_take_buffer_2d(
+                device, pool, total_tokens, embedding_dim
+            ),
+            grad_x=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            grad_attn=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            grad_ffn=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            grad_ln1=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
+            grad_ln2=pool_take_buffer_2d(device, pool, total_tokens, embedding_dim),
         )
     except (ValueError, MemoryError) as e:
         # If allocation fails, ensure we don't have a partial workspace
@@ -127,19 +130,15 @@ def workspace_get_or_create(
             f"Failed to allocate workspace for batch_size={batch_size}, seq_len={seq_len}: {e}"
         ) from e
 
-    # Store in manager (mutation)
     manager.active_workspaces[key] = workspace
     return workspace
 
 
 def workspace_release(manager: WorkspaceManager, batch_size: int, seq_len: int) -> None:
-    """Return workspace buffers to pool (mutation).
-
-    This function MUTATES manager.active_workspaces by removing the workspace
-    and returning all buffers to the pool. Returns None to signal mutation.
+    """Return workspace buffers to pool.
 
     Args:
-        manager: Workspace manager state (MUTATED)
+        manager: Workspace manager state
         batch_size: Batch size for workspace to release
         seq_len: Sequence length for workspace to release
     """
@@ -156,32 +155,29 @@ def workspace_release(manager: WorkspaceManager, batch_size: int, seq_len: int) 
 def workspace_all_release(manager: WorkspaceManager) -> None:
     """Release all workspaces.
 
-    This function MUTATES manager.active_workspaces by removing all workspaces
-    and returning all buffers to the pool. Returns None to signal mutation.
-
     Args:
-        manager: Workspace manager state (MUTATED)
+        manager: Workspace manager state
     """
     for key in list(manager.active_workspaces.keys()):
         workspace_release(manager, *key)
 
 
 def workspace_lru_release(
-    manager: WorkspaceManager, keep_count: Optional[int] = None
+    config: GPUConfig,
+    manager: WorkspaceManager,
+    keep_count: Optional[int] = None,
 ) -> int:
     """
-    Release least recently used workspaces (mutation)
+    Release least recently used workspaces
 
     This implements LRU eviction to prevent unbounded memory growth during training.
     Currently uses workspace size (batch_size * seq_len) as a proxy for LRU.
     In production, would track actual access times.
 
-    This function MUTATES manager.active_workspaces by releasing workspaces.
-
     Args:
-        manager: Workspace manager state (MUTATED)
+        manager: Workspace manager state
         keep_count: Number of workspaces to keep (most recently accessed).
-                   If None, uses manager.device.config.workspace_lru_keep_count
+                   If None, uses config.workspace_lru_keep_count
 
     Returns:
         Number of workspaces released
@@ -191,7 +187,7 @@ def workspace_lru_release(
     """
     # Use config default if not provided
     if keep_count is None:
-        keep_count = manager.device.config.workspace_lru_keep_count
+        keep_count = config.workspace_lru_keep_count
 
     if keep_count < 0:
         raise ValueError(f"keep_count must be non-negative, got {keep_count}")
@@ -216,13 +212,13 @@ def workspace_lru_release(
     return released
 
 
-def workspace_memory_usage_get(manager: WorkspaceManager) -> Dict[str, any]:
+def workspace_memory_usage_get(
+    manager: WorkspaceManager,
+) -> Dict[str, Union[int, list]]:
     """Get memory usage statistics for workspace manager.
 
-    This function does NOT mutate manager - it only reads from it.
-
     Args:
-        manager: Workspace manager state (not mutated)
+        manager: Workspace manager state
 
     Returns:
         Dictionary with:

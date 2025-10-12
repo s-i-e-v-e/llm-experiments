@@ -17,7 +17,6 @@ from .gpu_buffer import (
 from .gpu_device import (
     device_config_auto_detect,
     device_config_create,
-    device_config_init,
     device_config_shared_memory_usage_estimate,
     device_config_validate,
     device_create,
@@ -32,39 +31,42 @@ from .gpu_device import (
     pipeline_tuned_create,
     select_optimal_tile_size,
 )
-from .gpu_operations import (
-    # Optimizer
-    adamw_step,
-    attention,
+from .gpu_pass_backward import (
     attention_backward,
-    bias_add,
     bias_backward,
-    # Infrastructure
-    create_batch_state,
-    cross_entropy_loss,
-    embedding,
-    gelu,
+    flash_attention_backward,
     gelu_backward,
-    layernorm,
     layernorm_backward,
-    layernorm_backward_reduce,
-    # Forward ops
-    matmul,
-    # Backward ops
     matmul_backward_a,
     matmul_backward_b,
+)
+from .gpu_pass_forward import (
+    attention,
+    bias_add,
+    cross_entropy_loss,
+    embedding,
+    extract_last_tokens,
+    flash_attention,
+    gelu,
+    layernorm,
+    matmul,
     residual_add,
-    submit_batch,
+    softmax,
+)
+from .gpu_pass_optimizer import (
+    adamw_update_1d,
+    adamw_update_2d,
+    buffer_fill,
+    gradient_clip,
+    reduce_sum,
 )
 from .gpu_types import (
     BatchState,
-    Device,
     GPUBuffer1D,
     GPUBuffer2D,
-    GPUBuffer3D,
     GPUConfig,
+    GPUDevice,
     GPULayerParams,
-    GPUModelParams,
     GPUOptimizerState,
     PipelineCache,
     WorkspaceBuffers,
@@ -81,12 +83,10 @@ from .gpu_workspace import (
 
 __all__ = [
     # Types
-    "Device",
+    "GPUDevice",
     "GPUConfig",
     "GPUBuffer1D",
     "GPUBuffer2D",
-    "GPUBuffer3D",
-    "GPUModelParams",
     "GPULayerParams",
     "GPUOptimizerState",
     "BatchState",
@@ -101,10 +101,15 @@ __all__ = [
     "pipeline_tuned_create",
     "select_optimal_tile_size",
     "device_config_create",
-    "device_config_init",
     "device_config_validate",
     "device_config_auto_detect",
     "device_config_shared_memory_usage_estimate",
+    # Profiling
+    "perf_monitor_reset",
+    "perf_monitor_stats_get",
+    "perf_monitor_submission_record",
+    "perf_monitor_kernel_time_record",
+    "perf_monitor_create",
     # Buffers
     "create_gpu_buffer_1d",
     "create_gpu_buffer_2d",
@@ -123,30 +128,30 @@ __all__ = [
     "workspace_all_release",
     "workspace_lru_release",
     "workspace_memory_usage_get",
-    # Operations
-    "create_batch_state",
-    "submit_batch",
+    # Optimizer
+    "adamw_update_1d",
+    "adamw_update_2d",
+    "gradient_clip",
+    "buffer_fill",
+    "reduce_sum",
+    # Forward
     "matmul",
     "embedding",
     "attention",
     "layernorm",
     "gelu",
+    "softmax",
     "bias_add",
     "residual_add",
+    "extract_last_tokens",
     "cross_entropy_loss",
+    "flash_attention",
+    # Backward
     "matmul_backward_a",
     "matmul_backward_b",
     "layernorm_backward",
-    "layernorm_backward_reduce",
     "gelu_backward",
     "bias_backward",
     "attention_backward",
-    # Optimizer
-    "adamw_step",
-    # Profiling
-    "perf_monitor_reset",
-    "perf_monitor_stats_get",
-    "perf_monitor_submission_record",
-    "perf_monitor_kernel_time_record",
-    "perf_monitor_create",
+    "flash_attention_backward",
 ]

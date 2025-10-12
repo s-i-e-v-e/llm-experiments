@@ -1,5 +1,6 @@
 import numpy as np
-from gpu_kernels import (
+
+from .gpu_kernels import (
     get_attention_kernel,
     get_bias_add_kernel,
     get_cross_entropy_loss_kernel,
@@ -12,18 +13,19 @@ from gpu_kernels import (
     get_residual_add_kernel,
     get_softmax_kernel,
 )
-from gpu_types import (
-    BatchState,
-    GPUBuffer1D,
-    GPUBuffer2D,
-    PipelineCache,
-)
-
 from .gpu_ops import (
-    _add_compute_to_batch_internal,
+    add_compute_to_batch,
     validate_buffer_shape_1d,
     validate_buffer_shape_2d,
     validate_matmul_shapes,
+)
+from .gpu_types import (
+    BatchState,
+    GPUBuffer1D,
+    GPUBuffer2D,
+    GPUConfig,
+    GPUDevice,
+    PipelineCache,
 )
 
 # ============================================================================
@@ -32,29 +34,30 @@ from .gpu_ops import (
 
 
 def matmul(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     A: GPUBuffer2D,
     B: GPUBuffer2D,
     C: GPUBuffer2D,
 ) -> None:
-    """Matrix multiplication: C = A @ B (mutation).
+    """Matrix multiplication: C = A @ B.
 
     Uses tiled algorithm for efficiency. For matrices larger than
     ~1M x 1M, automatically tiles into multiple kernel launches.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED; operation added)
+        batch_state: Batch state
         A: Input matrix (M, K)
         B: Input matrix (K, N)
-        C: Output matrix (M, N) (MUTATED)
+        C: Output matrix (M, N)
 
     Raises:
         ValueError: If dimensions are incompatible
         NotImplementedError: If matrix exceeds maximum supported size
     """
-    config = pipeline_cache.device.config
 
     M, K, N = validate_matmul_shapes(A, B, C, "matmul")
 
@@ -66,7 +69,9 @@ def matmul(
 
     if wg_x <= MAX_WORKGROUPS and wg_y <= MAX_WORKGROUPS:
         params = np.array([M, K, N], dtype=np.uint32)
-        _add_compute_to_batch_internal(
+        add_compute_to_batch(
+            device,
+            config,
             pipeline_cache,
             batch_state,
             get_matmul_kernel(config),
@@ -86,6 +91,8 @@ def matmul(
 
 
 def embedding(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     embedding_table: GPUBuffer2D,
@@ -102,18 +109,17 @@ def embedding(
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED; operation added)
+        batch_state: Batch state
         embedding_table: Token embedding table (vocab_size, embedding_dim)
         pos_encoding: Positional encoding table (context_size, embedding_dim)
         input_ids: Input token IDs (batch_size * seq_len,) - stored as uint32
-        output: Output embeddings (batch_size * seq_len, embedding_dim) (MUTATED)
+        output: Output embeddings (batch_size * seq_len, embedding_dim)
         batch_size: Batch size
         seq_len: Sequence length
 
     Raises:
         ValueError: If buffer shapes don't match or seq_len exceeds context_size
     """
-    config = pipeline_cache.device.config
 
     if batch_size <= 0 or seq_len <= 0:
         raise ValueError(f"Invalid batch_size={batch_size} or seq_len={seq_len}")
@@ -136,7 +142,9 @@ def embedding(
     validate_buffer_shape_2d(output, (total_tokens, embedding_dim), "output")
 
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_embedding_kernel(config),
@@ -147,6 +155,8 @@ def embedding(
 
 
 def attention(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     Q: GPUBuffer2D,
@@ -163,15 +173,13 @@ def attention(
     Computes scaled dot-product attention for each head, with causal masking
     to prevent attending to future positions.
 
-    This function MUTATES output. Returns None to signal mutation.
-
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         Q: Query matrix (batch_size * seq_len, n_heads * head_dim)
         K: Key matrix (batch_size * seq_len, n_heads * head_dim)
         V: Value matrix (batch_size * seq_len, n_heads * head_dim)
-        output: Output matrix (batch_size * seq_len, n_heads * head_dim) (MUTATED)
+        output: Output matrix (batch_size * seq_len, n_heads * head_dim)
         batch_size: Batch size
         seq_len: Sequence length (no upper limit)
         n_heads: Number of attention heads
@@ -180,7 +188,6 @@ def attention(
     Raises:
         ValueError: If buffer shapes don't match or dimensions invalid
     """
-    config = pipeline_cache.device.config
 
     if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
         raise ValueError(
@@ -198,7 +205,9 @@ def attention(
 
     params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_attention_kernel(config),
@@ -211,6 +220,8 @@ def attention(
 
 
 def layernorm(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     input_buf: GPUBuffer2D,
@@ -222,16 +233,15 @@ def layernorm(
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         input_buf: Input tensor (n_elements, size)
         gamma: Scale parameters (size,)
         beta: Shift parameters (size,)
-        output: Output tensor (n_elements, size) (MUTATED)
+        output: Output tensor (n_elements, size)
 
     Raises:
         ValueError: If buffer shapes don't match
     """
-    config = pipeline_cache.device.config
 
     n_elements, size = input_buf.shape
 
@@ -244,7 +254,9 @@ def layernorm(
 
     params = np.array([size, n_elements], dtype=np.uint32)
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_layernorm_kernel(config),
@@ -255,6 +267,8 @@ def layernorm(
 
 
 def gelu(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     input_buf: GPUBuffer2D,
@@ -264,14 +278,13 @@ def gelu(
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         input_buf: Input tensor
-        output: Output tensor (MUTATED)
+        output: Output tensor
 
     Raises:
         ValueError: If buffer shapes don't match
     """
-    config = pipeline_cache.device.config
 
     if input_buf.shape != output.shape:
         raise ValueError(
@@ -281,7 +294,9 @@ def gelu(
     total_size = input_buf.size
     params = np.array([total_size], dtype=np.uint32)
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_gelu_kernel(config),
@@ -292,6 +307,8 @@ def gelu(
 
 
 def softmax(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     logits: GPUBuffer2D,
@@ -302,19 +319,14 @@ def softmax(
 
     Args:
         pipeline_cache: Pipeline cache for compute pipelines
-        batch_state: Current batch state with encoder (MUTATED)
+        batch_state: Current batch state with encoder
         logits: Input logits [batch_size, vocab_size]
-        probs: Output probabilities [batch_size, vocab_size] (MUTATED)
+        probs: Output probabilities [batch_size, vocab_size]
 
     Note:
         Uses numerically stable softmax with max subtraction.
         For generation/sampling after computing final layer logits.
     """
-    config = pipeline_cache.device.config
-
-    # Validate shapes
-    validate_buffer_shape_2d(logits)
-    validate_buffer_shape_2d(probs)
 
     if logits.shape != probs.shape:
         raise ValueError(
@@ -325,7 +337,9 @@ def softmax(
 
     params = np.array([batch_size, vocab_size], dtype=np.uint32)
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_softmax_kernel(config),
@@ -336,6 +350,8 @@ def softmax(
 
 
 def bias_add(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     input_buf: GPUBuffer2D,
@@ -348,15 +364,14 @@ def bias_add(
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         input_buf: Input tensor (n_elements, dim)
         bias: Bias vector (dim,)
-        output: Output tensor (n_elements, dim) (MUTATED)
+        output: Output tensor (n_elements, dim)
 
     Raises:
         ValueError: If buffer shapes don't match
     """
-    config = pipeline_cache.device.config
 
     n_elements, dim = input_buf.shape
 
@@ -369,7 +384,9 @@ def bias_add(
     total_size = n_elements * dim
     params = np.array([total_size, dim], dtype=np.uint32)
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_bias_add_kernel(config),
@@ -380,6 +397,8 @@ def bias_add(
 
 
 def residual_add(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     input_a: GPUBuffer2D,
@@ -390,15 +409,14 @@ def residual_add(
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         input_a: First input tensor
         input_b: Second input tensor
-        output: Output tensor (MUTATED)
+        output: Output tensor
 
     Raises:
         ValueError: If buffer shapes don't match
     """
-    config = pipeline_cache.device.config
 
     if not (input_a.shape == input_b.shape == output.shape):
         raise ValueError(
@@ -409,7 +427,9 @@ def residual_add(
     total_size = input_a.size
     params = np.array([total_size], dtype=np.uint32)
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_residual_add_kernel(config),
@@ -420,6 +440,8 @@ def residual_add(
 
 
 def extract_last_tokens(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     input_buf: GPUBuffer2D,
@@ -434,9 +456,9 @@ def extract_last_tokens(
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         input_buf: Input tensor [batch_size*seq_len, embedding_dim]
-        output: Output tensor [batch_size, embedding_dim] (MUTATED)
+        output: Output tensor [batch_size, embedding_dim]
         batch_size: Batch size
         seq_len: Sequence length
         embedding_dim: Embedding dimension
@@ -444,7 +466,6 @@ def extract_last_tokens(
     Raises:
         ValueError: If buffer shapes don't match or dimensions invalid
     """
-    config = pipeline_cache.device.config
 
     if batch_size <= 0 or seq_len <= 0 or embedding_dim <= 0:
         raise ValueError(
@@ -458,7 +479,9 @@ def extract_last_tokens(
 
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_extract_last_tokens_kernel(config),
@@ -471,6 +494,8 @@ def extract_last_tokens(
 
 
 def cross_entropy_loss(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     logits: GPUBuffer2D,
@@ -481,22 +506,20 @@ def cross_entropy_loss(
     """Combined cross-entropy loss and gradient computation.
 
     Computes both loss values and gradients in one pass for efficiency.
-    This function MUTATES loss_output and grad_logits. Returns None to signal mutation.
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         logits: Model predictions (batch_size * seq_len, vocab_size)
         targets: Target token IDs (batch_size * seq_len,) - uint32
-        loss_output: Loss for each prediction (batch_size * seq_len,) (MUTATED)
-        grad_logits: Gradient w.r.t. logits (batch_size * seq_len, vocab_size) (MUTATED)
+        loss_output: Loss for each prediction (batch_size * seq_len,)
+        grad_logits: Gradient w.r.t. logits (batch_size * seq_len, vocab_size)
         batch_size: Batch size
         seq_len: Sequence length
 
     Raises:
         ValueError: If buffer shapes don't match
     """
-    config = pipeline_cache.device.config
     batch_seq, vocab_size = logits.shape
 
     if batch_seq <= 0 or vocab_size <= 0:
@@ -509,7 +532,9 @@ def cross_entropy_loss(
 
     params = np.array([batch_seq, 1, vocab_size], dtype=np.uint32)
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_cross_entropy_loss_kernel(config),
@@ -520,6 +545,8 @@ def cross_entropy_loss(
 
 
 def flash_attention(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     Q: GPUBuffer2D,
@@ -536,19 +563,16 @@ def flash_attention(
     """
     Add FlashAttention forward pass to batch.
 
-    This function MUTATES batch_state by adding operations, and will MUTATE
-    O, L, M buffers when batch is submitted.
-
 
     Args:
         pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state (MUTATED)
+        batch_state: Batch state
         Q: Query matrix [batch_size*seq_len, n_heads*head_dim]
         K: Key matrix [batch_size*seq_len, n_heads*head_dim]
         V: Value matrix [batch_size*seq_len, n_heads*head_dim]
-        O: Output matrix [batch_size*seq_len, n_heads*head_dim] (MUTATED)
-        L: Softmax normalization [batch_size*seq_len*n_heads] (MUTATED)
-        M: Max values [batch_size*seq_len*n_heads] (MUTATED)
+        O: Output matrix [batch_size*seq_len, n_heads*head_dim]
+        L: Softmax normalization [batch_size*seq_len*n_heads]
+        M: Max values [batch_size*seq_len*n_heads]
         batch_size: Batch size
         seq_len: Sequence length
         n_heads: Number of attention heads
@@ -557,7 +581,6 @@ def flash_attention(
     Raises:
         ValueError: If buffer shapes don't match or dimensions invalid
     """
-    config = pipeline_cache.device.config
 
     # Validate head_dim against config
     if head_dim > config.flash_attn_max_head_dim:
@@ -601,7 +624,9 @@ def flash_attention(
     Br = config.flash_attn_br
     num_q_blocks = (seq_len + Br - 1) // Br
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_flash_attention_kernel(config),

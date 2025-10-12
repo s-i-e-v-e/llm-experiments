@@ -1,21 +1,21 @@
 from typing import Union
 
 import numpy as np
-from gpu_kernels import (
+
+from .gpu_kernels import (
     get_adamw_kernel,
     get_buffer_fill_kernel,
     get_gradient_clip_kernel,
     get_reduce_sum_kernel,
 )
-from gpu_types import (
+from .gpu_ops import add_compute_to_batch
+from .gpu_types import (
     BatchState,
     GPUBuffer1D,
     GPUBuffer2D,
+    GPUConfig,
+    GPUDevice,
     PipelineCache,
-)
-
-from .gpu_ops import (
-    _add_compute_to_batch_internal,
 )
 
 # ============================================================================
@@ -24,6 +24,8 @@ from .gpu_ops import (
 
 
 def INTERNAL__adamw_update(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     gradients: Union[GPUBuffer1D | GPUBuffer2D],
@@ -56,7 +58,6 @@ def INTERNAL__adamw_update(
         eps: Small constant for numerical stability
         step: Current training step (for bias correction)
     """
-    config = pipeline_cache.device.config
 
     total_size = weights.size
     params = np.array(
@@ -64,7 +65,9 @@ def INTERNAL__adamw_update(
         dtype=np.float32,
     )
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_adamw_kernel(config),
@@ -80,6 +83,8 @@ def INTERNAL__adamw_update(
 
 
 def adamw_update_2d(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     gradients: GPUBuffer2D,
@@ -94,6 +99,8 @@ def adamw_update_2d(
     step: int,
 ) -> None:
     INTERNAL__adamw_update(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         gradients,
@@ -110,6 +117,8 @@ def adamw_update_2d(
 
 
 def adamw_update_1d(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     gradients: GPUBuffer1D,
@@ -124,6 +133,8 @@ def adamw_update_1d(
     step: int,
 ) -> None:
     INTERNAL__adamw_update(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         gradients,
@@ -140,6 +151,8 @@ def adamw_update_1d(
 
 
 def gradient_clip(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     gradients: GPUBuffer2D,
@@ -160,7 +173,6 @@ def gradient_clip(
         max_norm: Maximum allowed gradient norm
         total_norm: Pre-computed global norm of all gradients
     """
-    config = pipeline_cache.device.config
 
     total_size = gradients.shape[0] * gradients.shape[1]
 
@@ -169,7 +181,9 @@ def gradient_clip(
         dtype=np.float32,
     )
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_gradient_clip_kernel(config),
@@ -180,6 +194,8 @@ def gradient_clip(
 
 
 def buffer_fill(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     buffer: GPUBuffer2D,
@@ -196,7 +212,6 @@ def buffer_fill(
         buffer: Buffer to fill
         value: Value to fill with
     """
-    config = pipeline_cache.device.config
 
     total_size = buffer.shape[0] * buffer.shape[1]
 
@@ -205,7 +220,9 @@ def buffer_fill(
         dtype=np.float32,
     )
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_buffer_fill_kernel(config),
@@ -216,6 +233,8 @@ def buffer_fill(
 
 
 def reduce_sum(
+    device: GPUDevice,
+    config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
     input_buffer: GPUBuffer2D,
@@ -230,11 +249,10 @@ def reduce_sum(
 
     Args:
         pipeline_cache: Pipeline cache for compute pipelines
-        batch_state: Current batch state with encoder (MUTATED)
+        batch_state: Current batch state with encoder
         input_buffer: Input buffer to reduce
-        output_buffer: Output buffer for partial sums [num_workgroups] (MUTATED)
+        output_buffer: Output buffer for partial sums [num_workgroups]
     """
-    config = pipeline_cache.device.config
 
     total_size = input_buffer.shape[0] * input_buffer.shape[1]
 
@@ -243,7 +261,9 @@ def reduce_sum(
         dtype=np.float32,
     )
 
-    _add_compute_to_batch_internal(
+    add_compute_to_batch(
+        device,
+        config,
         pipeline_cache,
         batch_state,
         get_reduce_sum_kernel(config),

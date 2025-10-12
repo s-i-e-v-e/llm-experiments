@@ -3,12 +3,14 @@
 from dataclasses import dataclass, field
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Optional,
     Protocol,
     Set,
     Tuple,
+    Union,
     runtime_checkable,
 )
 
@@ -22,7 +24,7 @@ from typing import (
 
 
 @runtime_checkable
-class WGPUBufferProtocol(Protocol):
+class GPUBufferProtocol(Protocol):
     """Structural type for wgpu.GPUBuffer - captures required interface"""
 
     size: int
@@ -50,7 +52,7 @@ class WGPUBufferProtocol(Protocol):
 
 
 @runtime_checkable
-class WGPUQueueProtocol(Protocol):
+class GPUQueueProtocol(Protocol):
     """Structural type for wgpu.GPUQueue"""
 
     def submit(self, command_buffers: Any) -> None:
@@ -58,7 +60,7 @@ class WGPUQueueProtocol(Protocol):
         ...
 
     def write_buffer(
-        self, buffer: WGPUBufferProtocol, buffer_offset: int, data: Any
+        self, buffer: GPUBufferProtocol, buffer_offset: int, data: Any
     ) -> None:
         """Write data directly to buffer"""
         ...
@@ -69,18 +71,47 @@ class WGPUQueueProtocol(Protocol):
 
 
 @runtime_checkable
-class WGPUDeviceProtocol(Protocol):
+class GPUAdapterProtocol(Protocol):
+    """Structural type for wgpu.GPUAdapter"""
+
+    def request_device_sync(self, **kwargs: Any) -> "GPUDeviceProtocol":
+        """Request device synchronously"""
+        ...
+
+    def request_adapter_info(self) -> Any:
+        """Query adapter capabilities"""
+        ...
+
+
+@runtime_checkable
+class GPULimitsProtocol(Protocol):
+    """Structural type for wgpu.GPU.Limits"""
+
+    max_compute_workgroup_size_x: int
+
+
+@runtime_checkable
+class GPUCommandEncoderProtocol(Protocol):
+    begin_compute_pass: Callable
+    copy_buffer_to_buffer: Callable
+    finish: Callable
+
+
+@runtime_checkable
+class GPUDeviceProtocol(Protocol):
     """Structural type for wgpu.GPUDevice"""
 
-    queue: WGPUQueueProtocol
+    queue: GPUQueueProtocol
+    adapter: GPUAdapterProtocol
+    limits: GPULimitsProtocol
 
     def create_buffer(
         self, *, size: int, usage: int, mapped_at_creation: bool = False
-    ) -> WGPUBufferProtocol:
+    ) -> GPUBufferProtocol:
         """Create GPU buffer"""
         ...
 
-    def create_buffer_with_data(self, *, data: Any, usage: int) -> WGPUBufferProtocol:
+    def create_buffer_with_data(self, *, data: Any, usage: int) -> GPUBufferProtocol:
         """Create buffer initialized with data"""
         ...
 
@@ -101,46 +132,20 @@ class WGPUDeviceProtocol(Protocol):
         ...
 
 
-@runtime_checkable
-class WGPUAdapterProtocol(Protocol):
-    """Structural type for wgpu.GPUAdapter"""
-
-    def request_device_sync(self, **kwargs: Any) -> WGPUDeviceProtocol:
-        """Request device synchronously"""
-        ...
-
-    def request_adapter_info(self) -> Any:
-        """Query adapter capabilities"""
-        ...
-
-
 # Type aliases using protocols instead of Any
-WGPUDevice = WGPUDeviceProtocol
-WGPUBuffer = WGPUBufferProtocol
-WGPUAdapter = WGPUAdapterProtocol
+GPUDevice = GPUDeviceProtocol
+GPUBuffer = GPUBufferProtocol
+GPUAdapter = GPUAdapterProtocol
+GPUCommandEncoder = GPUCommandEncoderProtocol
 
 # Other WGPU types that don't need full protocols (internal use only)
-WGPUCommandEncoder = Any  # wgpu.GPUCommandEncoder
-WGPUBindGroup = Any  # wgpu.GPUBindGroup
-WGPUComputePipeline = Any  # wgpu.GPUComputePipeline
-WGPUShaderModule = Any  # wgpu.GPUShaderModule
+GPUBindGroup = Any  # wgpu.GPUBindGroup
+GPUComputePipeline = Any  # wgpu.GPUComputePipeline
+GPUShaderModule = Any  # wgpu.GPUShaderModule
 
 # ============================================================================
 # DEVICE TYPES
 # ============================================================================
-
-
-@dataclass
-class Device:
-    """
-    GPU device wrapper
-
-    This dataclass is immutable - do not modify fields after creation.
-    """
-
-    wgpu_device: WGPUDevice
-    adapter: Optional[WGPUAdapter] = None
-    config: Optional["GPUConfig"] = None  # Forward reference to avoid circular import
 
 
 @dataclass
@@ -296,7 +301,7 @@ class BindGroupEntry:
     """
 
     binding: int
-    buffer: WGPUBuffer  # Now type-safe!
+    buffer: GPUBuffer  # Now type-safe!
     offset: int
     size: int
 
@@ -315,13 +320,11 @@ class GPUBuffer1D:
     1D GPU buffer - for vectors like biases, layer norm params
 
     This dataclass is immutable - do not modify fields after creation.
-    The underlying GPU buffer contents may be mutated by operations.
     """
 
-    buffer: WGPUBuffer  # Now type-safe!
+    buffer: GPUBuffer  # Now type-safe!
     shape: Tuple[int]
     size: int
-    device: Device
 
 
 @dataclass
@@ -330,14 +333,14 @@ class GPUBuffer2D:
     2D GPU buffer - for matrices like weight matrices
 
     This dataclass is immutable - do not modify fields after creation.
-    The underlying GPU buffer contents may be mutated by operations.
     """
 
-    buffer: WGPUBuffer  # Now type-safe!
+    buffer: GPUBuffer  # Now type-safe!
     shape: Tuple[int, int]
     size: int
-    device: Device
 
+
+GPUBufferAny = Union[GPUBuffer1D | GPUBuffer2D]
 
 # ============================================================================
 # BUFFER POOL TYPES
@@ -352,45 +355,33 @@ class BufferInfo:
     This dataclass is immutable - do not modify fields after creation.
     """
 
-    buffer: WGPUBuffer  # Now type-safe!
+    buffer: GPUBuffer  # Now type-safe!
 
 
 @dataclass
 class BufferPool:
     """
     Memory pool state for reusable GPU buffers
-
-    MUTATION SEMANTICS:
-    - pools: MUTABLE - buffers are added/removed during pool operations
-    - inuse: MUTABLE - tracks which buffers are currently taken
-    - totalmemorybytes: MUTABLE - updated as buffers are allocated/freed
-    - Other fields: immutable configuration
     """
 
-    device: Device
-    maxsize: int  # Max size per individual buffer
+    max_size: int  # Max size per individual buffer
     pools: Dict[int, List[BufferInfo]] = field(default_factory=dict)
-    inuse: Set[int] = field(default_factory=set)
-    totalmemorybytes: int = 0  # Current total memory allocated
-    maxtotalmemorybytes: int = 0  # Maximum total memory allowed (0 = unlimited)
+    in_use: Set[int] = field(default_factory=set)
+    total_memory_bytes: int = 0  # Current total memory allocated
+    max_total_memory_bytes: int = 0  # Maximum total memory allowed (0 = unlimited)
 
 
 @dataclass
 class StagingPool:
     """
     Staging buffer pool state for CPU-GPU transfers
-
-    MUTATION SEMANTICS:
-    - stagingbuffers: MUTABLE - buffers are added during upload/download operations
-    - Other fields: immutable configuration
     """
 
-    device: Device
-    stagingbuffers: Dict[int, WGPUBuffer] = field(
+    staging_buffers: Dict[int, GPUBuffer] = field(
         default_factory=dict
     )  # Now type-safe!
-    maxsize: int = 0
-    maxentries: int = 8  # Limit number of different-sized buffers
+    max_size: int = 0
+    max_entries: int = 8  # Limit number of different-sized buffers
 
 
 # ============================================================================
@@ -402,16 +393,10 @@ class StagingPool:
 class PipelineCache:
     """
     Cache for compiled GPU pipelines
-
-    MUTATION SEMANTICS:
-    - pipelines: MUTABLE - compiled pipelines are cached on first use
-    - bindgroups: MUTABLE - bind groups are cached
-    - device: immutable reference
     """
 
-    device: Device
-    pipelines: Dict[str, WGPUComputePipeline] = field(default_factory=dict)
-    bindgroups: Dict[int, WGPUBindGroup] = field(default_factory=dict)
+    pipelines: Dict[str, GPUComputePipeline] = field(default_factory=dict)
+    bind_groups: Dict[int, GPUBindGroup] = field(default_factory=dict)
 
 
 # ============================================================================
@@ -423,19 +408,12 @@ class PipelineCache:
 class BatchState:
     """
     State for batched GPU operations
-
-    MUTATION SEMANTICS:
-    - encoder: MUTABLE - set to None after submit_batch is called
-    - retainedbuffers: MUTABLE - accumulates buffers during batch operations, cleared after submit
-    - operationcount: MUTABLE - incremented for each operation added
-    - Other fields: immutable configuration
     """
 
-    device: Device
-    encoder: Optional[WGPUCommandEncoder]
-    retainedbuffers: List[WGPUBuffer] = field(default_factory=list)  # Now type-safe!
-    enableprofiling: bool = False
-    operationcount: int = 0
+    encoder: Optional[GPUCommandEncoder]
+    retained_buffers: List[GPUBuffer] = field(default_factory=list)  # Now type-safe!
+    enable_profiling: bool = False
+    operation_count: int = 0
 
 
 # ============================================================================
@@ -449,7 +427,6 @@ class GPULayerParams:
     Parameters for a single transformer layer
 
     This dataclass is immutable - do not modify fields after creation.
-    The underlying GPU buffer contents may be mutated by training operations.
     """
 
     # Attention weights
@@ -472,13 +449,22 @@ class GPULayerParams:
 
 
 @dataclass
+class GPUModelParams:
+    """
+    Complete model parameters
+
+    This dataclass is immutable - do not modify fields after creation.
+    """
+
+    embedding: GPUBuffer2D  # (vocab_size, embedding_dim)
+    pos_encoding: GPUBuffer2D  # (context_size, embedding_dim)
+    layers: List[GPULayerParams]
+
+
+@dataclass
 class GPUOptimizerState:
     """
     Optimizer state for AdamW
-
-    MUTATION SEMANTICS:
-    - All buffer contents are MUTABLE - updated during optimizer steps
-    - step: MUTABLE - incremented after each optimizer step
     - List structure: immutable (same length as model layers)
     """
 
@@ -500,7 +486,6 @@ class WorkspaceBuffers:
     Typed workspace buffers for a specific batch/sequence size
 
     This dataclass is immutable - do not modify fields after creation.
-    The underlying GPU buffer contents are MUTABLE and reused across operations.
 
     Buffer naming convention:
     - x_buffer_a, x_buffer_b: ping-pong buffers for layer inputs
@@ -546,15 +531,10 @@ class WorkspaceBuffers:
 class WorkspaceManager:
     """
     Manager for workspace buffer caching
-
-    MUTATION SEMANTICS:
-    - activeworkspaces: MUTABLE - workspaces are added/removed
-    - bufferpool: immutable reference (but pool itself is mutable)
     """
 
-    device: Device
-    bufferpool: BufferPool
-    activeworkspaces: Dict[Tuple[int, int], WorkspaceBuffers] = field(
+    buffer_pool: BufferPool
+    active_workspaces: Dict[Tuple[int, int], WorkspaceBuffers] = field(
         default_factory=dict
     )
 
@@ -595,11 +575,6 @@ class PerfStats:
 class PerfMonitor:
     """
     Performance monitoring state
-
-    MUTATION SEMANTICS:
-    - kernel_times: MUTABLE - timing data is accumulated during profiling
-    - memory_usage: MUTABLE - memory stats are recorded
-    - submission_count: MUTABLE - incremented on each submission
     """
 
     kernel_times: Dict[str, List[float]] = field(default_factory=dict)

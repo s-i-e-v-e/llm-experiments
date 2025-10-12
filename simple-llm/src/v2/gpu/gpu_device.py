@@ -2,56 +2,25 @@
 
 from typing import Dict, Optional
 
-from gpu_types import (
-    Device,
+import wgpu
+
+from .gpu_types import (
+    GPUAdapter,
+    GPUComputePipeline,
     GPUConfig,
+    GPUDevice,
     KernelTimeStats,
     PerfMonitor,
     PerfStats,
     PipelineCache,
-    WGPUAdapter,
-    WGPUComputePipeline,
-    WGPUDevice,
 )
-
-try:
-    import wgpu
-
-    WGPU_AVAILABLE = True
-except ImportError:
-    WGPU_AVAILABLE = False
-    wgpu = None
 
 # ============================================================================
 # DEVICE MANAGEMENT
 # ============================================================================
 
 
-def device_config_init(device: Device) -> Device:
-    """
-    Initialize device config if not provided (pure function).
-
-    Returns a new Device with config initialized if needed.
-    Does not mutate the input device.
-
-    Args:
-        device: Device that may have None config
-
-    Returns:
-        Device with config guaranteed to be non-None
-    """
-    if device.config is not None:
-        return device
-
-    # Create new Device with config set (immutable update)
-    return Device(
-        wgpu_device=device.wgpu_device,
-        adapter=device.adapter,
-        config=create_default_config(),
-    )
-
-
-def device_create(config: Optional[GPUConfig] = None) -> Optional[Device]:
+def device_create() -> GPUDevice:
     """
     Create a new WGPU device
 
@@ -67,53 +36,30 @@ def device_create(config: Optional[GPUConfig] = None) -> Optional[Device]:
     Raises:
         None - exceptions are caught and logged
     """
-    if not WGPU_AVAILABLE:
-        return None
 
     try:
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
         wgpu_device = adapter.request_device_sync()
 
-        # Auto-detect config if not provided
-        if config is None:
-            from gpu_config import auto_detect_config
-
-            config = auto_detect_config(adapter, wgpu_device)
-
         print("WGPU device initialized")
-        if config is not None:
-            print(
-                f"Configuration: tile_size={config.matmul_tile_size}, "
-                f"buffer_pool_max={config.buffer_pool_max_mb}MB, "
-                f"workgroup_size={config.default_workgroup_size}, "
-                f"flash_attn_max_head_dim={config.flash_attn_max_head_dim}"
-            )
 
-        return Device(wgpu_device=wgpu_device, adapter=adapter, config=config)
+        return wgpu_device
 
     except Exception as e:
-        print(f"WGPU initialization failed: {e}")
-        return None
+        raise RuntimeError(f"WGPU initialization failed: {e}")
 
 
-def pipeline_cache_create(device: Device) -> PipelineCache:
-    """Create a new pipeline cache for the given device.
-
-    This function does NOT mutate device.
-
-    Args:
-        device: GPU device state
+def pipeline_cache_create(device: GPUDevice) -> PipelineCache:
+    """Create a new pipeline cache.
 
     Returns:
         New empty pipeline cache for caching compiled shaders
     """
-    return PipelineCache(device=device)
+    return PipelineCache()
 
 
-def device_limits_query(device: Device) -> Dict[str, int]:
+def device_limits_query(device: GPUDevice) -> Dict[str, int]:
     """Query device capabilities for kernel optimization.
-
-    This function does NOT mutate device.
 
     Returns default limits if device query fails, ensuring code
     always has valid limits to work with.
@@ -139,7 +85,7 @@ def device_limits_query(device: Device) -> Dict[str, int]:
 
     # Try to query actual device limits if available
     try:
-        adapter_info = device.wgpu_device.adapter.request_adapter_info()
+        adapter_info = device.adapter.request_adapter_info()
         if hasattr(adapter_info, "limits"):
             limits.update(adapter_info.limits)
     except Exception:
@@ -152,8 +98,6 @@ def select_optimal_tile_size(
     device_limits: Dict[str, int], M: int, N: int, K: int
 ) -> int:
     """Select optimal tile size based on matrix dimensions and device.
-
-    This function does NOT mutate device_limits.
 
     Selects tile size to maximize performance while respecting device
     shared memory constraints. Larger tiles are preferred for large
@@ -192,14 +136,12 @@ def select_optimal_tile_size(
 
 
 def pipeline_tuned_create(
+    device: GPUDevice,
     pipeline_cache: PipelineCache,
     kernel_code: str,
     tune_params: Optional[Dict[str, int]] = None,
-) -> WGPUComputePipeline:
+) -> GPUComputePipeline:
     """Create pipeline with device-specific tuning.
-
-    This function does NOT mutate pipeline_cache or kernel_code.
-    It may MUTATE pipeline_cache.pipelines by adding new cached pipelines.
 
     Args:
         pipeline_cache: Pipeline cache for caching compiled shaders
@@ -210,30 +152,26 @@ def pipeline_tuned_create(
         Compiled compute pipeline
     """
     # NOTE: limits must be used in the tuning
-    limits = device_limits_query(pipeline_cache.device)
+    limits = device_limits_query(device)
 
-    # Apply tuning if provided (creates new string, doesn't mutate input)
     tuned_code = kernel_code
     if tune_params:
         for key, value in tune_params.items():
             tuned_code = tuned_code.replace(f"{{{key}}}", str(value))
 
-    return pipeline_get_or_create(pipeline_cache, tuned_code)
+    return pipeline_get_or_create(device, pipeline_cache, tuned_code)
 
 
 def pipeline_get_or_create(
-    pipeline_cache: PipelineCache, shader_code: str
-) -> WGPUComputePipeline:
-    """Cache compute pipelines to avoid recompilation (mutation).
-
-    This function MUTATES pipeline_cache.pipelines by adding new pipelines.
-    Returns None to signal mutation is incidental to caching behavior.
+    device: GPUDevice, pipeline_cache: PipelineCache, shader_code: str
+) -> GPUComputePipeline:
+    """Cache compute pipelines to avoid recompilation.
 
     Uses SHA256 hash of shader code to avoid collisions.
     Previously used Python hash() which can collide for different shaders.
 
     Args:
-        pipeline_cache: Pipeline cache state (MUTATED if pipeline not cached)
+        pipeline_cache: Pipeline cache state
         shader_code: WGSL shader source code
 
     Returns:
@@ -241,24 +179,20 @@ def pipeline_get_or_create(
     """
     import hashlib
 
-    device = pipeline_cache.device
-
-    # Use SHA256 instead of hash() to avoid collisions
     shader_hash = hashlib.sha256(shader_code.encode("utf-8")).hexdigest()
-    cache_key = (id(device.wgpu_device), shader_hash)
 
-    if cache_key not in pipeline_cache.pipelines:
-        shader_module = device.wgpu_device.create_shader_module(code=shader_code)
-        pipeline = device.wgpu_device.create_compute_pipeline(
+    if shader_hash not in pipeline_cache.pipelines:
+        shader_module = device.create_shader_module(code=shader_code)
+        pipeline = device.create_compute_pipeline(
             layout="auto",
             compute={
                 "module": shader_module,
                 "entry_point": "main",
             },
         )
-        pipeline_cache.pipelines[cache_key] = pipeline
+        pipeline_cache.pipelines[shader_hash] = pipeline
 
-    return pipeline_cache.pipelines[cache_key]
+    return pipeline_cache.pipelines[shader_hash]
 
 
 # ============================================================================
@@ -281,7 +215,7 @@ def device_config_default_create() -> GPUConfig:
     return GPUConfig()
 
 
-def device_config_auto_detect(adapter: WGPUAdapter, device: WGPUDevice) -> GPUConfig:
+def device_config_auto_detect(adapter: GPUAdapter, device: GPUDevice) -> GPUConfig:
     """
     Auto-detect GPU capabilities and return optimized configuration.
 
