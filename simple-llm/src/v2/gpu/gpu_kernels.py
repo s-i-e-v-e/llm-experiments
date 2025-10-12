@@ -1,11 +1,11 @@
 """WGSL kernels"""
 
 # ============================================================================
-# FORWARD KERNELS
+# FORWARD PASS KERNELS
 # ============================================================================
 
 
-def create_optimized_matmul_kernel(tile_size: int = 16) -> str:
+def create_matmul_kernel(tile_size: int = 16) -> str:
     """
     Generate matmul kernel with configurable tile size for different GPUs
 
@@ -983,8 +983,89 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
+def create_cross_entropy_loss_kernel(workgroup_size: int = 256) -> str:
+    """
+    Generate combined cross-entropy loss and gradient kernel
+
+    Computes both loss and gradients in a single pass for efficiency.
+    Numerically stable softmax with max subtraction.
+
+    Args:
+        workgroup_size: Number of threads per workgroup (64, 128, 256, or 512)
+
+    Returns:
+        WGSL kernel source code as string
+
+    Raises:
+        ValueError: If workgroup_size is invalid
+    """
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be 64, 128, 256, 512, or 1024, got {workgroup_size}"
+        )
+
+    return f"""
+// Combined cross-entropy loss and gradient computation
+// More efficient than separate loss + backward kernels
+//
+// Loss: -log(softmax(logits)[target])
+// Gradient: softmax(logits) - one_hot(target)
+
+struct LossParams {{
+    batch_size: u32,
+    seq_len: u32,
+    vocab_size: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: LossParams;
+@group(0) @binding(1) var<storage, read> logits: array<f32>;
+@group(0) @binding(2) var<storage, read> targets: array<u32>;
+@group(0) @binding(3) var<storage, read_write> loss_output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> grad_logits: array<f32>;
+
+@compute @workgroup_size({workgroup_size})
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
+    let pred_idx = global_id.x;
+    let total = params.batch_size * params.seq_len;
+
+    if (pred_idx >= total) {{
+        return;
+    }}
+
+    let target_idx = targets[pred_idx];
+    let logit_offset = pred_idx * params.vocab_size;
+
+    // Numerically stable softmax: subtract max
+    var max_logit = logits[logit_offset];
+    for (var i = 1u; i < params.vocab_size; i++) {{
+        max_logit = max(max_logit, logits[logit_offset + i]);
+    }}
+
+    var sum_exp = 0.0;
+    for (var i = 0u; i < params.vocab_size; i++) {{
+        sum_exp += exp(logits[logit_offset + i] - max_logit);
+    }}
+
+    // Loss: -log(softmax[target])
+    let target_logit = logits[logit_offset + target_idx];
+    loss_output[pred_idx] = -target_logit + max_logit + log(sum_exp);
+
+    // Gradient: softmax - one_hot
+    // Normalized by 1/total for averaging
+    for (var i = 0u; i < params.vocab_size; i++) {{
+        let prob = exp(logits[logit_offset + i] - max_logit) / sum_exp;
+        var grad = prob;
+        if (i == target_idx) {{
+            grad -= 1.0;
+        }}
+        grad_logits[logit_offset + i] = grad / f32(total);
+    }}
+}}
+"""
+
+
 # ============================================================================
-# BACKWARD KERNELS
+# BACKWARD PASS KERNELS
 # ============================================================================
 def create_matmul_backward_a_kernel(tile_size: int = 16) -> str:
     """
@@ -2129,87 +2210,6 @@ fn main(
 """
 
 
-def create_cross_entropy_loss_kernel(workgroup_size: int = 256) -> str:
-    """
-    Generate combined cross-entropy loss and gradient kernel
-
-    Computes both loss and gradients in a single pass for efficiency.
-    Numerically stable softmax with max subtraction.
-
-    Args:
-        workgroup_size: Number of threads per workgroup (64, 128, 256, or 512)
-
-    Returns:
-        WGSL kernel source code as string
-
-    Raises:
-        ValueError: If workgroup_size is invalid
-    """
-    if workgroup_size not in [64, 128, 256, 512, 1024]:
-        raise ValueError(
-            f"workgroup_size must be 64, 128, 256, 512, or 1024, got {workgroup_size}"
-        )
-
-    return f"""
-// Combined cross-entropy loss and gradient computation
-// More efficient than separate loss + backward kernels
-//
-// Loss: -log(softmax(logits)[target])
-// Gradient: softmax(logits) - one_hot(target)
-
-struct LossParams {{
-    batch_size: u32,
-    seq_len: u32,
-    vocab_size: u32,
-}}
-
-@group(0) @binding(0) var<uniform> params: LossParams;
-@group(0) @binding(1) var<storage, read> logits: array<f32>;
-@group(0) @binding(2) var<storage, read> targets: array<u32>;
-@group(0) @binding(3) var<storage, read_write> loss_output: array<f32>;
-@group(0) @binding(4) var<storage, read_write> grad_logits: array<f32>;
-
-@compute @workgroup_size({workgroup_size})
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
-    let pred_idx = global_id.x;
-    let total = params.batch_size * params.seq_len;
-
-    if (pred_idx >= total) {{
-        return;
-    }}
-
-    let target_idx = targets[pred_idx];
-    let logit_offset = pred_idx * params.vocab_size;
-
-    // Numerically stable softmax: subtract max
-    var max_logit = logits[logit_offset];
-    for (var i = 1u; i < params.vocab_size; i++) {{
-        max_logit = max(max_logit, logits[logit_offset + i]);
-    }}
-
-    var sum_exp = 0.0;
-    for (var i = 0u; i < params.vocab_size; i++) {{
-        sum_exp += exp(logits[logit_offset + i] - max_logit);
-    }}
-
-    // Loss: -log(softmax[target])
-    let target_logit = logits[logit_offset + target_idx];
-    loss_output[pred_idx] = -target_logit + max_logit + log(sum_exp);
-
-    // Gradient: softmax - one_hot
-    // Normalized by 1/total for averaging
-    for (var i = 0u; i < params.vocab_size; i++) {{
-        let prob = exp(logits[logit_offset + i] - max_logit) / sum_exp;
-        var grad = prob;
-        if (i == target_idx) {{
-            grad -= 1.0;
-        }}
-        grad_logits[logit_offset + i] = grad / f32(total);
-    }}
-}}
-"""
-
-
 # ============================================================================
 # OPTIMIZER KERNELS
 # ============================================================================
@@ -2458,116 +2458,125 @@ fn main(
 # ============================================================================
 
 
-def get_matmul_kernel_from_config(config) -> str:
-    """Get matmul kernel configured from GPUConfig"""
-    return create_optimized_matmul_kernel(config.matmul_tile_size)
+# ====
+# FORWARD
+# ====
+def get_matmul_kernel(config) -> str:
+    return create_matmul_kernel(config.matmul_tile_size)
 
 
-def get_layernorm_kernel_from_config(config) -> str:
-    """Get layernorm kernel configured from GPUConfig"""
+def get_layernorm_kernel(config) -> str:
     return create_layernorm_kernel(
         config.layernorm_workgroup_size, config.layernorm_epsilon
     )
 
 
-def get_gelu_kernel_from_config(config) -> str:
-    """Get GELU kernel configured from GPUConfig"""
+def get_gelu_kernel(config) -> str:
     return create_gelu_kernel(config.default_workgroup_size)
 
 
-def get_residual_add_kernel_from_config(config) -> str:
-    """Get residual add kernel configured from GPUConfig"""
+def get_residual_add_kernel(config) -> str:
     return create_residual_add_kernel(config.default_workgroup_size)
 
 
-def get_embedding_kernel_from_config(config) -> str:
-    """Get embedding kernel configured from GPUConfig"""
+def get_embedding_kernel(config) -> str:
     return create_embedding_kernel(config.default_workgroup_size)
 
 
-def get_bias_add_kernel_from_config(config) -> str:
-    """Get bias add kernel configured from GPUConfig"""
+def get_bias_add_kernel(config) -> str:
     return create_bias_add_kernel(config.default_workgroup_size)
 
 
-def get_attention_kernel_from_config(config) -> str:
-    """Get attention kernel configured from GPUConfig"""
+def get_attention_kernel(config) -> str:
     return create_attention_kernel(config.attention_workgroup_size)
 
 
-def get_flash_attention_kernel_from_config(config) -> str:
-    """Get FlashAttention kernel configured from GPUConfig"""
+def get_flash_attention_kernel(config) -> str:
     return create_flash_attention_kernel(
         config.flash_attn_max_head_dim, config.flash_attn_bc, config.flash_attn_br
     )
 
 
-def get_transpose_kernel_from_config(config) -> str:
-    """Get transpose kernel configured from GPUConfig"""
+def get_transpose_kernel(config) -> str:
     return create_transpose_kernel(
         config.matmul_tile_size
     )  # Use same tile size as matmul
 
 
-def get_extract_last_tokens_kernel_from_config(config) -> str:
-    """Get extract last tokens kernel configured from GPUConfig"""
+def get_extract_last_tokens_kernel(config) -> str:
     return create_extract_last_tokens_kernel(config.default_workgroup_size)
 
 
-# backward
+def get_cross_entropy_loss_kernel(config) -> str:
+    return create_cross_entropy_loss_kernel(config.default_workgroup_size)
 
 
-def get_matmul_backward_a_kernel_from_config(config) -> str:
-    """Get matmul backward (dA) kernel configured from GPUConfig"""
+def get_softmax_kernel(config) -> str:
+    return create_softmax_kernel(config.default_workgroup_size)
+
+
+# ====
+# BACKWARD
+# ====
+
+
+def get_matmul_backward_a_kernel(config) -> str:
     return create_matmul_backward_a_kernel(config.matmul_tile_size)
 
 
-def get_matmul_backward_b_kernel_from_config(config) -> str:
-    """Get matmul backward (dB) kernel configured from GPUConfig"""
+def get_matmul_backward_b_kernel(config) -> str:
     return create_matmul_backward_b_kernel(config.matmul_tile_size)
 
 
-def get_layernorm_backward_kernel_from_config(config) -> str:
-    """Get layernorm backward kernel configured from GPUConfig"""
+def get_layernorm_backward_kernel(config) -> str:
     return create_layernorm_backward_kernel(
         config.layernorm_workgroup_size, config.layernorm_epsilon
     )
 
 
-def get_layernorm_backward_reduce_kernel_from_config(config) -> str:
-    """Get layernorm backward reduction kernel configured from GPUConfig"""
+def get_layernorm_backward_reduce_kernel(config) -> str:
     return create_layernorm_backward_reduce_kernel(config.layernorm_workgroup_size)
 
 
-def get_layernorm_backward_reduce_accumulate_kernel_from_config(config) -> str:
-    """Get layernorm backward reduction with accumulation kernel configured from GPUConfig"""
+def get_layernorm_backward_reduce_accumulate_kernel(config) -> str:
     return create_layernorm_backward_reduce_accumulate_kernel(
         config.layernorm_workgroup_size
     )
 
 
-def get_gelu_backward_kernel_from_config(config) -> str:
-    """Get GELU backward kernel configured from GPUConfig"""
+def get_gelu_backward_kernel(config) -> str:
     return create_gelu_backward_kernel(config.default_workgroup_size)
 
 
-def get_bias_backward_kernel_from_config(config) -> str:
-    """Get bias backward kernel configured from GPUConfig"""
+def get_bias_backward_kernel(config) -> str:
     return create_bias_backward_kernel(config.default_workgroup_size)
 
 
-def get_attention_backward_kernel_from_config(config) -> str:
-    """Get attention backward kernel configured from GPUConfig"""
+def get_attention_backward_kernel(config) -> str:
     return create_attention_backward_kernel(config.attention_workgroup_size)
 
 
-def get_flash_attention_backward_kernel_from_config(config) -> str:
-    """Get FlashAttention backward kernel configured from GPUConfig"""
+def get_flash_attention_backward_kernel(config) -> str:
     return create_flash_attention_backward_kernel(
         config.flash_attn_max_head_dim, config.flash_attn_bc, config.flash_attn_br
     )
 
 
-def get_cross_entropy_loss_kernel_from_config(config) -> str:
-    """Get cross-entropy loss kernel configured from GPUConfig"""
-    return create_cross_entropy_loss_kernel(config.default_workgroup_size)
+# ====
+# OPTIMIZER
+# ====
+#
+def get_adamw_kernel(config) -> str:
+    return create_adamw_kernel(config.default_workgroup_size)
+
+
+def get_buffer_fill_kernel(config) -> str:
+    return create_buffer_fill_kernel(config.default_workgroup_size)
+
+
+def get_gradient_clip_kernel(config) -> str:
+    return create_gradient_clip_kernel(config.default_workgroup_size)
+
+
+def get_reduce_sum_kernel(config) -> str:
+    return create_reduce_sum_kernel(config.default_workgroup_size)

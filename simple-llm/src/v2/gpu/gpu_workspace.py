@@ -15,7 +15,7 @@ MEMORY MANAGEMENT:
 """
 
 from dataclasses import fields
-from typing import Dict
+from typing import Dict, Optional
 
 from gpu_buffer import pool_release_buffer, pool_take_buffer_2d
 from gpu_types import (
@@ -31,7 +31,7 @@ from gpu_types import (
 # ============================================================================
 
 
-def create_workspace_manager(
+def workspace_manager_create(
     device: Device, buffer_pool: BufferPool
 ) -> WorkspaceManager:
     """Create workspace manager state.
@@ -153,8 +153,8 @@ def workspace_release(manager: WorkspaceManager, batch_size: int, seq_len: int) 
         del manager.active_workspaces[key]
 
 
-def workspace_clear_all(manager: WorkspaceManager) -> None:
-    """Release all workspaces (mutation).
+def workspace_all_release(manager: WorkspaceManager) -> None:
+    """Release all workspaces.
 
     This function MUTATES manager.active_workspaces by removing all workspaces
     and returning all buffers to the pool. Returns None to signal mutation.
@@ -166,7 +166,7 @@ def workspace_clear_all(manager: WorkspaceManager) -> None:
         workspace_release(manager, *key)
 
 
-def workspace_release_lru(
+def workspace_lru_release(
     manager: WorkspaceManager, keep_count: Optional[int] = None
 ) -> int:
     """
@@ -216,7 +216,7 @@ def workspace_release_lru(
     return released
 
 
-def workspace_get_memory_usage(manager: WorkspaceManager) -> Dict[str, any]:
+def workspace_memory_usage_get(manager: WorkspaceManager) -> Dict[str, any]:
     """Get memory usage statistics for workspace manager.
 
     This function does NOT mutate manager - it only reads from it.

@@ -9,7 +9,6 @@ from typing import (
     Protocol,
     Set,
     Tuple,
-    Union,
     runtime_checkable,
 )
 
@@ -340,25 +339,6 @@ class GPUBuffer2D:
     device: Device
 
 
-@dataclass
-class GPUBuffer3D:
-    """
-    3D GPU buffer - for batched sequences (batch, seq, dim)
-
-    This dataclass is immutable - do not modify fields after creation.
-    The underlying GPU buffer contents may be mutated by operations.
-    """
-
-    buffer: WGPUBuffer  # Now type-safe!
-    shape: Tuple[int, int, int]
-    size: int
-    device: Device
-
-
-# Union type for when we need to accept any buffer dimension
-GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D, GPUBuffer3D]
-
-
 # ============================================================================
 # BUFFER POOL TYPES
 # ============================================================================
@@ -489,20 +469,6 @@ class GPULayerParams:
     ln_beta1: GPUBuffer1D  # (dim,)
     ln_gamma2: GPUBuffer1D  # (dim,)
     ln_beta2: GPUBuffer1D  # (dim,)
-
-
-@dataclass
-class GPUModelParams:
-    """
-    Complete model parameters
-
-    This dataclass is immutable - do not modify fields after creation.
-    The underlying GPU buffer contents may be mutated by training operations.
-    """
-
-    embedding: GPUBuffer2D  # (vocab_size, embedding_dim)
-    pos_encoding: GPUBuffer2D  # (context_size, embedding_dim)
-    layers: List[GPULayerParams]
 
 
 @dataclass

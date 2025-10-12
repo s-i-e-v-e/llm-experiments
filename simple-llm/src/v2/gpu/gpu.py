@@ -2,28 +2,36 @@
 GPU (WGPU) Backend for LLM Training and Inference
 """
 
-# Core types
-# Buffer operations
 from .gpu_buffer import (
-    clear_buffer,
-    create_buffer_pool,
     create_gpu_buffer_1d,
     create_gpu_buffer_2d,
-    create_gpu_buffer_3d,
-    gpu_to_numpy,
+    pool_clear,
+    pool_create,
+    pool_release_buffer,
+    pool_take_buffer_1d,
+    pool_take_buffer_2d,
+    staging_pool_create,
+    staging_pool_download,
+    staging_pool_upload,
 )
-
-# Device management
 from .gpu_device import (
-    create_device,
-    create_perf_monitor,
-    create_pipeline_cache,
-    get_perf_stats,
-    query_device_limits,
-    record_kernel_time,
+    device_config_auto_detect,
+    device_config_create,
+    device_config_init,
+    device_config_shared_memory_usage_estimate,
+    device_config_validate,
+    device_create,
+    device_limits_query,
+    perf_monitor_create,
+    perf_monitor_kernel_time_record,
+    perf_monitor_reset,
+    perf_monitor_stats_get,
+    perf_monitor_submission_record,
+    pipeline_cache_create,
+    pipeline_get_or_create,
+    pipeline_tuned_create,
+    select_optimal_tile_size,
 )
-
-# Operations (the main API for wgpu_backend.py)
 from .gpu_operations import (
     # Optimizer
     adamw_step,
@@ -62,9 +70,14 @@ from .gpu_types import (
     WorkspaceBuffers,
     WorkspaceManager,
 )
-
-# Workspace management
-from .gpu_workspace import create_workspace_manager, get_workspace, release_workspace
+from .gpu_workspace import (
+    workspace_all_release,
+    workspace_get_or_create,
+    workspace_lru_release,
+    workspace_manager_create,
+    workspace_memory_usage_get,
+    workspace_release,
+)
 
 __all__ = [
     # Types
@@ -81,20 +94,35 @@ __all__ = [
     "WorkspaceBuffers",
     "WorkspaceManager",
     # Device
-    "create_device",
-    "query_device_limits",
-    "create_pipeline_cache",
+    "device_create",
+    "device_limits_query",
+    "pipeline_cache_create",
+    "pipeline_get_or_create",
+    "pipeline_tuned_create",
+    "select_optimal_tile_size",
+    "device_config_create",
+    "device_config_init",
+    "device_config_validate",
+    "device_config_auto_detect",
+    "device_config_shared_memory_usage_estimate",
     # Buffers
     "create_gpu_buffer_1d",
     "create_gpu_buffer_2d",
-    "create_gpu_buffer_3d",
-    "gpu_to_numpy",
-    "clear_buffer",
-    "create_buffer_pool",
+    "staging_pool_create",
+    "staging_pool_upload",
+    "staging_pool_download",
+    "pool_create",
+    "pool_take_buffer_1d",
+    "pool_take_buffer_2d",
+    "pool_release_buffer",
+    "pool_clear",
     # Workspace
-    "create_workspace_manager",
-    "get_workspace",
-    "release_workspace",
+    "workspace_manager_create",
+    "workspace_get_or_create",
+    "workspace_release",
+    "workspace_all_release",
+    "workspace_lru_release",
+    "workspace_memory_usage_get",
     # Operations
     "create_batch_state",
     "submit_batch",
@@ -116,7 +144,9 @@ __all__ = [
     # Optimizer
     "adamw_step",
     # Profiling
-    "create_perf_monitor",
-    "record_kernel_time",
-    "get_perf_stats",
+    "perf_monitor_reset",
+    "perf_monitor_stats_get",
+    "perf_monitor_submission_record",
+    "perf_monitor_kernel_time_record",
+    "perf_monitor_create",
 ]

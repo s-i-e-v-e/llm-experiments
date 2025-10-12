@@ -11,6 +11,20 @@ from gpu_types import Device, GPULayerParams, GPUModelParams, GPUOptimizerState
 # ============================================================================
 
 
+@dataclass
+class GPUModelParams:
+    """
+    Complete model parameters
+
+    This dataclass is immutable - do not modify fields after creation.
+    The underlying GPU buffer contents may be mutated by training operations.
+    """
+
+    embedding: GPUBuffer2D  # (vocab_size, embedding_dim)
+    pos_encoding: GPUBuffer2D  # (context_size, embedding_dim)
+    layers: List[GPULayerParams]
+
+
 def positional_encoding(seq_len: int, dim: int) -> np.ndarray:
     """Generate sinusoidal positional encoding.
 

@@ -1,17 +1,17 @@
 """Device management and pipeline caching"""
 
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
-from gpu_config import create_default_config
 from gpu_types import (
-    BindGroupEntry,
     Device,
     GPUConfig,
     KernelTimeStats,
     PerfMonitor,
     PerfStats,
     PipelineCache,
+    WGPUAdapter,
     WGPUComputePipeline,
+    WGPUDevice,
 )
 
 try:
@@ -22,42 +22,12 @@ except ImportError:
     WGPU_AVAILABLE = False
     wgpu = None
 
-
-# ============================================================================
-# BIND GROUP HELPERS
-# ============================================================================
-
-
-def create_bind_group_entries(entries: List[BindGroupEntry]) -> List[Dict]:
-    """Convert typed BindGroupEntry list to wgpu bind group entry format.
-
-    This function does NOT mutate entries - it creates new dictionaries.
-
-    Args:
-        entries: List of BindGroupEntry specifications
-
-    Returns:
-        New list of dictionaries in wgpu bind group format
-    """
-    return [
-        {
-            "binding": entry.binding,
-            "resource": {
-                "buffer": entry.buffer,
-                "offset": entry.offset,
-                "size": entry.size,
-            },
-        }
-        for entry in entries
-    ]
-
-
 # ============================================================================
 # DEVICE MANAGEMENT
 # ============================================================================
 
 
-def init_device_config(device: Device) -> Device:
+def device_config_init(device: Device) -> Device:
     """
     Initialize device config if not provided (pure function).
 
@@ -81,7 +51,7 @@ def init_device_config(device: Device) -> Device:
     )
 
 
-def create_device(config: Optional[GPUConfig] = None) -> Optional[Device]:
+def device_create(config: Optional[GPUConfig] = None) -> Optional[Device]:
     """
     Create a new WGPU device
 
@@ -126,7 +96,7 @@ def create_device(config: Optional[GPUConfig] = None) -> Optional[Device]:
         return None
 
 
-def create_pipeline_cache(device: Device) -> PipelineCache:
+def pipeline_cache_create(device: Device) -> PipelineCache:
     """Create a new pipeline cache for the given device.
 
     This function does NOT mutate device.
@@ -140,7 +110,7 @@ def create_pipeline_cache(device: Device) -> PipelineCache:
     return PipelineCache(device=device)
 
 
-def query_device_limits(device: Device) -> Dict[str, int]:
+def device_limits_query(device: Device) -> Dict[str, int]:
     """Query device capabilities for kernel optimization.
 
     This function does NOT mutate device.
@@ -221,7 +191,7 @@ def select_optimal_tile_size(
         return valid_sizes[-1]
 
 
-def create_tuned_pipeline(
+def pipeline_tuned_create(
     pipeline_cache: PipelineCache,
     kernel_code: str,
     tune_params: Optional[Dict[str, int]] = None,
@@ -239,7 +209,8 @@ def create_tuned_pipeline(
     Returns:
         Compiled compute pipeline
     """
-    limits = query_device_limits(pipeline_cache.device)
+    # NOTE: limits must be used in the tuning
+    limits = device_limits_query(pipeline_cache.device)
 
     # Apply tuning if provided (creates new string, doesn't mutate input)
     tuned_code = kernel_code
@@ -247,10 +218,10 @@ def create_tuned_pipeline(
         for key, value in tune_params.items():
             tuned_code = tuned_code.replace(f"{{{key}}}", str(value))
 
-    return get_or_create_pipeline(pipeline_cache, tuned_code)
+    return pipeline_get_or_create(pipeline_cache, tuned_code)
 
 
-def get_or_create_pipeline(
+def pipeline_get_or_create(
     pipeline_cache: PipelineCache, shader_code: str
 ) -> WGPUComputePipeline:
     """Cache compute pipelines to avoid recompilation (mutation).
@@ -296,10 +267,8 @@ def get_or_create_pipeline(
 
 """GPU configuration and auto-tuning"""
 
-from typing import Optional
 
-
-def create_default_config() -> GPUConfig:
+def device_config_default_create() -> GPUConfig:
     """
     Create default GPU configuration with conservative settings.
 
@@ -312,7 +281,7 @@ def create_default_config() -> GPUConfig:
     return GPUConfig()
 
 
-def auto_detect_config(adapter: WGPUAdapter, device: WGPUDevice) -> GPUConfig:
+def device_config_auto_detect(adapter: WGPUAdapter, device: WGPUDevice) -> GPUConfig:
     """
     Auto-detect GPU capabilities and return optimized configuration.
 
@@ -451,7 +420,7 @@ def auto_detect_config(adapter: WGPUAdapter, device: WGPUDevice) -> GPUConfig:
     )
 
 
-def create_config_for_device(device_name: Optional[str] = None) -> GPUConfig:
+def device_config_create(device_name: Optional[str] = None) -> GPUConfig:
     """
     Create GPU configuration tuned for specific device.
 
@@ -469,7 +438,7 @@ def create_config_for_device(device_name: Optional[str] = None) -> GPUConfig:
         GPUConfig tuned for the specified device
     """
     if device_name is None:
-        return create_default_config()
+        return device_config_default_create()
 
     # Normalize device name for matching
     device_lower = device_name.lower()
@@ -535,12 +504,11 @@ def create_config_for_device(device_name: Optional[str] = None) -> GPUConfig:
             buffer_pool_max_buffer_mb=512,
         )
 
-    # Unknown device - use defaults
     else:
-        return create_default_config()
+        return device_config_default_create()
 
 
-def validate_config(config: GPUConfig) -> None:
+def device_config_validate(config: GPUConfig) -> None:
     """
     Validate GPU configuration for correctness.
 
@@ -641,7 +609,7 @@ def validate_config(config: GPUConfig) -> None:
         )
 
 
-def estimate_shared_memory_usage(config: GPUConfig) -> dict:
+def device_config_shared_memory_usage_estimate(config: GPUConfig) -> dict:
     """
     Estimate shared memory usage for different kernels.
 
@@ -675,12 +643,12 @@ def estimate_shared_memory_usage(config: GPUConfig) -> dict:
 # ============================================================================
 
 
-def create_perf_monitor() -> PerfMonitor:
+def perf_monitor_create() -> PerfMonitor:
     """Create performance monitor state"""
     return PerfMonitor()
 
 
-def record_kernel_time(
+def perf_monitor_kernel_time_record(
     monitor: PerfMonitor, kernel_name: str, duration_ms: float
 ) -> None:
     """Record kernel execution time"""
@@ -689,12 +657,12 @@ def record_kernel_time(
     monitor.kernel_times[kernel_name].append(duration_ms)
 
 
-def record_submission(monitor: PerfMonitor) -> None:
+def perf_monitor_submission_record(monitor: PerfMonitor) -> None:
     """Increment submission counter"""
     monitor.submission_count += 1
 
 
-def get_perf_stats(monitor: PerfMonitor) -> PerfStats:
+def perf_monitor_stats_get(monitor: PerfMonitor) -> PerfStats:
     """Get performance statistics"""
     kernel_stats = {}
     for kernel_name, times in monitor.kernel_times.items():
@@ -710,7 +678,7 @@ def get_perf_stats(monitor: PerfMonitor) -> PerfStats:
     )
 
 
-def reset_perf_monitor(monitor: PerfMonitor) -> None:
+def perf_monitor_reset(monitor: PerfMonitor) -> None:
     """Reset all counters"""
     monitor.kernel_times.clear()
     monitor.memory_usage.clear()
