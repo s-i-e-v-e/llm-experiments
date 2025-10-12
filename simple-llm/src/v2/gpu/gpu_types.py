@@ -126,9 +126,6 @@ WGPUBindGroup = Any  # wgpu.GPUBindGroup
 WGPUComputePipeline = Any  # wgpu.GPUComputePipeline
 WGPUShaderModule = Any  # wgpu.GPUShaderModule
 
-
-# ... (all previous content unchanged)
-
 # ============================================================================
 # DEVICE TYPES
 # ============================================================================
@@ -146,12 +143,144 @@ class Device:
     adapter: Optional[WGPUAdapter] = None
     config: Optional["GPUConfig"] = None  # Forward reference to avoid circular import
 
-    def __post_init__(self) -> None:
-        """Initialize config if not provided"""
-        if self.config is None:
-            from gpu_config import create_default_config
 
-            object.__setattr__(self, "config", create_default_config())
+@dataclass
+class GPUConfig:
+    """
+    Centralized GPU configuration for kernel parameters and memory limits.
+
+    This dataclass is immutable - do not modify fields after creation.
+    All parameters can be tuned for different GPU architectures.
+    """
+
+    # ========================================================================
+    # KERNEL TILE SIZES
+    # ========================================================================
+
+    matmul_tile_size: int = 16
+    """
+    Tile size for matrix multiplication kernels (16x16 default)
+
+    Optimal values:
+    - Small GPUs (integrated): 8
+    - Mid-range GPUs: 16
+    - High-end GPUs: 32
+
+    Constraints:
+    - Must be power of 2
+    - Shared memory usage: tile_size * tile_size * 2 * 4 bytes
+    - 16x16 = 2KB shared memory per tile
+    """
+
+    # ========================================================================
+    # FLASHATTENTION PARAMETERS
+    # ========================================================================
+
+    flash_attn_bc: int = 32
+    """
+    FlashAttention block size for K/V columns.
+
+    Controls memory tiling for keys and values. Larger values = more shared memory
+    usage but fewer kernel iterations.
+
+    Constraints:
+    - bc * head_dim * 4 bytes must fit in shared memory
+    - bc=32, head_dim=64: 8KB shared memory
+    """
+
+    flash_attn_br: int = 32
+    """
+    FlashAttention block size for Q rows.
+
+    Controls memory tiling for queries. Larger values = more shared memory
+    usage but fewer kernel iterations.
+
+    Constraints:
+    - br * head_dim * 4 bytes must fit in shared memory
+    - br=32, head_dim=64: 8KB shared memory
+    """
+
+    flash_attn_max_head_dim: int = 128
+    """
+    Maximum head dimension for FlashAttention.
+
+    Hardcoded in WGSL due to static shared memory allocation.
+    Larger values require kernel recompilation.
+
+    **WARNING**: Changing this requires regenerating kernels!
+
+    Supported values: 64, 128, 256
+    - 64: Conservative, works on all GPUs
+    - 128: Requires ~50KB workgroup memory
+    - 256: Requires ~200KB workgroup memory (high-end only)
+    """
+
+    # ========================================================================
+    # WORKGROUP SIZES
+    # ========================================================================
+
+    default_workgroup_size: int = 256
+    """Default workgroup size for simple kernels (e.g., GELU, residual add)"""
+
+    layernorm_workgroup_size: int = 256
+    """Workgroup size for layer normalization (uses shared memory reduction)"""
+
+    attention_workgroup_size: int = 256
+    """Workgroup size for attention operations"""
+
+    # ========================================================================
+    # MEMORY LIMITS
+    # ========================================================================
+
+    buffer_pool_max_mb: int = 512
+    """Maximum buffer pool size in megabytes"""
+
+    buffer_pool_max_buffer_mb: int = 512
+    """Maximum size of individual pooled buffers in MB"""
+
+    workspace_lru_keep_count: int = 2
+    """Number of workspace configurations to keep in LRU cache"""
+
+    staging_buffer_threshold_kb: int = 256
+    """
+    Threshold for using staging buffers (in KB).
+
+    Buffers larger than this use staging buffer pool.
+    Buffers smaller use direct queue.write_buffer().
+    """
+
+    staging_buffer_max_entries: int = 8
+    """Maximum number of different-sized staging buffers to cache"""
+
+    # ========================================================================
+    # COMPUTE LIMITS
+    # ========================================================================
+
+    max_workgroups_per_dim: int = 65535
+    """
+    Maximum workgroups per dimension (WGSL limit).
+
+    This is a WebGPU spec limit and should not be changed.
+    Used for validation and automatic tiling.
+    """
+
+    max_batch_operations: int = 1000
+    """
+    Maximum operations per batch submission.
+
+    Prevents unbounded command buffer growth.
+    Batches are automatically submitted when this limit is reached.
+    """
+
+    # ========================================================================
+    # NUMERICAL STABILITY
+    # ========================================================================
+
+    layernorm_epsilon: float = 1e-5
+    """Epsilon for LayerNorm numerical stability (added to variance before sqrt)"""
+
+    optimizer_epsilon: float = 1e-8
+    """Epsilon for AdamW optimizer numerical stability"""
 
 
 # ============================================================================

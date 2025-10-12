@@ -2,9 +2,11 @@
 
 from typing import Dict, List, Optional
 
+from gpu_config import create_default_config
 from gpu_types import (
     BindGroupEntry,
     Device,
+    GPUConfig,
     PipelineCache,
     WGPUComputePipeline,
 )
@@ -52,7 +54,31 @@ def create_bind_group_entries(entries: List[BindGroupEntry]) -> List[Dict]:
 # ============================================================================
 
 
-def create_device(config: Optional["GPUConfig"] = None) -> Optional[Device]:
+def init_device_config(device: Device) -> Device:
+    """
+    Initialize device config if not provided (pure function).
+
+    Returns a new Device with config initialized if needed.
+    Does not mutate the input device.
+
+    Args:
+        device: Device that may have None config
+
+    Returns:
+        Device with config guaranteed to be non-None
+    """
+    if device.config is not None:
+        return device
+
+    # Create new Device with config set (immutable update)
+    return Device(
+        wgpu_device=device.wgpu_device,
+        adapter=device.adapter,
+        config=create_default_config(),
+    )
+
+
+def create_device(config: Optional[GPUConfig] = None) -> Optional[Device]:
     """
     Create a new WGPU device
 
@@ -60,7 +86,7 @@ def create_device(config: Optional["GPUConfig"] = None) -> Optional[Device]:
     Falls back to default adapter if high-performance is unavailable.
 
     Args:
-        config: Optional GPU configuration. If None, default config is created.
+        config: Optional GPU configuration. If None, auto-detects from device.
 
     Returns:
         Device state if successful, None if WGPU unavailable or initialization fails
@@ -75,30 +101,23 @@ def create_device(config: Optional["GPUConfig"] = None) -> Optional[Device]:
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
         wgpu_device = adapter.request_device_sync()
 
-        # Get device name for auto-tuning if config not provided
+        # Auto-detect config if not provided
         if config is None:
-            try:
-                adapter_info = adapter.request_adapter_info()
-                device_name = getattr(adapter_info, "device", None) or getattr(
-                    adapter_info, "name", None
-                )
-            except:
-                device_name = None
+            from gpu_config import auto_detect_config
 
-            from gpu_config import create_config_for_device, validate_config
-
-            config = create_config_for_device(device_name)
-            validate_config(config)
+            config = auto_detect_config(adapter, wgpu_device)
 
         print("WGPU device initialized")
         if config is not None:
             print(
                 f"Configuration: tile_size={config.matmul_tile_size}, "
                 f"buffer_pool_max={config.buffer_pool_max_mb}MB, "
-                f"workgroup_size={config.default_workgroup_size}"
+                f"workgroup_size={config.default_workgroup_size}, "
+                f"flash_attn_max_head_dim={config.flash_attn_max_head_dim}"
             )
 
         return Device(wgpu_device=wgpu_device, adapter=adapter, config=config)
+
     except Exception as e:
         print(f"WGPU initialization failed: {e}")
         return None

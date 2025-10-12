@@ -1,18 +1,22 @@
 """Forward pass operations - individual kernel dispatches"""
 
 import numpy as np
+
+# Import config-based kernel generators
 from gpu_kernels_forward import (
-    BIAS_ADD_KERNEL,
+    # Keep constants for backward compatibility
     CROSS_ENTROPY_LOSS_KERNEL,
-    EMBEDDING_KERNEL,
-    GELU_KERNEL,
-    LAYERNORM_KERNEL,
-    MULTIHEAD_ATTENTION_KERNEL,
-    RESIDUAL_ADD_KERNEL,
-    TILED_MATMUL_KERNEL,
+    get_attention_kernel_from_config,
+    get_bias_add_kernel_from_config,
+    get_embedding_kernel_from_config,
+    get_extract_last_tokens_kernel_from_config,
+    get_flash_attention_kernel_from_config,
+    get_gelu_kernel_from_config,
+    get_layernorm_kernel_from_config,
+    get_matmul_kernel_from_config,
+    get_residual_add_kernel_from_config,
 )
 from gpu_ops import (
-    _validate_buffer_shapes,
     dispatch_simple_compute,
     validate_buffer_shape_1d,
     validate_buffer_shape_2d,
@@ -50,21 +54,18 @@ def run_matmul(
     """
     M, K, N = validate_matmul_shapes(A, B, C, "run_matmul")
 
-    # Workgroup limit in WGSL
     MAX_WORKGROUPS = 65535
-    TILE_SIZE = 16
+    config = pipeline_cache.device.config
+    TILE_SIZE = config.matmul_tile_size
 
-    # Calculate required workgroups
     wg_x = (N + TILE_SIZE - 1) // TILE_SIZE
     wg_y = (M + TILE_SIZE - 1) // TILE_SIZE
 
-    # Check if we need tiling
     if wg_x <= MAX_WORKGROUPS and wg_y <= MAX_WORKGROUPS:
-        # Single dispatch
         params = np.array([M, K, N], dtype=np.uint32)
         dispatch_simple_compute(
             pipeline_cache,
-            TILED_MATMUL_KERNEL,
+            get_matmul_kernel_from_config(config),
             params,
             [A, B, C],
             wg_x,
@@ -72,13 +73,11 @@ def run_matmul(
             1,
         )
     else:
-        # Matrix too large
         M_tile_size = MAX_WORKGROUPS * TILE_SIZE
         N_tile_size = MAX_WORKGROUPS * TILE_SIZE
         raise NotImplementedError(
             f"Matrix too large: ({M}, {K}) @ ({K}, {N}). "
-            f"Maximum supported size is ({M_tile_size}, K) @ (K, {N_tile_size}). "
-            f"Consider splitting the computation manually or using a different backend."
+            f"Maximum supported size is ({M_tile_size}, K) @ (K, {N_tile_size})."
         )
 
 
@@ -128,17 +127,18 @@ def run_embedding(
     validate_buffer_shape_1d(input_ids, total_tokens, "input_ids")
     validate_buffer_shape_2d(output, (total_tokens, embedding_dim), "output")
 
+    config = pipeline_cache.device.config
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
     dispatch_simple_compute(
         pipeline_cache,
-        EMBEDDING_KERNEL,
+        get_embedding_kernel_from_config(config),
         params,
         [embedding_table, pos_encoding, input_ids, output],
         (total_tokens + 255) // 256,
     )
 
 
-def run_multihead_attention(
+def run_attention(
     pipeline_cache: PipelineCache,
     Q: GPUBuffer2D,
     K: GPUBuffer2D,
@@ -179,25 +179,22 @@ def run_multihead_attention(
     embedding_dim = n_heads * head_dim
     total_tokens = batch_size * seq_len
 
-    _validate_buffer_shapes(
-        [
-            (Q, (total_tokens, embedding_dim), "Q"),
-            (K, (total_tokens, embedding_dim), "K"),
-            (V, (total_tokens, embedding_dim), "V"),
-            (output, (total_tokens, embedding_dim), "output"),
-        ]
-    )
+    validate_buffer_shape_2d(Q, (total_tokens, embedding_dim), "Q")
+    validate_buffer_shape_2d(K, (total_tokens, embedding_dim), "K")
+    validate_buffer_shape_2d(V, (total_tokens, embedding_dim), "V")
+    validate_buffer_shape_2d(output, (total_tokens, embedding_dim), "output")
 
+    config = pipeline_cache.device.config
     params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
 
     dispatch_simple_compute(
         pipeline_cache,
-        MULTIHEAD_ATTENTION_KERNEL,
+        get_attention_kernel_from_config(config),
         params,
         [Q, K, V, output],
-        workgroups_x=seq_len,
-        workgroups_y=n_heads,
-        workgroups_z=batch_size,
+        seq_len,
+        n_heads,
+        batch_size,
     )
 
 
@@ -224,17 +221,19 @@ def run_layernorm(
     """
     n_elements, size = input_buf.shape
 
-    if n_elements <= 0 or size <= 0:
-        raise ValueError(f"Invalid input shape: ({n_elements}, {size})")
+    if n_elements == 0 or size == 0:
+        raise ValueError(f"Invalid input_buf shape: {(n_elements, size)}")
 
     validate_buffer_shape_1d(gamma, size, "gamma")
     validate_buffer_shape_1d(beta, size, "beta")
     validate_buffer_shape_2d(output, (n_elements, size), "output")
 
+    config = pipeline_cache.device.config
     params = np.array([size, n_elements], dtype=np.uint32)
+
     dispatch_simple_compute(
         pipeline_cache,
-        LAYERNORM_KERNEL,
+        get_layernorm_kernel_from_config(config),
         params,
         [input_buf, gamma, beta, output],
         n_elements,
@@ -260,15 +259,16 @@ def run_gelu(
     """
     if input_buf.shape != output.shape:
         raise ValueError(
-            f"Input/output shape mismatch: {input_buf.shape} != {output.shape}"
+            f"Input shape {input_buf.shape} doesn't match output shape {output.shape}"
         )
 
     total_size = input_buf.size
-
+    config = pipeline_cache.device.config
     params = np.array([total_size], dtype=np.uint32)
+
     dispatch_simple_compute(
         pipeline_cache,
-        GELU_KERNEL,
+        get_gelu_kernel_from_config(config),
         params,
         [input_buf, output],
         (total_size + 255) // 256,
@@ -297,18 +297,19 @@ def run_bias_add(
     """
     n_elements, dim = input_buf.shape
 
-    if n_elements <= 0 or dim <= 0:
-        raise ValueError(f"Invalid input shape: ({n_elements}, {dim})")
-
-    total_size = n_elements * dim
+    if n_elements == 0 or dim == 0:
+        raise ValueError(f"Invalid input_buf shape: {(n_elements, dim)}")
 
     validate_buffer_shape_1d(bias, dim, "bias")
     validate_buffer_shape_2d(output, (n_elements, dim), "output")
 
+    total_size = n_elements * dim
+    config = pipeline_cache.device.config
     params = np.array([total_size, dim], dtype=np.uint32)
+
     dispatch_simple_compute(
         pipeline_cache,
-        BIAS_ADD_KERNEL,
+        get_bias_add_kernel_from_config(config),
         params,
         [input_buf, bias, output],
         (total_size + 255) // 256,
@@ -334,21 +335,59 @@ def run_residual_add(
     Raises:
         ValueError: If buffer shapes don't match
     """
-    if not (input_a.shape == input_b.shape == output.shape):
+    if input_a.shape != input_b.shape:
         raise ValueError(
-            f"Shape mismatch: input_a={input_a.shape}, "
-            f"input_b={input_b.shape}, output={output.shape}"
+            f"Input shapes don't match: {input_a.shape} != {input_b.shape}"
+        )
+
+    if output.shape != input_a.shape:
+        raise ValueError(
+            f"Output shape {output.shape} doesn't match input shape {input_a.shape}"
         )
 
     total_size = input_a.size
-
+    config = pipeline_cache.device.config
     params = np.array([total_size], dtype=np.uint32)
+
     dispatch_simple_compute(
         pipeline_cache,
-        RESIDUAL_ADD_KERNEL,
+        get_residual_add_kernel_from_config(config),
         params,
         [input_a, input_b, output],
         (total_size + 255) // 256,
+    )
+
+
+def run_extract_last_tokens(
+    pipeline_cache: PipelineCache,
+    input_buf: GPUBuffer2D,
+    output: GPUBuffer2D,
+    batch_size: int,
+    seq_len: int,
+    embedding_dim: int,
+) -> None:
+    """Extract last token from each sequence (mutation)."""
+    if batch_size <= 0 or seq_len <= 0 or embedding_dim <= 0:
+        raise ValueError(
+            f"Invalid dimensions: batch_size={batch_size}, seq_len={seq_len}, "
+            f"embedding_dim={embedding_dim}"
+        )
+
+    total_tokens = batch_size * seq_len
+    validate_buffer_shape_2d(input_buf, (total_tokens, embedding_dim), "input_buf")
+    validate_buffer_shape_2d(output, (batch_size, embedding_dim), "output")
+
+    config = pipeline_cache.device.config
+    params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
+
+    dispatch_simple_compute(
+        pipeline_cache,
+        get_extract_last_tokens_kernel_from_config(config),
+        params,
+        [input_buf, output],
+        (embedding_dim + 255) // 256,
+        batch_size,
+        1,
     )
 
 
@@ -358,8 +397,6 @@ def run_cross_entropy_loss(
     targets: GPUBuffer1D,
     loss_output: GPUBuffer1D,
     grad_logits: GPUBuffer2D,
-    batch_size: int,
-    seq_len: int,
 ) -> None:
     """Combined cross-entropy loss and gradient computation (mutation).
 
@@ -378,24 +415,92 @@ def run_cross_entropy_loss(
     Raises:
         ValueError: If buffer shapes don't match
     """
-    if batch_size <= 0 or seq_len <= 0:
-        raise ValueError(f"Invalid batch_size={batch_size} or seq_len={seq_len}")
+    batch_seq, vocab_size = logits.shape
 
-    total_predictions = batch_size * seq_len
-    vocab_size = logits.shape[1]
+    if batch_seq <= 0 or vocab_size <= 0:
+        raise ValueError(f"Invalid logits shape: {(batch_seq, vocab_size)}")
 
-    validate_buffer_shape_2d(logits, (total_predictions, vocab_size), "logits")
-    validate_buffer_shape_1d(targets, total_predictions, "targets")
-    validate_buffer_shape_1d(loss_output, total_predictions, "loss_output")
-    validate_buffer_shape_2d(
-        grad_logits, (total_predictions, vocab_size), "grad_logits"
-    )
+    validate_buffer_shape_1d(targets, batch_seq, "targets")
+    validate_buffer_shape_1d(loss_output, batch_seq, "loss_output")
+    validate_buffer_shape_2d(grad_logits, (batch_seq, vocab_size), "grad_logits")
 
-    params = np.array([batch_size, seq_len, vocab_size], dtype=np.uint32)
+    # Note: This kernel is not parameterized (workgroup_size=256 hardcoded)
+    # because it's self-contained and rarely needs tuning
+    params = np.array([batch_seq, 1, vocab_size], dtype=np.uint32)
+
     dispatch_simple_compute(
         pipeline_cache,
         CROSS_ENTROPY_LOSS_KERNEL,
         params,
         [logits, targets, loss_output, grad_logits],
-        (total_predictions + 255) // 256,
+        (batch_seq + 255) // 256,
+    )
+
+
+def run_flash_attention(
+    pipeline_cache: PipelineCache,
+    Q: GPUBuffer2D,
+    K: GPUBuffer2D,
+    V: GPUBuffer2D,
+    O: GPUBuffer2D,
+    L: GPUBuffer1D,
+    M: GPUBuffer1D,
+    batch_size: int,
+    seq_len: int,
+    n_heads: int,
+    head_dim: int,
+) -> None:
+    """FlashAttention forward pass (mutation)."""
+    config = pipeline_cache.device.config
+
+    # Validate head_dim against config
+    if head_dim > config.flash_attn_max_head_dim:
+        raise ValueError(
+            f"head_dim {head_dim} exceeds maximum supported by config: "
+            f"{config.flash_attn_max_head_dim}. "
+            f"Increase flash_attn_max_head_dim in GPUConfig or use smaller head_dim."
+        )
+
+    if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
+        raise ValueError(
+            f"Invalid dimensions: batch_size={batch_size}, seq_len={seq_len}, "
+            f"n_heads={n_heads}, head_dim={head_dim}"
+        )
+
+    embedding_dim = n_heads * head_dim
+    total_tokens = batch_size * seq_len
+
+    validate_buffer_shape_2d(Q, (total_tokens, embedding_dim), "Q")
+    validate_buffer_shape_2d(K, (total_tokens, embedding_dim), "K")
+    validate_buffer_shape_2d(V, (total_tokens, embedding_dim), "V")
+    validate_buffer_shape_2d(O, (total_tokens, embedding_dim), "O")
+
+    # L and M store statistics per (batch, seq, head)
+    stats_size = batch_size * seq_len * n_heads
+    validate_buffer_shape_1d(L, stats_size, "L")
+    validate_buffer_shape_1d(M, stats_size, "M")
+
+    params = np.array(
+        [
+            batch_size,
+            seq_len,
+            n_heads,
+            head_dim,
+            config.flash_attn_bc,
+            config.flash_attn_br,
+        ],
+        dtype=np.uint32,
+    )
+
+    Br = config.flash_attn_br
+    num_q_blocks = (seq_len + Br - 1) // Br
+
+    dispatch_simple_compute(
+        pipeline_cache,
+        get_flash_attention_kernel_from_config(config),
+        params,
+        [Q, K, V, O, L, M],
+        num_q_blocks,
+        n_heads,
+        batch_size,
     )

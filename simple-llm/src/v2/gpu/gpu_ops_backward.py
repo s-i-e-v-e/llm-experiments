@@ -11,14 +11,25 @@ MUTATION SEMANTICS:
 
 import numpy as np
 from gpu_buffer import clear_buffer
+
+# Import config-based kernel generators
 from gpu_kernels_backward import (
-    BIAS_BACKWARD_KERNEL,
-    GELU_BACKWARD_KERNEL,
-    LAYERNORM_BACKWARD_KERNEL,
-    MATMUL_BACKWARD_A_KERNEL,
-    MATMUL_BACKWARD_B_KERNEL,
+    # Keep backward-compatible constants
+    LAYERNORM_BACKWARD_REDUCE_ACCUMULATE_KERNEL,
+    get_attention_backward_kernel_from_config,
+    get_bias_backward_kernel_from_config,
+    get_flash_attention_backward_kernel_from_config,
+    get_gelu_backward_kernel_from_config,
+    get_layernorm_backward_kernel_from_config,
+    get_layernorm_backward_reduce_kernel_from_config,
+    get_matmul_backward_a_kernel_from_config,
+    get_matmul_backward_b_kernel_from_config,
 )
-from gpu_ops import dispatch_simple_compute
+from gpu_ops import (
+    dispatch_simple_compute,
+    validate_buffer_shape_1d,
+    validate_buffer_shape_2d,
+)
 from gpu_types import GPUBuffer1D, GPUBuffer2D, PipelineCache
 
 # ============================================================================
@@ -60,14 +71,17 @@ def run_matmul_backward_a(
             f"grad_A shape {grad_A.shape} doesn't match expected ({M}, {K})"
         )
 
+    config = pipeline_cache.device.config
+    TILE_SIZE = config.matmul_tile_size
     params = np.array([M, K, N], dtype=np.uint32)
+
     dispatch_simple_compute(
         pipeline_cache,
-        MATMUL_BACKWARD_A_KERNEL,
+        get_matmul_backward_a_kernel_from_config(config),
         params,
         [grad_C, B, grad_A],
-        (K + 15) // 16,
-        (M + 15) // 16,
+        (K + TILE_SIZE - 1) // TILE_SIZE,
+        (M + TILE_SIZE - 1) // TILE_SIZE,
         1,
     )
 
@@ -106,20 +120,23 @@ def run_matmul_backward_b(
             f"grad_B shape {grad_B.shape} doesn't match expected ({K}, {N})"
         )
 
+    config = pipeline_cache.device.config
+    TILE_SIZE = config.matmul_tile_size
     params = np.array([M, K, N], dtype=np.uint32)
+
     dispatch_simple_compute(
         pipeline_cache,
-        MATMUL_BACKWARD_B_KERNEL,
+        get_matmul_backward_b_kernel_from_config(config),
         params,
         [A, grad_C, grad_B],
-        (N + 15) // 16,
-        (K + 15) // 16,
+        (N + TILE_SIZE - 1) // TILE_SIZE,
+        (K + TILE_SIZE - 1) // TILE_SIZE,
         1,
     )
 
 
 def run_layernorm_backward(
-    pipelinecache: PipelineCache,
+    pipeline_cache: PipelineCache,
     input_buf: GPUBuffer2D,
     gamma: GPUBuffer1D,
     grad_output: GPUBuffer2D,
@@ -131,44 +148,30 @@ def run_layernorm_backward(
     """
     Backward pass for layer normalization (mutation)
 
-    This function MUTATES grad_input, grad_gamma, and grad_beta by writing gradients.
-    Returns None to signal mutation.
-
-    IMPLEMENTATION: Uses two-stage reduction to avoid race conditions:
+    Uses two-stage reduction to avoid race conditions:
     - Stage 1: Each workgroup computes partial gamma/beta gradients
     - Stage 2: Reduction kernel sums partial gradients into final result
 
     Args:
-        pipelinecache: Pipeline cache for kernel compilation
+        pipeline_cache: Pipeline cache for kernel compilation
         input_buf: Input from forward pass (n_elements, size)
         gamma: Scale parameters from forward pass (size,)
         grad_output: Gradient of loss w.r.t. output (n_elements, size)
-        grad_input: Output gradient w.r.t. input (n_elements, size) - MUTATED
-        grad_gamma: Output gradient w.r.t. gamma (size,) - MUTATED
-        grad_beta: Output gradient w.r.t. beta (size,) - MUTATED
-        accumulate: If False (default), zeros grad_gamma/grad_beta before accumulation.
-                   If True, accumulates into existing values using GPU-native atomic operations.
-                   Use True for gradient accumulation across mini-batches.
-                   Note: grad_input is always overwritten (never accumulated).
-
-    Raises:
-        ValueError: If shapes are incompatible
+        grad_input: Output gradient w.r.t. input (MUTATED)
+        grad_gamma: Output gradient w.r.t. gamma (MUTATED)
+        grad_beta: Output gradient w.r.t. beta (MUTATED)
+        accumulate: If False, zeros grad_gamma/grad_beta before accumulation.
+                   If True, accumulates into existing values.
 
     Example:
-        # Standard usage (single batch)
-        run_layernorm_backward(cache, x, gamma, grad_out, grad_in, grad_g, grad_b)
-
         # Gradient accumulation (multiple mini-batches)
         run_layernorm_backward(cache, x1, gamma, grad_out1, grad_in1, grad_g, grad_b, accumulate=False)
         run_layernorm_backward(cache, x2, gamma, grad_out2, grad_in2, grad_g, grad_b, accumulate=True)
     """
     from gpu_buffer import pool_release_buffer, pool_take_buffer_2d
-    from gpu_kernels_backward import (
-        LAYERNORM_BACKWARD_REDUCE_ACCUMULATE_KERNEL,
-        LAYERNORM_BACKWARD_REDUCE_KERNEL,
-    )
 
     n_elements, size = input_buf.shape
+    config = pipeline_cache.device.config
 
     if n_elements == 0 or size == 0:
         raise ValueError(f"Invalid input_buf shape: {(n_elements, size)}")
@@ -200,8 +203,8 @@ def run_layernorm_backward(
 
     # Allocate temporary buffers for partial gradients
     buffer_pool = (
-        pipelinecache.device.buffer_pool
-        if hasattr(pipelinecache.device, "buffer_pool")
+        pipeline_cache.device.buffer_pool
+        if hasattr(pipeline_cache.device, "buffer_pool")
         else None
     )
 
@@ -210,28 +213,27 @@ def run_layernorm_backward(
         partial_grad_beta = pool_take_buffer_2d(buffer_pool, n_elements, size)
     else:
         # Fallback: create temporary buffers directly
-        import numpy as np
         from gpu_buffer import create_gpu_buffer_2d
 
         partial_grad_gamma = create_gpu_buffer_2d(
-            pipelinecache.device,
+            pipeline_cache.device,
             n_elements,
             size,
             np.zeros((n_elements, size), dtype=np.float32),
         )
         partial_grad_beta = create_gpu_buffer_2d(
-            pipelinecache.device,
+            pipeline_cache.device,
             n_elements,
             size,
             np.zeros((n_elements, size), dtype=np.float32),
         )
 
-    # Stage 1: Compute partial gradients (one workgroup per element)
+    # Stage 1: Compute partial gradients
     params = np.array([size, n_elements], dtype=np.uint32)
 
     dispatch_simple_compute(
-        pipelinecache,
-        LAYERNORM_BACKWARD_KERNEL,
+        pipeline_cache,
+        get_layernorm_backward_kernel_from_config(config),
         params,
         [
             input_buf,
@@ -241,23 +243,21 @@ def run_layernorm_backward(
             partial_grad_gamma,
             partial_grad_beta,
         ],
-        n_elements,  # One workgroup per element
+        n_elements,
     )
 
-    # Stage 2: Reduce partial gradients into final gamma/beta gradients
-    # Choose kernel based on accumulation mode
+    # Stage 2: Reduce partial gradients
     if accumulate:
-        # Use atomic accumulation kernel (GPU-native, no CPU roundtrip)
+        # Use atomic accumulation kernel (still needed for accumulation mode)
         reduction_kernel = LAYERNORM_BACKWARD_REDUCE_ACCUMULATE_KERNEL
     else:
-        # Zero first, then use normal reduction
         clear_buffer(grad_gamma)
         clear_buffer(grad_beta)
-        reduction_kernel = LAYERNORM_BACKWARD_REDUCE_KERNEL
+        reduction_kernel = get_layernorm_backward_reduce_kernel_from_config(config)
 
     params_reduce = np.array([size, n_elements], dtype=np.uint32)
     dispatch_simple_compute(
-        pipelinecache,
+        pipeline_cache,
         reduction_kernel,
         params_reduce,
         [partial_grad_gamma, partial_grad_beta, grad_gamma, grad_beta],
@@ -301,11 +301,12 @@ def run_gelu_backward(
         )
 
     total_size = input_buf.size
-
+    config = pipeline_cache.device.config
     params = np.array([total_size], dtype=np.uint32)
+
     dispatch_simple_compute(
         pipeline_cache,
-        GELU_BACKWARD_KERNEL,
+        get_gelu_backward_kernel_from_config(config),
         params,
         [input_buf, grad_output, grad_input],
         (total_size + 255) // 256,
@@ -313,7 +314,7 @@ def run_gelu_backward(
 
 
 def run_bias_backward(
-    pipelinecache: PipelineCache,
+    pipeline_cache: PipelineCache,
     grad_output: GPUBuffer2D,
     grad_bias: GPUBuffer1D,
     accumulate: bool = False,
@@ -321,24 +322,14 @@ def run_bias_backward(
     """
     Backward pass for bias - sum gradients over batch (mutation)
 
-    This function MUTATES grad_bias by writing or accumulating gradients.
-    Returns None to signal mutation.
-
     Args:
-        pipelinecache: Pipeline cache for kernel compilation
+        pipeline_cache: Pipeline cache for kernel compilation
         grad_output: Gradient of loss w.r.t. output (n_elements, dim)
         grad_bias: Output gradient w.r.t. bias (dim,) - MUTATED
-        accumulate: If False (default), zeros grad_bias before accumulation.
+        accumulate: If False, zeros grad_bias before accumulation.
                    If True, accumulates into existing grad_bias values.
-                   Use True for gradient accumulation across mini-batches.
-
-    Raises:
-        ValueError: If shapes are incompatible
 
     Example:
-        # Standard usage (single batch)
-        run_bias_backward(cache, grad_out, grad_bias)
-
         # Gradient accumulation (multiple mini-batches)
         run_bias_backward(cache, grad_out1, grad_bias, accumulate=False)  # First batch
         run_bias_backward(cache, grad_out2, grad_bias, accumulate=True)   # Accumulate
@@ -359,12 +350,144 @@ def run_bias_backward(
         clear_buffer(grad_bias)
 
     total_size = n_elements * dim
+    config = pipeline_cache.device.config
     params = np.array([total_size, dim], dtype=np.uint32)
 
     dispatch_simple_compute(
-        pipelinecache,
-        BIAS_BACKWARD_KERNEL,
+        pipeline_cache,
+        get_bias_backward_kernel_from_config(config),
         params,
         [grad_output, grad_bias],
         (dim + 255) // 256,
+    )
+
+
+def run_attention_backward(
+    pipeline_cache: PipelineCache,
+    grad_output: GPUBuffer2D,
+    Q: GPUBuffer2D,
+    K: GPUBuffer2D,
+    V: GPUBuffer2D,
+    O: GPUBuffer2D,
+    grad_Q: GPUBuffer2D,
+    grad_K: GPUBuffer2D,
+    grad_V: GPUBuffer2D,
+    batch_size: int,
+    seq_len: int,
+    n_heads: int,
+    head_dim: int,
+) -> None:
+    """
+    Attention backward pass - ATOMIC-FREE version (mutation)
+
+    Each workgroup handles ONE query position completely, avoiding race conditions.
+    """
+    if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
+        raise ValueError(
+            f"Invalid dimensions: batch_size={batch_size}, seq_len={seq_len}, "
+            f"n_heads={n_heads}, head_dim={head_dim}"
+        )
+
+    embedding_dim = n_heads * head_dim
+    total_tokens = batch_size * seq_len
+
+    validate_buffer_shape_2d(grad_output, (total_tokens, embedding_dim), "grad_output")
+    validate_buffer_shape_2d(Q, (total_tokens, embedding_dim), "Q")
+    validate_buffer_shape_2d(K, (total_tokens, embedding_dim), "K")
+    validate_buffer_shape_2d(V, (total_tokens, embedding_dim), "V")
+    validate_buffer_shape_2d(O, (total_tokens, embedding_dim), "O")
+    validate_buffer_shape_2d(grad_Q, (total_tokens, embedding_dim), "grad_Q")
+    validate_buffer_shape_2d(grad_K, (total_tokens, embedding_dim), "grad_K")
+    validate_buffer_shape_2d(grad_V, (total_tokens, embedding_dim), "grad_V")
+
+    config = pipeline_cache.device.config
+    params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
+
+    dispatch_simple_compute(
+        pipeline_cache,
+        get_attention_backward_kernel_from_config(config),
+        params,
+        [grad_output, Q, K, V, O, grad_Q, grad_K, grad_V],
+        seq_len,
+        n_heads,
+        batch_size,
+    )
+
+
+def run_flash_attention_backward(
+    pipeline_cache: PipelineCache,
+    Q: GPUBuffer2D,
+    K: GPUBuffer2D,
+    V: GPUBuffer2D,
+    O: GPUBuffer2D,
+    L: GPUBuffer1D,
+    M: GPUBuffer1D,
+    grad_O: GPUBuffer2D,
+    grad_Q: GPUBuffer2D,
+    grad_K: GPUBuffer2D,
+    grad_V: GPUBuffer2D,
+    batch_size: int,
+    seq_len: int,
+    n_heads: int,
+    head_dim: int,
+) -> None:
+    """
+    FlashAttention backward pass - ATOMIC-FREE version (mutation)
+
+    Recomputes attention weights from saved statistics (L, M) to avoid
+    materializing full attention matrix.
+    """
+    config = pipeline_cache.device.config
+
+    # Validate head_dim against config
+    if head_dim > config.flash_attn_max_head_dim:
+        raise ValueError(
+            f"head_dim {head_dim} exceeds maximum supported by config: "
+            f"{config.flash_attn_max_head_dim}"
+        )
+
+    if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
+        raise ValueError(
+            f"Invalid dimensions: batch_size={batch_size}, seq_len={seq_len}, "
+            f"n_heads={n_heads}, head_dim={head_dim}"
+        )
+
+    embedding_dim = n_heads * head_dim
+    total_tokens = batch_size * seq_len
+    stats_size = batch_size * seq_len * n_heads
+
+    validate_buffer_shape_2d(Q, (total_tokens, embedding_dim), "Q")
+    validate_buffer_shape_2d(K, (total_tokens, embedding_dim), "K")
+    validate_buffer_shape_2d(V, (total_tokens, embedding_dim), "V")
+    validate_buffer_shape_2d(O, (total_tokens, embedding_dim), "O")
+    validate_buffer_shape_1d(L, stats_size, "L")
+    validate_buffer_shape_1d(M, stats_size, "M")
+    validate_buffer_shape_2d(grad_O, (total_tokens, embedding_dim), "grad_O")
+    validate_buffer_shape_2d(grad_Q, (total_tokens, embedding_dim), "grad_Q")
+    validate_buffer_shape_2d(grad_K, (total_tokens, embedding_dim), "grad_K")
+    validate_buffer_shape_2d(grad_V, (total_tokens, embedding_dim), "grad_V")
+
+    params = np.array(
+        [
+            batch_size,
+            seq_len,
+            n_heads,
+            head_dim,
+            config.flash_attn_bc,
+            config.flash_attn_br,
+        ],
+        dtype=np.uint32,
+    )
+
+    Br = config.flash_attn_br
+    num_q_blocks = (seq_len + Br - 1) // Br
+
+    dispatch_simple_compute(
+        pipeline_cache,
+        get_flash_attention_backward_kernel_from_config(config),
+        params,
+        [Q, K, V, O, grad_O, L, M, grad_Q, grad_K, grad_V],
+        num_q_blocks,
+        n_heads,
+        batch_size,
     )
