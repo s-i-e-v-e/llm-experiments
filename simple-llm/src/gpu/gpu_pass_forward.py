@@ -3,6 +3,8 @@ import numpy as np
 from .gpu_kernels import (
     get_attention_kernel,
     get_bias_add_kernel,
+    get_cross_entropy_loss_masked_kernel,
+    get_dropout_kernel,
     get_embedding_kernel,
     get_extract_last_tokens_kernel,
     get_flash_attention_kernel,
@@ -400,6 +402,10 @@ def cross_entropy_loss(
     Computes both loss values and gradients in one pass for efficiency.
     Masked (padding) tokens receive zero loss and zero gradients.
 
+    # Initialize valid_count buffer to 0 before each batch
+    # Run loss kernel with workgroups = (batch_size * seq_len, 1, 1)
+    # Run normalization kernel with workgroups = ceil(batch*seq*vocab / 256)
+
     Args:
         device: GPU device
         config: GPU configuration
@@ -422,8 +428,8 @@ def cross_entropy_loss(
     validate_buffer_shape_1d(targets, batch_seq, "targets")
     validate_buffer_shape_1d(mask, batch_seq, "mask")
     validate_buffer_shape_1d(loss_output, batch_seq, "loss_output")
-    validate_buffer_shape_2d(grad_logits, batch_seq, vocab_size, "grad_logits")
-    validate_buffer_shape_2d(logits, batch_seq, vocab_size, "logits")
+    validate_buffer_shape_2d(grad_logits, (batch_seq, vocab_size), "grad_logits")
+    validate_buffer_shape_2d(logits, (batch_seq, vocab_size), "logits")
 
     params = np.array([1, batch_seq, vocab_size], dtype=np.uint32)
 
@@ -434,11 +440,13 @@ def cross_entropy_loss(
         batch_state,
         get_cross_entropy_loss_masked_kernel(config),
         params,
-        logits,
-        targets,
-        mask,
-        loss_output,
-        grad_logits,
+        [
+            logits,
+            targets,
+            mask,
+            loss_output,
+            grad_logits,
+        ],
         (batch_seq + 255) // 256,
     )
 
@@ -477,8 +485,8 @@ def dropout(
     if rows == 0 or cols == 0:
         raise ValueError(f"Invalid input shape {rows, cols}")
 
-    validate_buffer_shape_2d(output, rows, cols, "output")
-    validate_buffer_shape_2d(mask, rows, cols, "mask")
+    validate_buffer_shape_2d(output, (rows, cols), "output")
+    validate_buffer_shape_2d(mask, (rows, cols), "mask")
 
     total_size = rows * cols
     params = np.array([total_size, keep_prob, seed, offset], dtype=np.float32)
@@ -490,9 +498,7 @@ def dropout(
         batch_state,
         get_dropout_kernel(config),
         params,
-        input_buf,
-        output,
-        mask,
+        [input_buf, output, mask],
         (total_size + 255) // 256,
     )
 
@@ -627,9 +633,16 @@ def flash_attention(
         batch_state,
         get_flash_attention_kernel(config),
         params,
-        [Q, K, V, O, L, M],
-        num_q_blocks,
-        n_heads,
+        [
+            Q,
+            K,
+            V,
+            O,
+            L,
+            M,
+            num_q_blocks,
+            n_heads,
+        ],
         batch_size,
     )
 

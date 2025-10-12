@@ -1157,16 +1157,22 @@ fn main(
 
 def create_cross_entropy_loss_kernel(workgroup_size: int = 256) -> str:
     """
-    Generate combined cross-entropy loss and gradient kernel
+    Generate unified cross-entropy loss and gradient kernel with masking support.
 
-    Computes both loss and gradients in a single pass for efficiency.
-    Numerically stable softmax with max subtraction.
+    Computes both loss and gradients in a single pass with proper normalization.
+    Handles variable-length sequences via padding masks.
+
+    Features:
+    - Numerically stable softmax (max subtraction)
+    - Automatic normalization by valid token count
+    - Zero loss/gradients for masked (padding) tokens
+    - Works with all-ones mask for unmasked batches
 
     Args:
-        workgroup_size: Number of threads per workgroup (64, 128, 256, or 512)
+        workgroup_size: Threads per workgroup (64, 128, 256, 512, or 1024)
 
     Returns:
-        WGSL kernel source code as string
+        WGSL kernel source code
 
     Raises:
         ValueError: If workgroup_size is invalid
@@ -1177,27 +1183,30 @@ def create_cross_entropy_loss_kernel(workgroup_size: int = 256) -> str:
         )
 
     return f"""
-// Combined cross-entropy loss and gradient computation
-// Parallelized version with parallel reduction
-// More efficient than separate loss + backward kernels
+// Unified Cross-Entropy Loss + Gradient Kernel with Masking
+// ============================================================
+// Computes: loss = -log(softmax(logits)[target])
+//           grad = (softmax(logits) - one_hot(target)) / valid_count
 //
-// Loss: -log(softmax(logits)[target])
-// Gradient: softmax(logits) - one_hot(target)
+// Properly normalized by count of non-masked tokens for stable training.
+// Pass all-ones mask for sequences without padding.
 
 struct LossParams {{
     batch_size: u32,
     seq_len: u32,
     vocab_size: u32,
+    pad_value: u32,  // Reserved for future use
 }}
 
 @group(0) @binding(0) var<uniform> params: LossParams;
-@group(0) @binding(1) var<storage, read> logits: array<f32>;
-@group(0) @binding(2) var<storage, read> targets: array<u32>;
-@group(0) @binding(3) var<storage, read_write> loss_output: array<f32>;
-@group(0) @binding(4) var<storage, read_write> grad_logits: array<f32>;
+@group(0) @binding(1) var<storage, read> logits: array<f32>;       // [B*S, V]
+@group(0) @binding(2) var<storage, read> targets: array<u32>;      // [B*S]
+@group(0) @binding(3) var<storage, read> mask: array<u32>;         // [B*S] 1=valid, 0=pad
+@group(0) @binding(4) var<storage, read_write> loss_output: array<f32>;  // [B*S]
+@group(0) @binding(5) var<storage, read_write> grad_logits: array<f32>;  // [B*S, V]
+@group(0) @binding(6) var<storage, read_write> valid_count: atomic<u32>; // Total valid tokens
 
 const BLOCK_SIZE: u32 = {workgroup_size}u;
-
 var<workgroup> shared_data: array<f32, {workgroup_size}>;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
@@ -1206,72 +1215,142 @@ fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) workgroup_id: vec3<u32>
 ) {{
-    let pred_idx = workgroup_id.x;
+    let token_idx = workgroup_id.x;
     let tid = local_id.x;
-    let total = params.batch_size * params.seq_len;
+    let total_tokens = params.batch_size * params.seq_len;
 
-    if (pred_idx >= total) {{
+    if (token_idx >= total_tokens) {{ return; }}
+
+    let is_valid = mask[token_idx];
+
+    // Count valid tokens atomically (once per workgroup)
+    if (tid == 0u && is_valid == 1u) {{
+        atomicAdd(&valid_count, 1u);
+    }}
+
+    // MASKED TOKENS: Zero out and exit early
+    if (is_valid == 0u) {{
+        if (tid == 0u) {{
+            loss_output[token_idx] = 0.0;
+        }}
+        for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
+            grad_logits[token_idx * params.vocab_size + i] = 0.0;
+        }}
         return;
     }}
 
-    let target_idx = targets[pred_idx];
-    let logit_offset = pred_idx * params.vocab_size;
+    // VALID TOKENS: Compute cross-entropy loss and gradients
+    let target_class = targets[token_idx];
+    let logit_offset = token_idx * params.vocab_size;
 
-    // Phase 1: Find max using parallel reduction
-    var max_logit = -1e10;
+    // Phase 1: Parallel reduction to find max logit (numerical stability)
+    var max_val = -1e10;
     for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
-        max_logit = max(max_logit, logits[logit_offset + i]);
+        max_val = max(max_val, logits[logit_offset + i]);
     }}
-    shared_data[tid] = max_logit;
+    shared_data[tid] = max_val;
     workgroupBarrier();
 
-    var active_threads = BLOCK_SIZE / 2u;
-    while (active_threads > 0u) {{
-        if (tid < active_threads) {{
-            shared_data[tid] = max(shared_data[tid], shared_data[tid + active_threads]);
+    // Tree reduction for max
+    var stride = BLOCK_SIZE / 2u;
+    while (stride > 0u) {{
+        if (tid < stride) {{
+            shared_data[tid] = max(shared_data[tid], shared_data[tid + stride]);
         }}
         workgroupBarrier();
-        active_threads >>= 1u;
+        stride /= 2u;
     }}
-    max_logit = shared_data[0];
+    max_val = shared_data[0];
     workgroupBarrier();
 
-    // Phase 2: Compute sum of exponentials using parallel reduction
+    // Phase 2: Parallel reduction to compute sum(exp(logit - max))
     var sum_exp = 0.0;
     for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
-        sum_exp += exp(logits[logit_offset + i] - max_logit);
+        sum_exp += exp(logits[logit_offset + i] - max_val);
     }}
     shared_data[tid] = sum_exp;
     workgroupBarrier();
 
-    active_threads = BLOCK_SIZE / 2u;
-    while (active_threads > 0u) {{
-        if (tid < active_threads) {{
-            shared_data[tid] += shared_data[tid + active_threads];
+    // Tree reduction for sum
+    stride = BLOCK_SIZE / 2u;
+    while (stride > 0u) {{
+        if (tid < stride) {{
+            shared_data[tid] += shared_data[tid + stride];
         }}
         workgroupBarrier();
-        active_threads >>= 1u;
+        stride /= 2u;
     }}
     sum_exp = shared_data[0];
     workgroupBarrier();
 
-    // Phase 3: Compute loss (thread 0 only)
+    // Phase 3: Compute loss (thread 0 writes to output)
     if (tid == 0u) {{
-        let target_logit = logits[logit_offset + target_idx];
-        loss_output[pred_idx] = -target_logit + max_logit + log(sum_exp);
+        let target_logit = logits[logit_offset + target_class];
+        let log_sum_exp = log(sum_exp);
+        // Standard cross-entropy: -log(softmax[target])
+        loss_output[token_idx] = log_sum_exp + max_val - target_logit;
     }}
 
-    // Phase 4: Compute gradients (parallelized)
-    // Gradient: softmax - one_hot
-    // Normalized by 1/total for averaging
-    let normalization = 1.0 / f32(total);
+    // Phase 4: Compute gradients with proper normalization
+    // NOTE: Normalization will be applied in a second pass after counting
+    // For now, store unnormalized gradients
+    let log_sum_exp = log(sum_exp);
     for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
-        let prob = exp(logits[logit_offset + i] - max_logit) / sum_exp;
+        // Compute softmax probability
+        let prob = exp(logits[logit_offset + i] - max_val - log_sum_exp);
+
+        // Gradient: softmax - one_hot(target)
         var grad = prob;
-        if (i == target_idx) {{
+        if (i == target_class) {{
             grad -= 1.0;
         }}
-        grad_logits[logit_offset + i] = grad * normalization;
+
+        // Store unnormalized gradient (will normalize in separate kernel)
+        grad_logits[logit_offset + i] = grad;
+    }}
+}}
+"""
+
+
+def create_gradient_normalization_kernel(workgroup_size: int = 256) -> str:
+    """
+    Generate kernel to normalize gradients by valid token count.
+
+    Must be called AFTER the loss kernel to divide all gradients by
+    the total number of valid (non-masked) tokens.
+
+    Args:
+        workgroup_size: Threads per workgroup
+
+    Returns:
+        WGSL kernel source code
+    """
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be 64, 128, 256, 512, or 1024, got {workgroup_size}"
+        )
+
+    return f"""
+// Gradient Normalization Kernel
+// Divides all gradients by the count of valid tokens
+
+struct NormParams {{
+    total_elements: u32,  // batch_size * seq_len * vocab_size
+}}
+
+@group(0) @binding(0) var<uniform> params: NormParams;
+@group(0) @binding(1) var<storage, read_write> grad_logits: array<f32>;
+@group(0) @binding(2) var<storage, read> valid_count: atomic<u32>;
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
+    let idx = global_id.x;
+    if (idx >= params.total_elements) {{ return; }}
+
+    let count = atomicLoad(&valid_count);
+    if (count > 0u) {{
+        let normalization = 1.0 / f32(count);
+        grad_logits[idx] *= normalization;
     }}
 }}
 """
@@ -3066,110 +3145,6 @@ fn main(
 # ============================================================================
 
 
-def create_cross_entropy_loss_masked_kernel(workgroup_size: int = 256) -> str:
-    """Generate cross-entropy loss kernel with padding mask support."""
-    if workgroup_size not in [64, 128, 256, 512, 1024]:
-        raise ValueError(
-            f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
-        )
-
-    return f"""// Cross-entropy with masking for padding tokens
-struct LossParams {{
-    batch_size: u32,
-    seq_len: u32,
-    vocab_size: u32,
-}}
-
-@group(0) @binding(0) var<uniform> params: LossParams;
-@group(0) @binding(1) var<storage, read> logits: array<f32>;
-@group(0) @binding(2) var<storage, read> targets: array<u32>;
-@group(0) @binding(3) var<storage, read> mask: array<u32>;  // 1=valid, 0=padding
-@group(0) @binding(4) var<storage, read_write> loss_output: array<f32>;
-@group(0) @binding(5) var<storage, read_write> grad_logits: array<f32>;
-
-const BLOCK_SIZE: u32 = {workgroup_size}u;
-var<workgroup> shared_data: array<f32, {workgroup_size}>;
-
-@compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(
-    @builtin(global_invocation_id) global_id: vec3<u32>,
-    @builtin(local_invocation_id) local_id: vec3<u32>,
-    @builtin(workgroup_id) workgroup_id: vec3<u32>
-) {{
-    let token_idx = workgroup_id.x;
-    let tid = local_id.x;
-
-    if (token_idx >= params.batch_size * params.seq_len) {{ return; }}
-
-    let is_valid = mask[token_idx];
-
-    // MASKED TOKENS: Zero loss and gradients
-    if (is_valid == 0u) {{
-        loss_output[token_idx] = 0.0;
-        for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
-            grad_logits[token_idx * params.vocab_size + i] = 0.0;
-        }}
-        return;
-    }}
-
-    // VALID TOKENS: Normal cross-entropy computation
-    let logit_offset = token_idx * params.vocab_size;
-    let target = targets[token_idx];
-
-    // Find max (numerical stability)
-    var max_logit = -1e10;
-    for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
-        max_logit = max(max_logit, logits[logit_offset + i]);
-    }}
-    shared_data[tid] = max_logit;
-    workgroupBarrier();
-
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] = max(shared_data[tid], shared_data[tid + active]);
-        }}
-        workgroupBarrier();
-        active /= 2u;
-    }}
-    max_logit = shared_data[0];
-    workgroupBarrier();
-
-    // Sum of exponentials
-    var sum_exp = 0.0;
-    for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
-        sum_exp += exp(logits[logit_offset + i] - max_logit);
-    }}
-    shared_data[tid] = sum_exp;
-    workgroupBarrier();
-
-    active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] += shared_data[tid + active];
-        }}
-        workgroupBarrier();
-        active /= 2u;
-    }}
-    sum_exp = shared_data[0];
-    workgroupBarrier();
-
-    // Compute loss
-    if (tid == 0u) {{
-        let target_logit = logits[logit_offset + target];
-        loss_output[token_idx] = log(sum_exp) + max_logit - target_logit;
-    }}
-
-    // Compute gradients: softmax(logits) - one_hot(target)
-    for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
-        let prob = exp(logits[logit_offset + i] - max_logit) / sum_exp;
-        let one_hot = select(0.0, 1.0, i == target);
-        grad_logits[logit_offset + i] = prob - one_hot;
-    }}
-}}
-"""
-
-
 def create_embedding_backward_kernel(workgroup_size: int = 256) -> str:
     """Generate embedding backward pass kernel with atomic accumulation."""
     if workgroup_size not in [64, 128, 256, 512, 1024]:
@@ -3487,11 +3462,6 @@ def get_cross_entropy_loss_kernel(config) -> str:
 
 def get_softmax_kernel(config) -> str:
     return create_softmax_kernel(config.default_workgroup_size)
-
-
-def get_cross_entropy_loss_masked_kernel(config) -> str:
-    """Factory function for masked cross-entropy kernel."""
-    return create_cross_entropy_loss_masked_kernel(config.default_workgroup_size)
 
 
 def get_dropout_kernel(config) -> str:

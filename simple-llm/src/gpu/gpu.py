@@ -3,16 +3,12 @@ GPU (WGPU) Backend for LLM Training and Inference
 """
 
 from .gpu_buffer import (
-    create_gpu_buffer_1d,
-    create_gpu_buffer_2d,
-    pool_clear,
-    pool_create,
-    pool_release_buffer,
-    pool_take_buffer_1d,
-    pool_take_buffer_2d,
-    staging_pool_create,
-    staging_pool_download,
-    staging_pool_upload,
+    gpu_buffer_1d_create,
+    gpu_buffer_1d_read,
+    gpu_buffer_1d_write,
+    gpu_buffer_2d_create,
+    gpu_buffer_2d_read,
+    gpu_buffer_2d_write,
 )
 from .gpu_device import (
     device_config_auto_detect,
@@ -59,11 +55,11 @@ from .gpu_pass_optimizer import (
     adamw_update_2d,
     buffer_fill,
     gradient_clip,
+    gradient_clip_with_norm,
     reduce_sum,
 )
 from .gpu_types import (
     BatchState,
-    BufferPool,
     GPUBuffer1D,
     GPUBuffer2D,
     GPUConfig,
@@ -74,21 +70,10 @@ from .gpu_types import (
     GPUModelParams,
     GPUOptimizerState,
     PipelineCache,
-    WorkspaceBuffers,
-    WorkspaceManager,
-)
-from .gpu_workspace import (
-    workspace_all_release,
-    workspace_get_or_create,
-    workspace_lru_release,
-    workspace_manager_create,
-    workspace_memory_usage_get,
-    workspace_release,
 )
 
 __all__ = [
     # Types
-    "BufferPool",
     "GPUDevice",
     "GPUModelGradients",
     "GPUModelParams",
@@ -100,8 +85,6 @@ __all__ = [
     "GPUOptimizerState",
     "BatchState",
     "PipelineCache",
-    "WorkspaceBuffers",
-    "WorkspaceManager",
     # Device
     "device_create",
     "device_limits_query",
@@ -120,29 +103,19 @@ __all__ = [
     "perf_monitor_kernel_time_record",
     "perf_monitor_create",
     # Buffers
-    "create_gpu_buffer_1d",
-    "create_gpu_buffer_2d",
-    "staging_pool_create",
-    "staging_pool_upload",
-    "staging_pool_download",
-    "pool_create",
-    "pool_take_buffer_1d",
-    "pool_take_buffer_2d",
-    "pool_release_buffer",
-    "pool_clear",
-    # Workspace
-    "workspace_manager_create",
-    "workspace_get_or_create",
-    "workspace_release",
-    "workspace_all_release",
-    "workspace_lru_release",
-    "workspace_memory_usage_get",
+    "gpu_buffer_1d_create",
+    "gpu_buffer_2d_create",
+    "gpu_buffer_1d_write",
+    "gpu_buffer_2d_write",
+    "gpu_buffer_1d_read",
+    "gpu_buffer_2d_read",
     # Optimizer
     "adamw_update_1d",
     "adamw_update_2d",
     "gradient_clip",
     "buffer_fill",
     "reduce_sum",
+    "gradient_clip_with_norm",
     # Forward
     "matmul",
     "embedding",

@@ -8,7 +8,6 @@ from typing import (
     List,
     Optional,
     Protocol,
-    Set,
     Tuple,
     Union,
     runtime_checkable,
@@ -104,6 +103,7 @@ class GPUDeviceProtocol(Protocol):
     queue: GPUQueueProtocol
     adapter: GPUAdapterProtocol
     limits: GPULimitsProtocol
+    adapter_info: Dict[str, str]
 
     def create_buffer(
         self, *, size: int, usage: int, mapped_at_creation: bool = False
@@ -340,49 +340,7 @@ class GPUBuffer2D:
     size: int
 
 
-GPUBufferAny = Union[GPUBuffer1D | GPUBuffer2D]
-
-# ============================================================================
-# BUFFER POOL TYPES
-# ============================================================================
-
-
-@dataclass
-class BufferInfo:
-    """
-    Information about a pooled buffer
-
-    This dataclass is immutable - do not modify fields after creation.
-    """
-
-    buffer: GPUBuffer  # Now type-safe!
-
-
-@dataclass
-class BufferPool:
-    """
-    Memory pool state for reusable GPU buffers
-    """
-
-    max_size: int  # Max size per individual buffer
-    pools: Dict[int, List[BufferInfo]] = field(default_factory=dict)
-    in_use: Set[int] = field(default_factory=set)
-    total_memory_bytes: int = 0  # Current total memory allocated
-    max_total_memory_bytes: int = 0  # Maximum total memory allowed (0 = unlimited)
-
-
-@dataclass
-class StagingPool:
-    """
-    Staging buffer pool state for CPU-GPU transfers
-    """
-
-    staging_buffers: Dict[int, GPUBuffer] = field(
-        default_factory=dict
-    )  # Now type-safe!
-    max_size: int = 0
-    max_entries: int = 8  # Limit number of different-sized buffers
-
+GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D]
 
 # ============================================================================
 # PIPELINE CACHE TYPES
@@ -482,69 +440,6 @@ class GPUOptimizerState:
 
 GPULayerGradients = GPULayerParams
 GPUModelGradients = GPUModelParams
-
-# ============================================================================
-# WORKSPACE MANAGEMENT TYPES
-# ============================================================================
-
-
-@dataclass
-class WorkspaceBuffers:
-    """
-    Typed workspace buffers for a specific batch/sequence size
-
-    This dataclass is immutable - do not modify fields after creation.
-
-    Buffer naming convention:
-    - x_buffer_a, x_buffer_b: ping-pong buffers for layer inputs
-    - x_norm1, x_norm2: layer norm outputs
-    - Q, K, V: attention query/key/value
-    - attn_out_pre, attn_out: attention outputs
-    - x_with_attn: residual after attention
-    - hidden, hidden_bias, hidden_gelu: FFN intermediate activations
-    - ffn_out, ffn_out_bias: FFN outputs
-    - logits: final predictions
-    - grad_*: gradient buffers for backward pass
-    """
-
-    # Forward pass buffers
-    x_buffer_a: GPUBuffer2D  # (batch*seq, dim) - ping
-    x_buffer_b: GPUBuffer2D  # (batch*seq, dim) - pong
-    x_norm1: GPUBuffer2D  # (batch*seq, dim)
-    x_norm2: GPUBuffer2D  # (batch*seq, dim)
-    Q: GPUBuffer2D  # (batch*seq, dim)
-    K: GPUBuffer2D  # (batch*seq, dim)
-    V: GPUBuffer2D  # (batch*seq, dim)
-    attn_out_pre: GPUBuffer2D  # (batch*seq, dim)
-    attn_out: GPUBuffer2D  # (batch*seq, dim)
-    x_with_attn: GPUBuffer2D  # (batch*seq, dim)
-    hidden: GPUBuffer2D  # (batch*seq, 4*dim)
-    hidden_bias: GPUBuffer2D  # (batch*seq, 4*dim)
-    hidden_gelu: GPUBuffer2D  # (batch*seq, 4*dim)
-    ffn_out: GPUBuffer2D  # (batch*seq, dim)
-    ffn_out_bias: GPUBuffer2D  # (batch*seq, dim)
-    logits: GPUBuffer2D  # (batch*seq, vocab_size)
-
-    # Backward pass buffers
-    grad_logits: GPUBuffer2D  # (batch*seq, vocab_size)
-    grad_embedding: GPUBuffer2D  # (batch*seq, dim)
-    grad_x: GPUBuffer2D  # (batch*seq, dim)
-    grad_attn: GPUBuffer2D  # (batch*seq, dim)
-    grad_ffn: GPUBuffer2D  # (batch*seq, dim)
-    grad_ln1: GPUBuffer2D  # (batch*seq, dim)
-    grad_ln2: GPUBuffer2D  # (batch*seq, dim)
-
-
-@dataclass
-class WorkspaceManager:
-    """
-    Manager for workspace buffer caching
-    """
-
-    buffer_pool: BufferPool
-    active_workspaces: Dict[Tuple[int, int], WorkspaceBuffers] = field(
-        default_factory=dict
-    )
 
 
 # ============================================================================

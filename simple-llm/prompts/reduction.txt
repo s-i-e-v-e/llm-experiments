@@ -1,0 +1,111 @@
+@dataclass
+class TrainingState:
+    """Immutable container for all persistent buffers"""
+    device: GPUDevice
+    model_params: GPUModelParams
+    activations: Dict[str, GPUBuffer2D]
+    gradients: Dict[str, GPUBuffer2D]
+    optimizer_state: GPUOptimizerState
+
+def create_training_state(device: GPUDevice, config: GPUConfig,
+                          batch_size: int, seq_len: int) -> TrainingState:
+    """Allocate all buffers upfront—single allocation point"""
+
+    # Allocate activations directly
+    total_tokens = batch_size * seq_len
+    activations = {
+        'x_buffer_a': create_gpu_buffer_2d(device, total_tokens, config.hidden_dim),
+        'x_buffer_b': create_gpu_buffer_2d(device, total_tokens, config.hidden_dim),
+        'Q': create_gpu_buffer_2d(device, total_tokens, config.hidden_dim),
+        'K': create_gpu_buffer_2d(device, total_tokens, config.hidden_dim),
+        # ... all other buffers
+    }
+
+    # Allocate gradients
+    gradients = {
+        'grad_x': create_gpu_buffer_2d(device, total_tokens, config.hidden_dim),
+        # ... all other gradient buffers
+    }
+
+    # Python GC handles cleanup when TrainingState goes out of scope
+    return TrainingState(
+        device=device,
+        model_params=load_model_params(device, config),
+        activations=activations,
+        gradients=gradients,
+        optimizer_state=create_optimizer_state(device, config)
+    )
+
+The TrainingState dataclass holds all buffer references. When it goes out of scope, Python GC cleans up automatically.
+==================
+
+def train_step(state: TrainingState, batch: np.ndarray) -> None:
+    """No allocation—uses buffers from state"""
+
+    # Forward pass uses pre-allocated buffers
+    forward_pass(
+        state.device,
+        state.model_params,
+        state.activations,
+        batch
+    )
+
+    # Backward pass uses pre-allocated gradient buffers
+    backward_pass(
+        state.device,
+        state.model_params,
+        state.activations,
+        state.gradients,
+        batch
+    )
+
+    # Update parameters
+    optimizer_step(
+        state.device,
+        state.model_params,
+        state.gradients,
+        state.optimizer_state
+    )
+
+def run_training(device: GPUDevice, config: GPUConfig,
+                 batches: List[np.ndarray]) -> None:
+    """Main training loop—single allocation at start"""
+
+    # Allocate once
+    state = create_training_state(device, config, batch_size=32, seq_len=128)
+
+    # Train without any per-step allocation
+    for batch in batches:
+        train_step(state, batch)
+
+    # When state goes out of scope, all buffers cleaned up by GC
+
+
+====================
+# At training initialization
+buffers = {
+    'forward_x_a': ...,
+    'forward_x_b': ...,
+    # ...
+
+    # Reduction workspace (allocated once, reused every step)
+    'reduction_workspace': create_gpu_buffer_1d(device, max_gradient_partials),
+}
+
+# During training step
+def optimizer_step(device, model_params, gradients, buffers):
+    # Compute gradient norm using pre-allocated workspace
+    global_norm = compute_global_gradient_norm(
+        device,
+        config,
+        pipeline_cache,
+        batch_state,
+        gradients,
+        buffers['reduction_workspace'],  # Reused buffer
+    )
+
+    # Clip gradients based on norm
+    clip_gradients(device, gradients, global_norm, max_norm=1.0)
+
+    # Apply updates
+    # ...

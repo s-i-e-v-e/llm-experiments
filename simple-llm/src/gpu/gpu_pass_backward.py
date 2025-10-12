@@ -1,13 +1,12 @@
 import numpy as np
 
-from .gpu_buffer import (
-    clear_buffer,
-    pool_release_buffer,
-    pool_take_buffer_2d,
-)
+from .gpu_buffer import gpu_buffer_2d_create, gpu_buffer_zerofy
 from .gpu_kernels import (
     get_attention_backward_kernel,
     get_bias_backward_kernel,
+    get_dropout_backward_kernel,
+    get_embedding_backward_convert_kernel,
+    get_embedding_backward_kernel,
     get_flash_attention_backward_kernel,
     get_gelu_backward_kernel,
     get_layernorm_backward_kernel,
@@ -23,7 +22,6 @@ from .gpu_ops import (
 )
 from .gpu_types import (
     BatchState,
-    BufferPool,
     GPUBuffer1D,
     GPUBuffer2D,
     GPUConfig,
@@ -148,7 +146,6 @@ def embedding_backward(
     config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    buffer_pool: BufferPool,
     input_ids: GPUBuffer1D,
     grad_output: GPUBuffer2D,
     grad_embedding: GPUBuffer2D,
@@ -166,7 +163,6 @@ def embedding_backward(
         config: GPU configuration
         pipeline_cache: Pipeline cache for kernel compilation
         batch_state: Batch state
-        buffer_pool: Buffer pool for temporary allocations
         input_ids: Input token IDs [batch_size*seq_len]
         grad_output: Gradient w.r.t. embeddings [batch_size*seq_len, embedding_dim]
         grad_embedding: Output gradient w.r.t. embedding table [vocab_size, embedding_dim]
@@ -183,10 +179,10 @@ def embedding_backward(
         raise ValueError(f"Embedding dim mismatch: {embedding_dim} != {embedding_dim2}")
 
     validate_buffer_shape_1d(input_ids, total_tokens, "input_ids")
-    validate_buffer_shape_2d(grad_output, total_tokens, embedding_dim, "grad_output")
+    validate_buffer_shape_2d(grad_output, (total_tokens, embedding_dim), "grad_output")
 
-    temp_i32 = pool_take_buffer_2d(device, buffer_pool, vocab_size, embedding_dim)
-    clear_buffer(device, temp_i32)
+    temp_i32 = gpu_buffer_2d_create(device, vocab_size, embedding_dim)
+    gpu_buffer_zerofy(device, temp_i32)
 
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
 
@@ -197,9 +193,7 @@ def embedding_backward(
         batch_state,
         get_embedding_backward_kernel(config),
         params,
-        input_ids,
-        grad_output,
-        temp_i32,
+        [input_ids, grad_output, temp_i32],
         (total_tokens + 255) // 256,
         (embedding_dim + 255) // 256,
         1,
@@ -214,8 +208,7 @@ def embedding_backward(
         batch_state,
         get_embedding_backward_convert_kernel(config),
         convert_params,
-        temp_i32,
-        grad_embedding,
+        [temp_i32, grad_embedding],
         (vocab_size * embedding_dim + 255) // 256,
     )
 
@@ -247,8 +240,8 @@ def dropout_backward(
     """
     rows, cols = grad_output.shape
 
-    validate_buffer_shape_2d(grad_input, rows, cols, "grad_input")
-    validate_buffer_shape_2d(mask, rows, cols, "mask")
+    validate_buffer_shape_2d(grad_input, (rows, cols), "grad_input")
+    validate_buffer_shape_2d(mask, (rows, cols), "mask")
 
     total_size = rows * cols
     params = np.array([total_size, keep_prob], dtype=np.float32)
@@ -260,9 +253,7 @@ def dropout_backward(
         batch_state,
         get_dropout_backward_kernel(config),
         params,
-        grad_output,
-        mask,
-        grad_input,
+        [grad_output, mask, grad_input],
         (total_size + 255) // 256,
     )
 
@@ -272,7 +263,6 @@ def layernorm_backward(
     config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    buffer_pool: BufferPool,
     input_buf: GPUBuffer2D,
     gamma: GPUBuffer1D,
     grad_output: GPUBuffer2D,
@@ -319,13 +309,9 @@ def layernorm_backward(
     validate_buffer_shape_1d(grad_gamma, size, "grad_gamma")
     validate_buffer_shape_1d(grad_beta, size, "grad_beta")
 
-    # Zero accumulation buffers
-    clear_buffer(device, grad_gamma)
-    clear_buffer(device, grad_beta)
-
     # Allocate temporary buffers for partial gradients
-    partial_grad_gamma = pool_take_buffer_2d(device, buffer_pool, n_elements, size)
-    partial_grad_beta = pool_take_buffer_2d(device, buffer_pool, n_elements, size)
+    partial_grad_gamma = gpu_buffer_2d_create(device, n_elements, size)
+    partial_grad_beta = gpu_buffer_2d_create(device, n_elements, size)
 
     # Stage 1: Compute partial gradients
     params = np.array([size, n_elements], dtype=np.uint32)
@@ -337,17 +323,24 @@ def layernorm_backward(
         batch_state,
         get_layernorm_backward_kernel(config),
         params,
-        [input_buf, gamma, grad_output, grad_input, grad_gamma, grad_beta],
+        [
+            input_buf,
+            gamma,
+            grad_output,
+            grad_input,
+            partial_grad_gamma,
+            partial_grad_beta,
+        ],
         n_elements,
     )
 
     # Stage 2: Reduce partial gradients
     if accumulate:
-        # Use atomic accumulation kernel (still needed for accumulation mode)
+        # Use atomic accumulation kernel
         reduction_kernel = get_layernorm_backward_reduce_accumulate_kernel(config)
     else:
-        clear_buffer(device, grad_gamma)
-        clear_buffer(device, grad_beta)
+        gpu_buffer_zerofy(device, grad_gamma)
+        gpu_buffer_zerofy(device, grad_beta)
         reduction_kernel = get_layernorm_backward_reduce_kernel(config)
 
     params_reduce = np.array([size, n_elements], dtype=np.uint32)
@@ -362,10 +355,6 @@ def layernorm_backward(
         [partial_grad_gamma, partial_grad_beta, grad_gamma, grad_beta],
         (size + 255) // 256,
     )
-
-    # Release temporary buffers
-    pool_release_buffer(buffer_pool, partial_grad_gamma)
-    pool_release_buffer(buffer_pool, partial_grad_beta)
 
 
 def gelu_backward(
@@ -451,7 +440,7 @@ def bias_backward(
 
     # Zero accumulation buffer only if not accumulating
     if not accumulate:
-        clear_buffer(device, grad_bias)
+        gpu_buffer_zerofy(device, grad_bias)
 
     total_size = n_elements * dim
     params = np.array([total_size, dim], dtype=np.uint32)

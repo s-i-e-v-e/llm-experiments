@@ -1,14 +1,17 @@
-from typing import Union
+from typing import List, Union
 
 import numpy as np
 
+from .gpu_buffer import gpu_buffer_1d_create, gpu_buffer_1d_read
 from .gpu_kernels import (
     get_adamw_kernel,
     get_buffer_fill_kernel,
     get_gradient_clip_kernel,
+    get_gradient_norm_kernel,
+    get_gradient_norm_reduce_kernel,
     get_reduce_sum_kernel,
 )
-from .gpu_ops import add_compute_to_batch
+from .gpu_ops import add_compute_to_batch, create_command_batch, submit_batch
 from .gpu_types import (
     BatchState,
     GPUBuffer1D,
@@ -23,15 +26,15 @@ from .gpu_types import (
 # ============================================================================
 
 
-def INTERNAL__adamw_update(
+def __adamw_update(
     device: GPUDevice,
     config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    gradients: Union[GPUBuffer1D | GPUBuffer2D],
-    weights: Union[GPUBuffer1D | GPUBuffer2D],
-    m: Union[GPUBuffer1D | GPUBuffer2D],
-    v: Union[GPUBuffer1D | GPUBuffer2D],
+    gradients: Union[GPUBuffer1D, GPUBuffer2D],
+    weights: Union[GPUBuffer1D, GPUBuffer2D],
+    m: Union[GPUBuffer1D, GPUBuffer2D],
+    v: Union[GPUBuffer1D, GPUBuffer2D],
     lr: float,
     beta1: float,
     beta2: float,
@@ -72,12 +75,7 @@ def INTERNAL__adamw_update(
         batch_state,
         get_adamw_kernel(config),
         params,
-        [
-            gradients.buffer,
-            weights.buffer,
-            m.buffer,
-            v.buffer,
-        ],
+        [gradients, weights, m, v],
         (total_size + 255) // 256,
     )
 
@@ -98,7 +96,7 @@ def adamw_update_2d(
     eps: float,
     step: int,
 ) -> None:
-    INTERNAL__adamw_update(
+    __adamw_update(
         device,
         config,
         pipeline_cache,
@@ -132,7 +130,7 @@ def adamw_update_1d(
     eps: float,
     step: int,
 ) -> None:
-    INTERNAL__adamw_update(
+    __adamw_update(
         device,
         config,
         pipeline_cache,
@@ -188,7 +186,7 @@ def gradient_clip(
         batch_state,
         get_gradient_clip_kernel(config),
         params,
-        [gradients.buffer],
+        [gradients],
         (total_size + 255) // 256,
     )
 
@@ -227,7 +225,7 @@ def buffer_fill(
         batch_state,
         get_buffer_fill_kernel(config),
         params,
-        [buffer.buffer],
+        [buffer],
         (total_size + 255) // 256,
     )
 
@@ -268,20 +266,20 @@ def reduce_sum(
         batch_state,
         get_reduce_sum_kernel(config),
         params,
-        [input_buffer.buffer, output_buffer.buffer],
+        [input_buffer, output_buffer],
         (total_size + 255) // 256,
     )
 
 
-def compute_gradient_norm(
+def __compute_gradient_norm(
     device: GPUDevice,
     config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    buffer_pool: BufferPool,
-    gradients: list,
+    gradients: List[GPUBuffer2D],
+    reduction_workspace: GPUBuffer1D,
 ) -> GPUBuffer1D:
-    """Compute global L2 norm across all gradient buffers.
+    """Compute global L2 norm using pre-allocated workspace across all gradient buffers.
 
     Two-stage process:
     1. Each buffer computes partial norms per workgroup
@@ -292,19 +290,23 @@ def compute_gradient_norm(
         config: GPU configuration
         pipeline_cache: Pipeline cache for kernel compilation
         batch_state: Batch state
-        buffer_pool: Buffer pool for temporary allocations
         gradients: List of all gradient buffers (GPUBuffer2D)
 
     Returns:
         Buffer containing single scalar with global gradient norm
     """
-    all_partial_norms = []
 
+    # Track offset into reduction workspace
+    current_offset = 0
+    total_partials = 0
+
+    # Phase 1: Per-gradient partial reductions
     for grad_buf in gradients:
         size = grad_buf.shape[0] * grad_buf.shape[1]
         num_workgroups = (size + 255) // 256
-        partial_norms = pool_take_buffer_1d(device, buffer_pool, num_workgroups)
-        params = np.array([size], dtype=np.uint32)
+
+        # Write partial sums to offset in pre-allocated workspace
+        params = np.array([size, current_offset], dtype=np.uint32)
 
         add_compute_to_batch(
             device,
@@ -313,18 +315,15 @@ def compute_gradient_norm(
             batch_state,
             get_gradient_norm_kernel(config),
             params,
-            grad_buf,
-            partial_norms,
+            [grad_buf, reduction_workspace],
             num_workgroups,
         )
-        all_partial_norms.append(partial_norms)
 
-    combined_partials = concatenate_buffers_1d(
-        device, batch_state, buffer_pool, all_partial_norms
-    )
+        current_offset += num_workgroups
+        total_partials += num_workgroups
 
-    total_partials = combined_partials.shape[0]
-    global_norm_buf = pool_take_buffer_1d(device, buffer_pool, 1)
+    # Phase 2: Final reduction over all partials
+    global_norm_buf = gpu_buffer_1d_create(device, 1)
     reduce_params = np.array([total_partials], dtype=np.uint32)
 
     add_compute_to_batch(
@@ -334,8 +333,7 @@ def compute_gradient_norm(
         batch_state,
         get_gradient_norm_reduce_kernel(config),
         reduce_params,
-        combined_partials,
-        global_norm_buf,
+        [reduction_workspace, global_norm_buf],
         1,
     )
 
@@ -347,9 +345,9 @@ def gradient_clip_with_norm(
     config: GPUConfig,
     pipeline_cache: PipelineCache,
     batch_state: BatchState,
-    buffer_pool: BufferPool,
-    gradients: list,
+    gradients: List[GPUBuffer2D],
     max_norm: float,
+    reduction_workspace: GPUBuffer1D,
 ) -> None:
     """Clip gradients by computing and using global norm.
 
@@ -362,16 +360,17 @@ def gradient_clip_with_norm(
         gradients: List of all gradient buffers to clip
         max_norm: Maximum allowed gradient norm
     """
-    total_norm_buf = compute_gradient_norm(
-        device, config, pipeline_cache, batch_state, buffer_pool, gradients
+    total_norm_buf = __compute_gradient_norm(
+        device, config, pipeline_cache, batch_state, gradients, reduction_workspace
     )
 
     submit_batch(device, batch_state)
 
-    norm_array = read_buffer_to_numpy(device, total_norm_buf, dtype=np.float32)
+    norm_array = np.array([], dtype=np.float32)
+    gpu_buffer_1d_read(device, total_norm_buf, norm_array)
     total_norm = float(norm_array[0])
 
-    batch_state = begin_batch(device)
+    batch_state = create_command_batch(device, config)
 
     for grad_buf in gradients:
         size = grad_buf.shape[0] * grad_buf.shape[1]
@@ -384,6 +383,7 @@ def gradient_clip_with_norm(
             batch_state,
             get_gradient_clip_kernel(config),
             params,
-            grad_buf,
+            [grad_buf],
             (size + 255) // 256,
         )
+    submit_batch(device, batch_state)

@@ -3,11 +3,9 @@
 from typing import Dict, List, Tuple
 
 import numpy as np
+import wgpu
 
-from .gpu_device import (
-    pipeline_get_or_create,
-    wgpu,
-)
+from .gpu_device import pipeline_get_or_create
 from .gpu_kernels import get_transpose_kernel
 from .gpu_types import (
     BatchState,

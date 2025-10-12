@@ -15,6 +15,8 @@ from .gpu_types import (
     PipelineCache,
 )
 
+__all__ = ["wgpu"]
+
 # ============================================================================
 # DEVICE MANAGEMENT
 # ============================================================================
@@ -533,7 +535,7 @@ def device_config_validate(config: GPUConfig) -> None:
         )
 
 
-def device_config_shared_memory_usage_estimate(config: GPUConfig) -> dict:
+def device_config_shared_memory_usage_estimate(config: GPUConfig) -> Dict[str, int]:
     """
     Estimate shared memory usage for different kernels.
 
