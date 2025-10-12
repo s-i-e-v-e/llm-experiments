@@ -3,7 +3,7 @@
 import numpy as np
 from gpu_buffer import create_gpu_buffer_1d, create_gpu_buffer_2d, gpu_to_numpy
 from gpu_device import create_device, create_pipeline_cache
-from gpu_ops_forward import run_layernorm, run_matmul
+from gpu_operations import run_layernorm, run_matmul
 from gpu_types import Device
 
 # ============================================================================
