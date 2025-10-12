@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 
 from common.util import load_tokenizer
-from v2.jax_backend import forward, load_model, sample_token
+from jax_backend import forward, load_model, sample_token
 
 
 def generate_text(

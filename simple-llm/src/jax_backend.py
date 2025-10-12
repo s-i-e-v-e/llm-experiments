@@ -9,12 +9,12 @@ import optax
 from flax import struct
 
 from common.util import deserialize, get_model_file_names, serialize
-from v2.hyper import HyperParams
+from common_backend import TransformerModelParams
+from hyper import HyperParams
 
 # JAX configuration
 jax.config.update("jax_enable_x64", False)
 jax.config.update("jax_default_matmul_precision", "bfloat16")
-from v2.hyper import HyperParams
 
 
 # ============================================================================
@@ -35,7 +35,11 @@ def positional_encoding(seq_len, dim):
 
 @struct.dataclass
 class LayerParams:
-    """Parameters for a single transformer layer"""
+    """
+    Parameters for a single transformer layer
+
+    This dataclass is immutable - do not modify fields after creation.
+    """
 
     attn_wq: jnp.ndarray
     attn_wk: jnp.ndarray
@@ -55,17 +59,7 @@ class LayerParams:
 class ModelParams:
     embedding: jnp.ndarray
     pos_encoding: jnp.ndarray
-    layers: list
-
-
-@dataclasses.dataclass
-class TransformerModelParams:
-    vocab_size: int
-    embedding_dim: int
-    context_size: int
-    n_heads: int
-    n_layers: int
-    epochs: list = dataclasses.field(default_factory=list)
+    layers: list[LayerParams]
 
 
 @dataclasses.dataclass
@@ -323,8 +317,8 @@ def create_optimizer_with_schedule(scaled_lr, total_steps):
 
 def initialize_model(
     hp: HyperParams,
-    epochs,
-    total_steps,
+    epochs: int,
+    total_steps: int,
 ):
     """Initialize model - no pre-compilation overhead"""
     key = jax.random.PRNGKey(0)

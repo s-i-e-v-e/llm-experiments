@@ -143,6 +143,130 @@ def matmul_backward_b(
     )
 
 
+def embedding_backward(
+    device: GPUDevice,
+    config: GPUConfig,
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    buffer_pool: BufferPool,
+    input_ids: GPUBuffer1D,
+    grad_output: GPUBuffer2D,
+    grad_embedding: GPUBuffer2D,
+    batch_size: int,
+    seq_len: int,
+) -> None:
+    """Embedding backward pass with atomic accumulation.
+
+    Two-stage process:
+    1. Accumulate gradients as i32 using atomics (handles race conditions)
+    2. Convert i32 back to f32
+
+    Args:
+        device: GPU device
+        config: GPU configuration
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state
+        buffer_pool: Buffer pool for temporary allocations
+        input_ids: Input token IDs [batch_size*seq_len]
+        grad_output: Gradient w.r.t. embeddings [batch_size*seq_len, embedding_dim]
+        grad_embedding: Output gradient w.r.t. embedding table [vocab_size, embedding_dim]
+        batch_size: Batch size
+        seq_len: Sequence length
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
+    total_tokens, embedding_dim = grad_output.shape
+    vocab_size, embedding_dim2 = grad_embedding.shape
+
+    if embedding_dim != embedding_dim2:
+        raise ValueError(f"Embedding dim mismatch: {embedding_dim} != {embedding_dim2}")
+
+    validate_buffer_shape_1d(input_ids, total_tokens, "input_ids")
+    validate_buffer_shape_2d(grad_output, total_tokens, embedding_dim, "grad_output")
+
+    temp_i32 = pool_take_buffer_2d(device, buffer_pool, vocab_size, embedding_dim)
+    clear_buffer(device, temp_i32)
+
+    params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
+
+    add_compute_to_batch(
+        device,
+        config,
+        pipeline_cache,
+        batch_state,
+        get_embedding_backward_kernel(config),
+        params,
+        input_ids,
+        grad_output,
+        temp_i32,
+        (total_tokens + 255) // 256,
+        (embedding_dim + 255) // 256,
+        1,
+    )
+
+    convert_params = np.array([vocab_size * embedding_dim], dtype=np.uint32)
+
+    add_compute_to_batch(
+        device,
+        config,
+        pipeline_cache,
+        batch_state,
+        get_embedding_backward_convert_kernel(config),
+        convert_params,
+        temp_i32,
+        grad_embedding,
+        (vocab_size * embedding_dim + 255) // 256,
+    )
+
+
+def dropout_backward(
+    device: GPUDevice,
+    config: GPUConfig,
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    grad_output: GPUBuffer2D,
+    mask: GPUBuffer2D,
+    grad_input: GPUBuffer2D,
+    keep_prob: float,
+) -> None:
+    """Dropout backward using saved mask.
+
+    Args:
+        device: GPU device
+        config: GPU configuration
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state
+        grad_output: Gradient w.r.t. output [rows, cols]
+        mask: Mask from forward pass [rows, cols]
+        grad_input: Output gradient w.r.t. input [rows, cols]
+        keep_prob: Probability of keeping each element (from forward pass)
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
+    rows, cols = grad_output.shape
+
+    validate_buffer_shape_2d(grad_input, rows, cols, "grad_input")
+    validate_buffer_shape_2d(mask, rows, cols, "mask")
+
+    total_size = rows * cols
+    params = np.array([total_size, keep_prob], dtype=np.float32)
+
+    add_compute_to_batch(
+        device,
+        config,
+        pipeline_cache,
+        batch_state,
+        get_dropout_backward_kernel(config),
+        params,
+        grad_output,
+        mask,
+        grad_input,
+        (total_size + 255) // 256,
+    )
+
+
 def layernorm_backward(
     device: GPUDevice,
     config: GPUConfig,

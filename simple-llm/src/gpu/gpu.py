@@ -31,6 +31,7 @@ from .gpu_device import (
     pipeline_tuned_create,
     select_optimal_tile_size,
 )
+from .gpu_ops import create_command_batch
 from .gpu_pass_backward import (
     attention_backward,
     bias_backward,
@@ -62,11 +63,15 @@ from .gpu_pass_optimizer import (
 )
 from .gpu_types import (
     BatchState,
+    BufferPool,
     GPUBuffer1D,
     GPUBuffer2D,
     GPUConfig,
     GPUDevice,
+    GPULayerGradients,
     GPULayerParams,
+    GPUModelGradients,
+    GPUModelParams,
     GPUOptimizerState,
     PipelineCache,
     WorkspaceBuffers,
@@ -83,11 +88,15 @@ from .gpu_workspace import (
 
 __all__ = [
     # Types
+    "BufferPool",
     "GPUDevice",
+    "GPUModelGradients",
+    "GPUModelParams",
+    "GPULayerGradients",
+    "GPULayerParams",
     "GPUConfig",
     "GPUBuffer1D",
     "GPUBuffer2D",
-    "GPULayerParams",
     "GPUOptimizerState",
     "BatchState",
     "PipelineCache",
@@ -154,4 +163,6 @@ __all__ = [
     "bias_backward",
     "attention_backward",
     "flash_attention_backward",
+    # Ops
+    "create_command_batch",
 ]

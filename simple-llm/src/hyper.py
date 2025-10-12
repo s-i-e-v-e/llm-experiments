@@ -106,6 +106,8 @@ def get_hyperparams_auto(
 
             # Linear interpolation for most parameters
             embedding_dim = round(d_lower + t * (d_upper - d_lower))
+            # Round up to nearest even number
+            embedding_dim = embedding_dim + (embedding_dim % 2)
             n_layers = round(l_lower + t * (l_upper - l_lower))
             n_heads = round(h_lower + t * (h_upper - h_lower))
             context_size = round(c_lower + t * (c_upper - c_lower))
@@ -127,6 +129,8 @@ def get_hyperparams_auto(
                     n_heads = min(divisors, key=lambda x: abs(x - n_heads))
                 else:
                     embedding_dim = n_heads * (embedding_dim // n_heads)
+                    if embedding_dim % 2 != 0:
+                        embedding_dim += n_heads
 
             # Round context and vocab to powers of 2 (hardware efficient)
             context_size = 2 ** round(math.log2(max(context_size, 32)))

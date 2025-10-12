@@ -598,13 +598,13 @@ fn main(
     shared_reduction[tid] = max_score;
     workgroupBarrier();
 
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_reduction[tid] = max(shared_reduction[tid], shared_reduction[tid + active]);
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_reduction[tid] = max(shared_reduction[tid], shared_reduction[tid + active_threads]);
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     max_score = shared_reduction[0];
     workgroupBarrier();
@@ -621,13 +621,13 @@ fn main(
     shared_reduction[tid] = sum_exp;
     workgroupBarrier();
 
-    active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_reduction[tid] += shared_reduction[tid + active];
+    active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_reduction[tid] += shared_reduction[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     sum_exp = shared_reduction[0];
     workgroupBarrier();
@@ -1115,13 +1115,13 @@ fn main(
     workgroupBarrier();
 
     // Reduction to find global max
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] = max(shared_data[tid], shared_data[tid + active]);
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] = max(shared_data[tid], shared_data[tid + active_threads]);
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     max_logit = shared_data[0];
     workgroupBarrier();
@@ -1135,13 +1135,13 @@ fn main(
     workgroupBarrier();
 
     // Reduction to find global sum
-    active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] += shared_data[tid + active];
+    active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] += shared_data[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     sum_exp = shared_data[0];
     workgroupBarrier();
@@ -1225,13 +1225,13 @@ fn main(
     shared_data[tid] = max_logit;
     workgroupBarrier();
 
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] = max(shared_data[tid], shared_data[tid + active]);
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] = max(shared_data[tid], shared_data[tid + active_threads]);
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     max_logit = shared_data[0];
     workgroupBarrier();
@@ -1244,13 +1244,13 @@ fn main(
     shared_data[tid] = sum_exp;
     workgroupBarrier();
 
-    active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] += shared_data[tid + active];
+    active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] += shared_data[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     sum_exp = shared_data[0];
     workgroupBarrier();
@@ -1477,12 +1477,14 @@ fn main(
 
     for (var t = 0u; t < num_tiles; t++) {{
         // Load A^T tile (transpose on-the-fly) - each thread loads ITEMS_PER_THREAD elements
+        // This loads a tile of A into tile_A with a layout ready for matmul.
         for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
             let a_row = t * TILE_SIZE + local_row;
             let a_col = base_row + i;
-            let tile_idx = local_row * TILE_SIZE + (local_col * ITEMS_PER_THREAD + i);
+            let tile_idx = (local_row * ITEMS_PER_THREAD + i) * TILE_SIZE + local_col;
 
             if (a_row < params.M && a_col < params.K) {{
+                // Note: The indexing here loads A transposed into tile_A
                 tile_A[tile_idx] = A[a_row * params.K + a_col];
             }} else {{
                 tile_A[tile_idx] = 0.0;
@@ -1504,10 +1506,9 @@ fn main(
 
         workgroupBarrier();
 
-        // Compute partial results
         for (var k = 0u; k < TILE_SIZE; k++) {{
             for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-                let a_val = tile_A[k * TILE_SIZE + (local_col * ITEMS_PER_THREAD + i)];
+                let a_val = tile_A[(local_row * ITEMS_PER_THREAD + i) * TILE_SIZE + k];
                 for (var j = 0u; j < ITEMS_PER_THREAD; j++) {{
                     let grad_val = tile_grad[k * TILE_SIZE + (local_col * ITEMS_PER_THREAD + j)];
                     acc[i * ITEMS_PER_THREAD + j] += a_val * grad_val;
@@ -1615,13 +1616,13 @@ fn main(
     shared_data[tid] = sum;
     workgroupBarrier();
 
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] += shared_data[tid + active];
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] += shared_data[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
 
     let mean = shared_data[0] / f32(params.size);
@@ -1636,13 +1637,13 @@ fn main(
     shared_data[tid] = var_sum;
     workgroupBarrier();
 
-    active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] += shared_data[tid + active];
+    active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] += shared_data[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
 
     let variance = shared_data[0] / f32(params.size);
@@ -1677,13 +1678,13 @@ fn main(
     shared_data[tid] = d_xhat_sum;
     workgroupBarrier();
 
-    active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] += shared_data[tid + active];
+    active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] += shared_data[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     d_xhat_sum = shared_data[0];
     workgroupBarrier();
@@ -1691,13 +1692,13 @@ fn main(
     shared_data[tid] = d_xhat_xhat_sum;
     workgroupBarrier();
 
-    active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] += shared_data[tid + active];
+    active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] += shared_data[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     d_xhat_xhat_sum = shared_data[0];
     workgroupBarrier();
@@ -1784,14 +1785,14 @@ fn main(
     workgroupBarrier();
 
     // Tree reduction
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_gamma[tid] += shared_gamma[tid + active];
-            shared_beta[tid] += shared_beta[tid + active];
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_gamma[tid] += shared_gamma[tid + active_threads];
+            shared_beta[tid] += shared_beta[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
 
     // Thread 0 writes final result
@@ -1878,14 +1879,14 @@ fn main(
     workgroupBarrier();
 
     // Tree reduction
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_gamma[tid] += shared_gamma[tid + active];
-            shared_beta[tid] += shared_beta[tid + active];
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_gamma[tid] += shared_gamma[tid + active_threads];
+            shared_beta[tid] += shared_beta[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
 
     // Thread 0 accumulates result
@@ -2021,13 +2022,13 @@ fn main(
     workgroupBarrier();
 
     // Tree reduction
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] += shared_data[tid + active];
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] += shared_data[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
 
     // Thread 0 writes result
@@ -2151,13 +2152,13 @@ fn main(
     shared_reduction[tid] = max_score;
     workgroupBarrier();
 
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_reduction[tid] = max(shared_reduction[tid], shared_reduction[tid + active]);
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_reduction[tid] = max(shared_reduction[tid], shared_reduction[tid + active_threads]);
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     max_score = shared_reduction[0];
     workgroupBarrier();
@@ -2173,13 +2174,13 @@ fn main(
     shared_reduction[tid] = sum_exp;
     workgroupBarrier();
 
-    active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_reduction[tid] += shared_reduction[tid + active];
+    active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_reduction[tid] += shared_reduction[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     sum_exp = shared_reduction[0];
     workgroupBarrier();
@@ -2192,13 +2193,13 @@ fn main(
     shared_reduction[tid] = dO_dot_O;
     workgroupBarrier();
 
-    active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_reduction[tid] += shared_reduction[tid + active];
+    active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_reduction[tid] += shared_reduction[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
     dO_dot_O = shared_reduction[0];
     workgroupBarrier();
@@ -2330,14 +2331,14 @@ fn main(
     workgroupBarrier();
 
     // Tree reduction
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_K[tid] += shared_K[tid + active];
-            shared_V[tid] += shared_V[tid + active];
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_K[tid] += shared_K[tid + active_threads];
+            shared_V[tid] += shared_V[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
 
     // Thread 0 writes final result
@@ -2771,14 +2772,14 @@ fn main(
     workgroupBarrier();
 
     // Tree reduction
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_K[tid] += shared_K[tid + active];
-            shared_V[tid] += shared_V[tid + active];
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_K[tid] += shared_K[tid + active_threads];
+            shared_V[tid] += shared_V[tid + active_threads];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active_threads >>= 1u;
     }}
 
     // Thread 0 writes result
@@ -3043,18 +3044,384 @@ fn main(
     workgroupBarrier();
 
     // Tree reduction in shared memory
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] += shared_data[tid + active_threads];
+        }}
+        workgroupBarrier();
+        active_threads >>= 1u;
+    }}
+
+    // Write result for this workgroup
+    if (tid == 0u) {{
+        output[workgroup_id.x] = shared_data[0];
+    }}
+}}
+"""
+
+
+# ============================================================================
+# NEW KERNELS
+# ============================================================================
+
+
+def create_cross_entropy_loss_masked_kernel(workgroup_size: int = 256) -> str:
+    """Generate cross-entropy loss kernel with padding mask support."""
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
+        )
+
+    return f"""// Cross-entropy with masking for padding tokens
+struct LossParams {{
+    batch_size: u32,
+    seq_len: u32,
+    vocab_size: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: LossParams;
+@group(0) @binding(1) var<storage, read> logits: array<f32>;
+@group(0) @binding(2) var<storage, read> targets: array<u32>;
+@group(0) @binding(3) var<storage, read> mask: array<u32>;  // 1=valid, 0=padding
+@group(0) @binding(4) var<storage, read_write> loss_output: array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_logits: array<f32>;
+
+const BLOCK_SIZE: u32 = {workgroup_size}u;
+var<workgroup> shared_data: array<f32, {workgroup_size}>;
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
+) {{
+    let token_idx = workgroup_id.x;
+    let tid = local_id.x;
+
+    if (token_idx >= params.batch_size * params.seq_len) {{ return; }}
+
+    let is_valid = mask[token_idx];
+
+    // MASKED TOKENS: Zero loss and gradients
+    if (is_valid == 0u) {{
+        loss_output[token_idx] = 0.0;
+        for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
+            grad_logits[token_idx * params.vocab_size + i] = 0.0;
+        }}
+        return;
+    }}
+
+    // VALID TOKENS: Normal cross-entropy computation
+    let logit_offset = token_idx * params.vocab_size;
+    let target = targets[token_idx];
+
+    // Find max (numerical stability)
+    var max_logit = -1e10;
+    for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
+        max_logit = max(max_logit, logits[logit_offset + i]);
+    }}
+    shared_data[tid] = max_logit;
+    workgroupBarrier();
+
+    var active = BLOCK_SIZE / 2u;
+    while (active > 0u) {{
+        if (tid < active) {{
+            shared_data[tid] = max(shared_data[tid], shared_data[tid + active]);
+        }}
+        workgroupBarrier();
+        active /= 2u;
+    }}
+    max_logit = shared_data[0];
+    workgroupBarrier();
+
+    // Sum of exponentials
+    var sum_exp = 0.0;
+    for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
+        sum_exp += exp(logits[logit_offset + i] - max_logit);
+    }}
+    shared_data[tid] = sum_exp;
+    workgroupBarrier();
+
+    active = BLOCK_SIZE / 2u;
+    while (active > 0u) {{
+        if (tid < active) {{
+            shared_data[tid] += shared_data[tid + active];
+        }}
+        workgroupBarrier();
+        active /= 2u;
+    }}
+    sum_exp = shared_data[0];
+    workgroupBarrier();
+
+    // Compute loss
+    if (tid == 0u) {{
+        let target_logit = logits[logit_offset + target];
+        loss_output[token_idx] = log(sum_exp) + max_logit - target_logit;
+    }}
+
+    // Compute gradients: softmax(logits) - one_hot(target)
+    for (var i = tid; i < params.vocab_size; i += BLOCK_SIZE) {{
+        let prob = exp(logits[logit_offset + i] - max_logit) / sum_exp;
+        let one_hot = select(0.0, 1.0, i == target);
+        grad_logits[logit_offset + i] = prob - one_hot;
+    }}
+}}
+"""
+
+
+def create_embedding_backward_kernel(workgroup_size: int = 256) -> str:
+    """Generate embedding backward pass kernel with atomic accumulation."""
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
+        )
+
+    return f"""// Embedding backward: accumulate gradients to embedding table
+struct EmbedBackwardParams {{
+    batch_size: u32,
+    seq_len: u32,
+    embedding_dim: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: EmbedBackwardParams;
+@group(0) @binding(1) var<storage, read> input_ids: array<u32>;
+@group(0) @binding(2) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_embedding: array<atomic<i32>>;
+
+// Fixed-point scale for atomic operations
+const SCALE: f32 = 65536.0;
+
+fn f32_to_i32(x: f32) -> i32 {{
+    return i32(x * SCALE);
+}}
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
+    let token_idx = global_id.x;
+    let dim_idx = global_id.y;
+
+    let total_tokens = params.batch_size * params.seq_len;
+
+    if (token_idx >= total_tokens || dim_idx >= params.embedding_dim) {{
+        return;
+    }}
+
+    let token_id = input_ids[token_idx];
+    let grad_value = grad_output[token_idx * params.embedding_dim + dim_idx];
+
+    let emb_offset = token_id * params.embedding_dim + dim_idx;
+    atomicAdd(&grad_embedding[emb_offset], f32_to_i32(grad_value));
+}}
+"""
+
+
+def create_embedding_backward_convert_kernel(workgroup_size: int = 256) -> str:
+    """Convert atomic i32 gradients back to f32."""
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
+        )
+
+    return f"""// Convert atomic i32 gradients to f32
+struct ConvertParams {{
+    size: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: ConvertParams;
+@group(0) @binding(1) var<storage, read> grad_i32: array<atomic<i32>>;
+@group(0) @binding(2) var<storage, read_write> grad_f32: array<f32>;
+
+const SCALE: f32 = 65536.0;
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
+    let idx = global_id.x;
+    if (idx >= params.size) {{ return; }}
+
+    let i32_val = atomicLoad(&grad_i32[idx]);
+    grad_f32[idx] = f32(i32_val) / SCALE;
+}}
+"""
+
+
+def create_dropout_kernel(workgroup_size: int = 256) -> str:
+    """Generate dropout kernel with PCG random number generator."""
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
+        )
+
+    return f"""// Dropout with PCG random number generation
+struct DropoutParams {{
+    size: u32,
+    keep_prob: f32,
+    seed: u32,
+    offset: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: DropoutParams;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read_write> mask: array<u32>;  // Save mask for backward
+
+// PCG Random Number Generator (O'Neill 2014)
+fn pcg_hash(input: u32) -> u32 {{
+    var state = input * 747796405u + 2891336453u;
+    var word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}}
+
+fn random_uniform(seed: u32, idx: u32) -> f32 {{
+    let hash = pcg_hash(seed + idx);
+    return f32(hash) / 4294967296.0;  // Normalize to [0, 1)
+}}
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
+    let idx = global_id.x;
+    if (idx >= params.size) {{ return; }}
+
+    let rand = random_uniform(params.seed, params.offset + idx);
+    let keep = select(0u, 1u, rand < params.keep_prob);
+
+    // Scale by 1/keep_prob for inverted dropout
+    let scale = 1.0 / params.keep_prob;
+    output[idx] = input[idx] * f32(keep) * scale;
+    mask[idx] = keep;
+}}
+"""
+
+
+def create_dropout_backward_kernel(workgroup_size: int = 256) -> str:
+    """Generate dropout backward kernel."""
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
+        )
+
+    return f"""// Dropout backward pass
+struct DropoutBackwardParams {{
+    size: u32,
+    keep_prob: f32,
+}}
+
+@group(0) @binding(0) var<uniform> params: DropoutBackwardParams;
+@group(0) @binding(1) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(2) var<storage, read> mask: array<u32>;
+@group(0) @binding(3) var<storage, read_write> grad_input: array<f32>;
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
+    let idx = global_id.x;
+    if (idx >= params.size) {{ return; }}
+
+    let scale = 1.0 / params.keep_prob;
+    grad_input[idx] = grad_output[idx] * f32(mask[idx]) * scale;
+}}
+"""
+
+
+def create_gradient_norm_kernel(workgroup_size: int = 256) -> str:
+    """Generate kernel to compute L2 norm of gradients (first pass)."""
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
+        )
+
+    return f"""// Compute partial squared norms for gradient clipping
+struct NormParams {{
+    size: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: NormParams;
+@group(0) @binding(1) var<storage, read> gradients: array<f32>;
+@group(0) @binding(2) var<storage, read_write> partial_norms: array<f32>;
+
+const BLOCK_SIZE: u32 = {workgroup_size}u;
+var<workgroup> shared_data: array<f32, {workgroup_size}>;
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
+) {{
+    let tid = local_id.x;
+
+    // Accumulate squared gradients
+    var sum_sq = 0.0;
+    for (var i = global_id.x; i < params.size; i += BLOCK_SIZE * gridDim.x) {{
+        let g = gradients[i];
+        sum_sq += g * g;
+    }}
+
+    shared_data[tid] = sum_sq;
+    workgroupBarrier();
+
+    // Tree reduction
     var active = BLOCK_SIZE / 2u;
     while (active > 0u) {{
         if (tid < active) {{
             shared_data[tid] += shared_data[tid + active];
         }}
         workgroupBarrier();
-        active >>= 1u;
+        active /= 2u;
     }}
 
-    // Write result for this workgroup
+    // Write partial sum
     if (tid == 0u) {{
-        output[workgroup_id.x] = shared_data[0];
+        partial_norms[workgroup_id.x] = shared_data[0];
+    }}
+}}
+"""
+
+
+def create_gradient_norm_reduce_kernel(workgroup_size: int = 256) -> str:
+    """Generate kernel to reduce partial norms to global norm (second pass)."""
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
+        )
+
+    return f"""// Reduce partial norms to global norm
+struct ReduceParams {{
+    num_partials: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: ReduceParams;
+@group(0) @binding(1) var<storage, read> partial_norms: array<f32>;
+@group(0) @binding(2) var<storage, read_write> global_norm: array<f32>;
+
+const BLOCK_SIZE: u32 = {workgroup_size}u;
+var<workgroup> shared_data: array<f32, {workgroup_size}>;
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {{
+    let tid = local_id.x;
+
+    // Load partial norms
+    var sum = 0.0;
+    for (var i = tid; i < params.num_partials; i += BLOCK_SIZE) {{
+        sum += partial_norms[i];
+    }}
+
+    shared_data[tid] = sum;
+    workgroupBarrier();
+
+    // Tree reduction
+    var active = BLOCK_SIZE / 2u;
+    while (active > 0u) {{
+        if (tid < active) {{
+            shared_data[tid] += shared_data[tid + active];
+        }}
+        workgroupBarrier();
+        active /= 2u;
+    }}
+
+    // Compute sqrt of sum to get L2 norm
+    if (tid == 0u) {{
+        global_norm[0] = sqrt(shared_data[0]);
     }}
 }}
 """
@@ -3122,6 +3489,16 @@ def get_softmax_kernel(config) -> str:
     return create_softmax_kernel(config.default_workgroup_size)
 
 
+def get_cross_entropy_loss_masked_kernel(config) -> str:
+    """Factory function for masked cross-entropy kernel."""
+    return create_cross_entropy_loss_masked_kernel(config.default_workgroup_size)
+
+
+def get_dropout_kernel(config) -> str:
+    """Factory function for dropout kernel."""
+    return create_dropout_kernel(config.default_workgroup_size)
+
+
 # ====
 # BACKWARD
 # ====
@@ -3179,6 +3556,21 @@ def get_flash_attention_backward_reduce_kernel(config) -> str:
     )
 
 
+def get_embedding_backward_kernel(config) -> str:
+    """Factory function for embedding backward kernel."""
+    return create_embedding_backward_kernel(config.default_workgroup_size)
+
+
+def get_embedding_backward_convert_kernel(config) -> str:
+    """Factory function for embedding backward convert kernel."""
+    return create_embedding_backward_convert_kernel(config.default_workgroup_size)
+
+
+def get_dropout_backward_kernel(config) -> str:
+    """Factory function for dropout backward kernel."""
+    return create_dropout_backward_kernel(config.default_workgroup_size)
+
+
 # ====
 # OPTIMIZER
 # ====
@@ -3193,6 +3585,16 @@ def get_buffer_fill_kernel(config) -> str:
 
 def get_gradient_clip_kernel(config) -> str:
     return create_gradient_clip_kernel(config.default_workgroup_size)
+
+
+def get_gradient_norm_kernel(config) -> str:
+    """Factory function for gradient norm computation kernel."""
+    return create_gradient_norm_kernel(config.default_workgroup_size)
+
+
+def get_gradient_norm_reduce_kernel(config) -> str:
+    """Factory function for gradient norm reduction kernel."""
+    return create_gradient_norm_reduce_kernel(config.default_workgroup_size)
 
 
 def get_reduce_sum_kernel(config) -> str:

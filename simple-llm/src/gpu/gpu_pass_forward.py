@@ -3,7 +3,6 @@ import numpy as np
 from .gpu_kernels import (
     get_attention_kernel,
     get_bias_add_kernel,
-    get_cross_entropy_loss_kernel,
     get_embedding_kernel,
     get_extract_last_tokens_kernel,
     get_flash_attention_kernel,
@@ -154,71 +153,6 @@ def embedding(
     )
 
 
-def attention(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
-    Q: GPUBuffer2D,
-    K: GPUBuffer2D,
-    V: GPUBuffer2D,
-    output: GPUBuffer2D,
-    batch_size: int,
-    seq_len: int,
-    n_heads: int,
-    head_dim: int,
-) -> None:
-    """Multi-head self-attention with causal masking
-
-    Computes scaled dot-product attention for each head, with causal masking
-    to prevent attending to future positions.
-
-    Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
-        Q: Query matrix (batch_size * seq_len, n_heads * head_dim)
-        K: Key matrix (batch_size * seq_len, n_heads * head_dim)
-        V: Value matrix (batch_size * seq_len, n_heads * head_dim)
-        output: Output matrix (batch_size * seq_len, n_heads * head_dim)
-        batch_size: Batch size
-        seq_len: Sequence length (no upper limit)
-        n_heads: Number of attention heads
-        head_dim: Dimension per head (no upper limit)
-
-    Raises:
-        ValueError: If buffer shapes don't match or dimensions invalid
-    """
-
-    if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
-        raise ValueError(
-            f"Invalid dimensions: batch_size={batch_size}, seq_len={seq_len}, "
-            f"n_heads={n_heads}, head_dim={head_dim}"
-        )
-
-    embedding_dim = n_heads * head_dim
-    total_tokens = batch_size * seq_len
-
-    validate_buffer_shape_2d(Q, (total_tokens, embedding_dim), "Q")
-    validate_buffer_shape_2d(K, (total_tokens, embedding_dim), "K")
-    validate_buffer_shape_2d(V, (total_tokens, embedding_dim), "V")
-    validate_buffer_shape_2d(output, (total_tokens, embedding_dim), "output")
-
-    params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
-
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_attention_kernel(config),
-        params,
-        [Q, K, V, output],
-        workgroups_x=seq_len,
-        workgroups_y=n_heads,
-        workgroups_z=batch_size,
-    )
-
-
 def layernorm(
     device: GPUDevice,
     config: GPUConfig,
@@ -303,49 +237,6 @@ def gelu(
         params,
         [input_buf, output],
         (total_size + 255) // 256,
-    )
-
-
-def softmax(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
-    logits: GPUBuffer2D,
-    probs: GPUBuffer2D,
-) -> None:
-    """
-    Apply softmax to logits to get probability distribution.
-
-    Args:
-        pipeline_cache: Pipeline cache for compute pipelines
-        batch_state: Current batch state with encoder
-        logits: Input logits [batch_size, vocab_size]
-        probs: Output probabilities [batch_size, vocab_size]
-
-    Note:
-        Uses numerically stable softmax with max subtraction.
-        For generation/sampling after computing final layer logits.
-    """
-
-    if logits.shape != probs.shape:
-        raise ValueError(
-            f"Softmax shape mismatch: logits {logits.shape} != probs {probs.shape}"
-        )
-
-    batch_size, vocab_size = logits.shape
-
-    params = np.array([batch_size, vocab_size], dtype=np.uint32)
-
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_softmax_kernel(config),
-        params,
-        [logits.buffer, probs.buffer],
-        batch_size,
     )
 
 
@@ -500,47 +391,152 @@ def cross_entropy_loss(
     batch_state: BatchState,
     logits: GPUBuffer2D,
     targets: GPUBuffer1D,
+    mask: GPUBuffer1D,
     loss_output: GPUBuffer1D,
     grad_logits: GPUBuffer2D,
 ) -> None:
-    """Combined cross-entropy loss and gradient computation.
+    """Combined cross-entropy loss and gradient computation with masking.
 
     Computes both loss values and gradients in one pass for efficiency.
+    Masked (padding) tokens receive zero loss and zero gradients.
 
     Args:
+        device: GPU device
+        config: GPU configuration
         pipeline_cache: Pipeline cache for kernel compilation
         batch_state: Batch state
-        logits: Model predictions (batch_size * seq_len, vocab_size)
-        targets: Target token IDs (batch_size * seq_len,) - uint32
-        loss_output: Loss for each prediction (batch_size * seq_len,)
-        grad_logits: Gradient w.r.t. logits (batch_size * seq_len, vocab_size)
-        batch_size: Batch size
-        seq_len: Sequence length
+        logits: Model predictions [batch_size*seq_len, vocab_size]
+        targets: Target token IDs [batch_size*seq_len] - uint32
+        mask: Mask for valid tokens [batch_size*seq_len] - 1=valid, 0=padding
+        loss_output: Loss for each prediction [batch_size*seq_len]
+        grad_logits: Gradient w.r.t. logits [batch_size*seq_len, vocab_size]
 
     Raises:
         ValueError: If buffer shapes don't match
     """
     batch_seq, vocab_size = logits.shape
 
-    if batch_seq <= 0 or vocab_size <= 0:
-        raise ValueError(f"Invalid logits shape: {(batch_seq, vocab_size)}")
+    if batch_seq == 0 or vocab_size == 0:
+        raise ValueError(f"Invalid logits shape {batch_seq, vocab_size}")
 
     validate_buffer_shape_1d(targets, batch_seq, "targets")
+    validate_buffer_shape_1d(mask, batch_seq, "mask")
     validate_buffer_shape_1d(loss_output, batch_seq, "loss_output")
-    validate_buffer_shape_2d(grad_logits, (batch_seq, vocab_size), "grad_logits")
-    validate_buffer_shape_2d(logits, (batch_seq, vocab_size), "logits")
+    validate_buffer_shape_2d(grad_logits, batch_seq, vocab_size, "grad_logits")
+    validate_buffer_shape_2d(logits, batch_seq, vocab_size, "logits")
 
-    params = np.array([batch_seq, 1, vocab_size], dtype=np.uint32)
+    params = np.array([1, batch_seq, vocab_size], dtype=np.uint32)
 
     add_compute_to_batch(
         device,
         config,
         pipeline_cache,
         batch_state,
-        get_cross_entropy_loss_kernel(config),
+        get_cross_entropy_loss_masked_kernel(config),
         params,
-        [logits, targets, loss_output, grad_logits],
+        logits,
+        targets,
+        mask,
+        loss_output,
+        grad_logits,
         (batch_seq + 255) // 256,
+    )
+
+
+def dropout(
+    device: GPUDevice,
+    config: GPUConfig,
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    input_buf: GPUBuffer2D,
+    output: GPUBuffer2D,
+    mask: GPUBuffer2D,
+    keep_prob: float,
+    seed: int,
+    offset: int,
+) -> None:
+    """Apply dropout with saved mask for backward pass.
+
+    Args:
+        device: GPU device
+        config: GPU configuration
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state
+        input_buf: Input tensor [rows, cols]
+        output: Output tensor [rows, cols]
+        mask: Mask to save for backward [rows, cols] - uint32
+        keep_prob: Probability of keeping each element
+        seed: Random seed
+        offset: Offset for random number generation
+
+    Raises:
+        ValueError: If buffer shapes don't match
+    """
+    rows, cols = input_buf.shape
+
+    if rows == 0 or cols == 0:
+        raise ValueError(f"Invalid input shape {rows, cols}")
+
+    validate_buffer_shape_2d(output, rows, cols, "output")
+    validate_buffer_shape_2d(mask, rows, cols, "mask")
+
+    total_size = rows * cols
+    params = np.array([total_size, keep_prob, seed, offset], dtype=np.float32)
+
+    add_compute_to_batch(
+        device,
+        config,
+        pipeline_cache,
+        batch_state,
+        get_dropout_kernel(config),
+        params,
+        input_buf,
+        output,
+        mask,
+        (total_size + 255) // 256,
+    )
+
+
+def softmax(
+    device: GPUDevice,
+    config: GPUConfig,
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    logits: GPUBuffer2D,
+    probs: GPUBuffer2D,
+) -> None:
+    """
+    Apply softmax to logits to get probability distribution.
+
+    Args:
+        pipeline_cache: Pipeline cache for compute pipelines
+        batch_state: Current batch state with encoder
+        logits: Input logits [batch_size, vocab_size]
+        probs: Output probabilities [batch_size, vocab_size]
+
+    Note:
+        Uses numerically stable softmax with max subtraction.
+        For generation/sampling after computing final layer logits.
+    """
+
+    if logits.shape != probs.shape:
+        raise ValueError(
+            f"Softmax shape mismatch: logits {logits.shape} != probs {probs.shape}"
+        )
+
+    batch_size, vocab_size = logits.shape
+
+    params = np.array([batch_size, vocab_size], dtype=np.uint32)
+
+    add_compute_to_batch(
+        device,
+        config,
+        pipeline_cache,
+        batch_state,
+        get_softmax_kernel(config),
+        params,
+        [logits.buffer, probs.buffer],
+        batch_size,
     )
 
 
@@ -635,4 +631,69 @@ def flash_attention(
         num_q_blocks,
         n_heads,
         batch_size,
+    )
+
+
+def attention(
+    device: GPUDevice,
+    config: GPUConfig,
+    pipeline_cache: PipelineCache,
+    batch_state: BatchState,
+    Q: GPUBuffer2D,
+    K: GPUBuffer2D,
+    V: GPUBuffer2D,
+    output: GPUBuffer2D,
+    batch_size: int,
+    seq_len: int,
+    n_heads: int,
+    head_dim: int,
+) -> None:
+    """Multi-head self-attention with causal masking
+
+    Computes scaled dot-product attention for each head, with causal masking
+    to prevent attending to future positions.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state
+        Q: Query matrix (batch_size * seq_len, n_heads * head_dim)
+        K: Key matrix (batch_size * seq_len, n_heads * head_dim)
+        V: Value matrix (batch_size * seq_len, n_heads * head_dim)
+        output: Output matrix (batch_size * seq_len, n_heads * head_dim)
+        batch_size: Batch size
+        seq_len: Sequence length (no upper limit)
+        n_heads: Number of attention heads
+        head_dim: Dimension per head (no upper limit)
+
+    Raises:
+        ValueError: If buffer shapes don't match or dimensions invalid
+    """
+
+    if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
+        raise ValueError(
+            f"Invalid dimensions: batch_size={batch_size}, seq_len={seq_len}, "
+            f"n_heads={n_heads}, head_dim={head_dim}"
+        )
+
+    embedding_dim = n_heads * head_dim
+    total_tokens = batch_size * seq_len
+
+    validate_buffer_shape_2d(Q, (total_tokens, embedding_dim), "Q")
+    validate_buffer_shape_2d(K, (total_tokens, embedding_dim), "K")
+    validate_buffer_shape_2d(V, (total_tokens, embedding_dim), "V")
+    validate_buffer_shape_2d(output, (total_tokens, embedding_dim), "output")
+
+    params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
+
+    add_compute_to_batch(
+        device,
+        config,
+        pipeline_cache,
+        batch_state,
+        get_attention_kernel(config),
+        params,
+        [Q, K, V, output],
+        workgroups_x=seq_len,
+        workgroups_y=n_heads,
+        workgroups_z=batch_size,
     )

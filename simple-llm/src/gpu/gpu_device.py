@@ -202,19 +202,6 @@ def pipeline_get_or_create(
 """GPU configuration and auto-tuning"""
 
 
-def device_config_default_create() -> GPUConfig:
-    """
-    Create default GPU configuration with conservative settings.
-
-    These settings work on most GPUs but may not be optimal for all hardware.
-    For automatic optimization, use auto_detect_config() instead.
-
-    Returns:
-        GPUConfig with default parameters
-    """
-    return GPUConfig()
-
-
 def device_config_auto_detect(adapter: GPUAdapter, device: GPUDevice) -> GPUConfig:
     """
     Auto-detect GPU capabilities and return optimized configuration.
@@ -354,7 +341,7 @@ def device_config_auto_detect(adapter: GPUAdapter, device: GPUDevice) -> GPUConf
     )
 
 
-def device_config_create(device_name: Optional[str] = None) -> GPUConfig:
+def device_config_create(device: GPUDevice) -> GPUConfig:
     """
     Create GPU configuration tuned for specific device.
 
@@ -371,8 +358,11 @@ def device_config_create(device_name: Optional[str] = None) -> GPUConfig:
     Returns:
         GPUConfig tuned for the specified device
     """
+    default_config = GPUConfig()
+
+    device_name = device.adapter_info["device"]
     if device_name is None:
-        return device_config_default_create()
+        return default_config
 
     # Normalize device name for matching
     device_lower = device_name.lower()
@@ -439,7 +429,7 @@ def device_config_create(device_name: Optional[str] = None) -> GPUConfig:
         )
 
     else:
-        return device_config_default_create()
+        return default_config
 
 
 def device_config_validate(config: GPUConfig) -> None:

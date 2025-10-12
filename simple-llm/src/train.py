@@ -8,8 +8,8 @@ from common.util import (
     load_corpus,
     load_tokenizer,
 )
-from v2.generate import generate_text
-from v2.hyper import get_hyperparams_auto
+from generate import generate_text
+from hyper import get_hyperparams_auto
 
 
 def train_command(args):
@@ -32,7 +32,7 @@ def train_command(args):
 
     # STEP 5: Backend selection
     if args.backend == "jax":
-        from v2.jax_backend import (
+        from jax_backend import (
             initialize_model,
             load_model,
             save_model,
@@ -43,7 +43,7 @@ def train_command(args):
     elif args.backend == "python":
         raise NotImplementedError(f"Not implemented {args.backend}")
     elif args.backend == "wgpu":
-        from v2.wgpu_backend import (
+        from wgpu_backend import (
             initialize_model,
             load_model,
             save_model,

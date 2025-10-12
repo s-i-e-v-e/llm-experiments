@@ -6,6 +6,7 @@ import numpy as np
 
 from .gpu_device import wgpu
 from .gpu_types import (
+    BatchState,
     BufferInfo,
     BufferPool,
     GPUBuffer,
@@ -481,3 +482,205 @@ def staging_pool_download(
     staging.unmap()
 
     return data.reshape(gpu_buffer.shape)
+
+
+# ============================================================================
+# STAGING BUFFER POOL
+# ============================================================================
+
+
+def copy_buffer_region(
+    device: GPUDevice,
+    batch_state: BatchState,
+    source: Union[GPUBuffer1D, GPUBuffer2D],
+    dest: Union[GPUBuffer1D, GPUBuffer2D],
+    source_offset: int = 0,
+    dest_offset: int = 0,
+    size: int = None,
+) -> None:
+    """Copy a region from source buffer to destination buffer.
+
+    Args:
+        device: GPU device
+        batch_state: Batch state for command encoder
+        source: Source buffer
+        dest: Destination buffer
+        source_offset: Offset in source buffer (in elements)
+        dest_offset: Offset in destination buffer (in elements)
+        size: Number of elements to copy (None = all remaining)
+
+    Raises:
+        ValueError: If offsets/size invalid
+        RuntimeError: If batch not initialized
+    """
+    if batch_state.encoder is None:
+        raise RuntimeError("Must call begin_batch before copy operations")
+
+    source_size = (
+        source.shape[0]
+        if isinstance(source, GPUBuffer1D)
+        else source.shape[0] * source.shape[1]
+    )
+    dest_size = (
+        dest.shape[0]
+        if isinstance(dest, GPUBuffer1D)
+        else dest.shape[0] * dest.shape[1]
+    )
+
+    if size is None:
+        size = source_size - source_offset
+
+    if source_offset + size > source_size:
+        raise ValueError("Copy would read past end of source buffer")
+    if dest_offset + size > dest_size:
+        raise ValueError("Copy would write past end of dest buffer")
+
+    bytes_per_element = 4  # f32
+    source_byte_offset = source_offset * bytes_per_element
+    dest_byte_offset = dest_offset * bytes_per_element
+    byte_size = size * bytes_per_element
+
+    batch_state.encoder.copy_buffer_to_buffer(
+        source.buffer, source_byte_offset, dest.buffer, dest_byte_offset, byte_size
+    )
+    batch_state.operation_count += 1
+
+
+def concatenate_buffers_1d(
+    device: GPUDevice,
+    batch_state: BatchState,
+    buffer_pool: BufferPool,
+    sources: list,
+) -> GPUBuffer1D:
+    """Concatenate multiple 1D buffers into a single buffer.
+
+    Args:
+        device: GPU device
+        batch_state: Batch state for command encoder
+        buffer_pool: Buffer pool for allocating output
+        sources: List of source buffers to concatenate
+
+    Returns:
+        New buffer containing concatenated data
+
+    Raises:
+        ValueError: If sources is empty
+    """
+    if not sources:
+        raise ValueError("Cannot concatenate empty list of buffers")
+
+    total_size = sum(buf.shape[0] for buf in sources)
+    output = pool_take_buffer_1d(device, buffer_pool, total_size)
+
+    offset = 0
+    for source in sources:
+        copy_buffer_region(
+            device, batch_state, source, output, 0, offset, source.shape[0]
+        )
+        offset += source.shape[0]
+
+    return output
+
+
+def read_buffer_to_numpy(
+    device: GPUDevice,
+    buffer: Union[GPUBuffer1D, GPUBuffer2D],
+    dtype=np.float32,
+) -> np.ndarray:
+    """Read GPU buffer contents to numpy array (blocking operation).
+
+    This creates a staging buffer, copies GPU data to it, maps it for reading,
+    and copies to a numpy array. This is a synchronous operation that will
+    block until data is available.
+
+    Args:
+        device: GPU device
+        buffer: Buffer to read from
+        dtype: Numpy dtype (default: np.float32)
+
+    Returns:
+        Numpy array containing buffer data
+
+    Raises:
+        RuntimeError: If read operation fails
+    """
+    if isinstance(buffer, GPUBuffer1D):
+        size = buffer.shape[0]
+        shape = (size,)
+    else:  # GPUBuffer2D
+        rows, cols = buffer.shape
+        size = rows * cols
+        shape = (rows, cols)
+
+    byte_size = size * 4  # f32 = 4 bytes
+
+    staging_buffer = device.create_buffer(
+        size=byte_size, usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ
+    )
+
+    encoder = device.create_command_encoder()
+    encoder.copy_buffer_to_buffer(buffer.buffer, 0, staging_buffer, 0, byte_size)
+    command_buffer = encoder.finish()
+    device.queue.submit([command_buffer])
+
+    device.queue.wait_until_idle()
+
+    staging_buffer.map(wgpu.MapMode.READ)
+    mapped_data = staging_buffer.read_mapped()
+    array = np.frombuffer(mapped_data, dtype=dtype).copy()
+
+    staging_buffer.unmap()
+    staging_buffer.destroy()
+
+    return array.reshape(shape)
+
+
+def write_numpy_to_buffer(
+    device: GPUDevice,
+    data: np.ndarray,
+    buffer: Union[GPUBuffer1D, GPUBuffer2D],
+) -> None:
+    """Write numpy array to GPU buffer (blocking operation).
+
+    Args:
+        device: GPU device
+        data: Numpy array to write
+        buffer: Destination buffer
+
+    Raises:
+        ValueError: If data shape doesn't match buffer shape
+    """
+    if isinstance(buffer, GPUBuffer1D):
+        if data.shape != (buffer.shape[0],):
+            raise ValueError(
+                f"Data shape {data.shape} doesn't match buffer shape {buffer.shape}"
+            )
+    else:  # GPUBuffer2D
+        if data.shape != buffer.shape:
+            raise ValueError(
+                f"Data shape {data.shape} doesn't match buffer shape {buffer.shape}"
+            )
+
+    data_f32 = np.ascontiguousarray(data, dtype=np.float32)
+    device.queue.write_buffer(buffer.buffer, 0, data_f32.tobytes())
+
+
+def wait_for_gpu_idle(device: GPUDevice) -> None:
+    """Wait for all pending GPU operations to complete."""
+    device.queue.wait_until_idle()
+
+
+def poll_gpu(device: GPUDevice, timeout_ms: int = 1000) -> bool:
+    """Poll GPU for completion with timeout.
+
+    Returns:
+        True if operations completed, False if timeout
+    """
+    import time
+
+    start = time.time()
+    while (time.time() - start) * 1000 < timeout_ms:
+        if device.poll():
+            return True
+        time.sleep(0.001)
+    return False

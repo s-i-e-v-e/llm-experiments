@@ -459,6 +459,9 @@ class GPUModelParams:
     embedding: GPUBuffer2D  # (vocab_size, embedding_dim)
     pos_encoding: GPUBuffer2D  # (context_size, embedding_dim)
     layers: List[GPULayerParams]
+    final_ln_gamma: GPUBuffer1D
+    final_ln_beta: GPUBuffer1D
+    output_projection: GPUBuffer2D
 
 
 @dataclass
@@ -472,8 +475,13 @@ class GPUOptimizerState:
     v_embedding: GPUBuffer2D  # variance
     m_layers: List[GPULayerParams]
     v_layers: List[GPULayerParams]
+    m_output_projection: GPUBuffer2D
+    v_output_projection: GPUBuffer2D
     step: int
 
+
+GPULayerGradients = GPULayerParams
+GPUModelGradients = GPUModelParams
 
 # ============================================================================
 # WORKSPACE MANAGEMENT TYPES
