@@ -109,3 +109,32 @@ def optimizer_step(device, model_params, gradients, buffers):
 
     # Apply updates
     # ...
+
+
+=========================================
+KV cache usage
+# Create cache
+cache = gpu.kvcache_create(ctx, config)
+
+# During generation loop:
+for layer in layers:
+    q_new = gpu.matmul(...)  # From gpu_pass_forward
+    k_new = gpu.matmul(...)  # From gpu_pass_forward
+    v_new = gpu.matmul(...)  # From gpu_pass_forward
+
+    gpu.kvcache_update(ctx, cache, layer_idx, k_new, v_new)  # From gpu_kv_cache
+    gpu.attention_with_kvcache(ctx, cache, layer_idx, q_new, output)  # From gpu_kv_cache
+
+=========================================
+# Training forward pass
+flash_attention(ctx, q, k, v, output, L, M, ...)  # All layers
+
+# Training backward pass
+flash_attention_backward(ctx, q, k, v, grad_output, L, M, grad_q, grad_k, grad_v, ...)
+
+# Inference: First token (prefill)
+flash_attention(ctx, q, k, v, output, L, M, ...)
+
+# Inference: Subsequent tokens (generation)
+kvcache_update(ctx, cache, layer_idx, k_new, v_new)
+attention_with_kvcache(ctx, cache, layer_idx, q_new, output)

@@ -27,7 +27,13 @@ from .gpu_device import (
     pipeline_tuned_create,
     select_optimal_tile_size,
 )
-from .gpu_ops import create_command_batch
+from .gpu_kv_cache import (
+    attention_with_kv_cache,
+    kv_cache_create,
+    kv_cache_reset,
+    kv_cache_update,
+)
+from .gpu_ops import batch_add, batch_begin, batch_commit
 from .gpu_pass_backward import (
     attention_backward,
     bias_backward,
@@ -59,32 +65,26 @@ from .gpu_pass_optimizer import (
     reduce_sum,
 )
 from .gpu_types import (
-    BatchState,
     GPUBuffer1D,
     GPUBuffer2D,
-    GPUConfig,
-    GPUDevice,
+    GPUContext,
     GPULayerGradients,
     GPULayerParams,
     GPUModelGradients,
     GPUModelParams,
     GPUOptimizerState,
-    PipelineCache,
 )
 
 __all__ = [
     # Types
-    "GPUDevice",
     "GPUModelGradients",
     "GPUModelParams",
     "GPULayerGradients",
     "GPULayerParams",
-    "GPUConfig",
     "GPUBuffer1D",
     "GPUBuffer2D",
     "GPUOptimizerState",
-    "BatchState",
-    "PipelineCache",
+    "GPUContext",
     # Device
     "device_create",
     "device_limits_query",
@@ -137,5 +137,12 @@ __all__ = [
     "attention_backward",
     "flash_attention_backward",
     # Ops
-    "create_command_batch",
+    "batch_begin",
+    "batch_add",
+    "batch_commit",
+    # KV-cache
+    "kv_cache_create",
+    "kv_cache_reset",
+    "kv_cache_update",
+    "attention_with_kv_cache",
 ]

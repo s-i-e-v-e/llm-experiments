@@ -5,13 +5,7 @@ from typing import Optional, Tuple, Union
 import numpy as np
 import wgpu
 
-from .gpu_types import (
-    GPUBuffer,
-    GPUBuffer1D,
-    GPUBuffer2D,
-    GPUBufferAny,
-    GPUDevice,
-)
+from .gpu_types import GPUBuffer1D, GPUBuffer2D, GPUBufferAny, GPUContext
 
 # ============================================================================
 # BASIC BUFFER OPERATIONS
@@ -19,8 +13,8 @@ from .gpu_types import (
 
 
 def __gpu_buffer_create(
-    device: GPUDevice, shape: Tuple[int, ...], data: Optional[np.ndarray] = None
-) -> GPUBuffer:
+    ctx: GPUContext, shape: Tuple[int, ...], data: Optional[np.ndarray] = None
+) -> wgpu.GPUBuffer:
     """Internal: Create raw GPU buffer of any shape.
 
     Args:
@@ -36,14 +30,14 @@ def __gpu_buffer_create(
 
     if data is not None:
         data_np = np.ascontiguousarray(data, dtype=np.float32).flatten()
-        buffer = device.create_buffer_with_data(
+        buffer = ctx.device.create_buffer_with_data(
             data=data_np,
             usage=wgpu.BufferUsage.STORAGE
             | wgpu.BufferUsage.COPY_SRC
             | wgpu.BufferUsage.COPY_DST,
         )
     else:
-        buffer = device.create_buffer(
+        buffer = ctx.device.create_buffer(
             size=buffer_size,
             usage=wgpu.BufferUsage.STORAGE
             | wgpu.BufferUsage.COPY_SRC
@@ -54,7 +48,7 @@ def __gpu_buffer_create(
 
 
 def gpu_buffer_1d_create(
-    device: GPUDevice, size: int, data: Optional[np.ndarray] = None
+    ctx: GPUContext, size: int, data: Optional[np.ndarray] = None
 ) -> GPUBuffer1D:
     """Create 1D GPU buffer for vectors (biases, layer norm params).
 
@@ -79,12 +73,12 @@ def gpu_buffer_1d_create(
             )
 
     shape = (size,)
-    buffer = __gpu_buffer_create(device, shape, data)
+    buffer = __gpu_buffer_create(ctx, shape, data)
     return GPUBuffer1D(buffer=buffer, shape=shape, size=size)
 
 
 def gpu_buffer_2d_create(
-    device: GPUDevice, rows: int, cols: int, data: Optional[np.ndarray] = None
+    ctx: GPUContext, rows: int, cols: int, data: Optional[np.ndarray] = None
 ) -> GPUBuffer2D:
     """Create 2D GPU buffer for matrices (weight matrices, activations).
 
@@ -111,11 +105,11 @@ def gpu_buffer_2d_create(
 
     shape = (rows, cols)
     size = rows * cols
-    buffer = __gpu_buffer_create(device, shape, data)
+    buffer = __gpu_buffer_create(ctx, shape, data)
     return GPUBuffer2D(buffer=buffer, shape=shape, size=size)
 
 
-def gpu_buffer_zerofy(device: GPUDevice, gpu_buffer: GPUBufferAny) -> None:
+def gpu_buffer_zerofy(ctx: GPUContext, gpu_buffer: GPUBufferAny) -> None:
     """Zero-initialize a GPU buffer.
 
     Args:
@@ -123,30 +117,30 @@ def gpu_buffer_zerofy(device: GPUDevice, gpu_buffer: GPUBufferAny) -> None:
         gpu_buffer: GPU buffer to clear
     """
     zero_data = np.zeros(gpu_buffer.size, dtype=np.float32)
-    device.queue.write_buffer(gpu_buffer.buffer, 0, zero_data)
+    ctx.device.queue.write_buffer(gpu_buffer.buffer, 0, zero_data)
 
 
 def __gpu_buffer_write(
-    device: GPUDevice, in_data: np.ndarray, buffer: Union[GPUBuffer1D, GPUBuffer2D]
+    ctx: GPUContext, in_data: np.ndarray, buffer: Union[GPUBuffer1D, GPUBuffer2D]
 ) -> None:
     data_f32 = np.ascontiguousarray(in_data, dtype=np.float32)
-    device.queue.write_buffer(buffer.buffer, 0, data_f32.tobytes())
+    ctx.device.queue.write_buffer(buffer.buffer, 0, data_f32.tobytes())
 
 
 def gpu_buffer_1d_write(
-    device: GPUDevice, in_data: np.ndarray, buffer: GPUBuffer1D
+    ctx: GPUContext, in_data: np.ndarray, buffer: GPUBuffer1D
 ) -> None:
-    __gpu_buffer_write(device, in_data, buffer)
+    __gpu_buffer_write(ctx, in_data, buffer)
 
 
 def gpu_buffer_2d_write(
-    device: GPUDevice, in_data: np.ndarray, buffer: GPUBuffer2D
+    ctx: GPUContext, in_data: np.ndarray, buffer: GPUBuffer2D
 ) -> None:
-    __gpu_buffer_write(device, in_data, buffer)
+    __gpu_buffer_write(ctx, in_data, buffer)
 
 
 def __gpu_buffer_read(
-    device: GPUDevice, buffer: Union[GPUBuffer1D, GPUBuffer2D], out_data: np.ndarray
+    ctx: GPUContext, buffer: Union[GPUBuffer1D, GPUBuffer2D], out_data: np.ndarray
 ) -> None:
     """Read GPU buffer to numpy array
 
@@ -156,14 +150,14 @@ def __gpu_buffer_read(
     size_bytes = out_data.nbytes
 
     # Create temporary staging buffer for this read
-    staging = device.create_buffer(
+    staging = ctx.device.create_buffer(
         size=size_bytes, usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ
     )
 
     # Copy GPU buffer to staging buffer
-    encoder = device.create_command_encoder()
+    encoder = ctx.device.create_command_encoder()
     encoder.copy_buffer_to_buffer(buffer.buffer, 0, staging, 0, size_bytes)
-    device.queue.submit([encoder.finish()])
+    ctx.device.queue.submit([encoder.finish()])
 
     # Map staging buffer for reading (synchronous)
     staging.map_sync(wgpu.MapMode.READ)
@@ -180,7 +174,7 @@ def __gpu_buffer_read(
 
 
 def gpu_buffer_1d_read(
-    device: GPUDevice, buffer: GPUBuffer1D, out_data: np.ndarray
+    ctx: GPUContext, buffer: GPUBuffer1D, out_data: np.ndarray
 ) -> None:
     """Read 1D GPU buffer to numpy array
 
@@ -189,11 +183,11 @@ def gpu_buffer_1d_read(
         buffer: Source GPU buffer
         out_data: Pre-allocated numpy array to fill (shape must match buffer.size)
     """
-    __gpu_buffer_read(device, buffer, out_data)
+    __gpu_buffer_read(ctx, buffer, out_data)
 
 
 def gpu_buffer_2d_read(
-    device: GPUDevice, buffer: GPUBuffer2D, out_data: np.ndarray
+    ctx: GPUContext, buffer: GPUBuffer2D, out_data: np.ndarray
 ) -> None:
     """Read 2D GPU buffer to numpy array
 
@@ -202,4 +196,4 @@ def gpu_buffer_2d_read(
         buffer: Source GPU buffer
         out_data: Pre-allocated numpy array to fill (shape must match buffer rows x cols)
     """
-    __gpu_buffer_read(device, buffer, out_data)
+    __gpu_buffer_read(ctx, buffer, out_data)

@@ -3,7 +3,7 @@ import numpy as np
 from .gpu_kernels import (
     get_attention_kernel,
     get_bias_add_kernel,
-    get_cross_entropy_loss_masked_kernel,
+    get_cross_entropy_loss_kernel,
     get_dropout_kernel,
     get_embedding_kernel,
     get_extract_last_tokens_kernel,
@@ -15,18 +15,15 @@ from .gpu_kernels import (
     get_softmax_kernel,
 )
 from .gpu_ops import (
-    add_compute_to_batch,
+    batch_add,
     validate_buffer_shape_1d,
     validate_buffer_shape_2d,
     validate_matmul_shapes,
 )
 from .gpu_types import (
-    BatchState,
     GPUBuffer1D,
     GPUBuffer2D,
-    GPUConfig,
-    GPUDevice,
-    PipelineCache,
+    GPUContext,
 )
 
 # ============================================================================
@@ -35,10 +32,7 @@ from .gpu_types import (
 
 
 def matmul(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     A: GPUBuffer2D,
     B: GPUBuffer2D,
     C: GPUBuffer2D,
@@ -63,19 +57,16 @@ def matmul(
     M, K, N = validate_matmul_shapes(A, B, C, "matmul")
 
     MAX_WORKGROUPS = 65535
-    TILE_SIZE = config.matmul_tile_size
+    TILE_SIZE = ctx.config.matmul_tile_size
 
     wg_x = (N + TILE_SIZE - 1) // TILE_SIZE
     wg_y = (M + TILE_SIZE - 1) // TILE_SIZE
 
     if wg_x <= MAX_WORKGROUPS and wg_y <= MAX_WORKGROUPS:
         params = np.array([M, K, N], dtype=np.uint32)
-        add_compute_to_batch(
-            device,
-            config,
-            pipeline_cache,
-            batch_state,
-            get_matmul_kernel(config),
+        batch_add(
+            ctx,
+            get_matmul_kernel(ctx),
             params,
             [A, B, C],
             wg_x,
@@ -92,10 +83,7 @@ def matmul(
 
 
 def embedding(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     embedding_table: GPUBuffer2D,
     pos_encoding: GPUBuffer2D,
     input_ids: GPUBuffer1D,
@@ -143,12 +131,9 @@ def embedding(
     validate_buffer_shape_2d(output, (total_tokens, embedding_dim), "output")
 
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_embedding_kernel(config),
+    batch_add(
+        ctx,
+        get_embedding_kernel(ctx),
         params,
         [embedding_table, pos_encoding, input_ids, output],
         (total_tokens + 255) // 256,
@@ -156,10 +141,7 @@ def embedding(
 
 
 def layernorm(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     input_buf: GPUBuffer2D,
     gamma: GPUBuffer1D,
     beta: GPUBuffer1D,
@@ -190,12 +172,9 @@ def layernorm(
 
     params = np.array([size, n_elements], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_layernorm_kernel(config),
+    batch_add(
+        ctx,
+        get_layernorm_kernel(ctx),
         params,
         [input_buf, gamma, beta, output],
         n_elements,
@@ -203,10 +182,7 @@ def layernorm(
 
 
 def gelu(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     input_buf: GPUBuffer2D,
     output: GPUBuffer2D,
 ) -> None:
@@ -230,12 +206,9 @@ def gelu(
     total_size = input_buf.size
     params = np.array([total_size], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_gelu_kernel(config),
+    batch_add(
+        ctx,
+        get_gelu_kernel(ctx),
         params,
         [input_buf, output],
         (total_size + 255) // 256,
@@ -243,10 +216,7 @@ def gelu(
 
 
 def bias_add(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     input_buf: GPUBuffer2D,
     bias: GPUBuffer1D,
     output: GPUBuffer2D,
@@ -277,12 +247,9 @@ def bias_add(
     total_size = n_elements * dim
     params = np.array([total_size, dim], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_bias_add_kernel(config),
+    batch_add(
+        ctx,
+        get_bias_add_kernel(ctx),
         params,
         [input_buf, bias, output],
         (total_size + 255) // 256,
@@ -290,10 +257,7 @@ def bias_add(
 
 
 def residual_add(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     input_a: GPUBuffer2D,
     input_b: GPUBuffer2D,
     output: GPUBuffer2D,
@@ -320,12 +284,9 @@ def residual_add(
     total_size = input_a.size
     params = np.array([total_size], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_residual_add_kernel(config),
+    batch_add(
+        ctx,
+        get_residual_add_kernel(ctx),
         params,
         [input_a, input_b, output],
         (total_size + 255) // 256,
@@ -333,10 +294,7 @@ def residual_add(
 
 
 def extract_last_tokens(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     input_buf: GPUBuffer2D,
     output: GPUBuffer2D,
     batch_size: int,
@@ -372,12 +330,9 @@ def extract_last_tokens(
 
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_extract_last_tokens_kernel(config),
+    batch_add(
+        ctx,
+        get_extract_last_tokens_kernel(ctx),
         params,
         [input_buf, output],
         (embedding_dim + 255) // 256,
@@ -387,10 +342,7 @@ def extract_last_tokens(
 
 
 def cross_entropy_loss(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     logits: GPUBuffer2D,
     targets: GPUBuffer1D,
     mask: GPUBuffer1D,
@@ -433,12 +385,9 @@ def cross_entropy_loss(
 
     params = np.array([1, batch_seq, vocab_size], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_cross_entropy_loss_masked_kernel(config),
+    batch_add(
+        ctx,
+        get_cross_entropy_loss_kernel(ctx),
         params,
         [
             logits,
@@ -452,10 +401,7 @@ def cross_entropy_loss(
 
 
 def dropout(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     input_buf: GPUBuffer2D,
     output: GPUBuffer2D,
     mask: GPUBuffer2D,
@@ -491,12 +437,9 @@ def dropout(
     total_size = rows * cols
     params = np.array([total_size, keep_prob, seed, offset], dtype=np.float32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_dropout_kernel(config),
+    batch_add(
+        ctx,
+        get_dropout_kernel(ctx),
         params,
         [input_buf, output, mask],
         (total_size + 255) // 256,
@@ -504,10 +447,7 @@ def dropout(
 
 
 def softmax(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     logits: GPUBuffer2D,
     probs: GPUBuffer2D,
 ) -> None:
@@ -534,12 +474,9 @@ def softmax(
 
     params = np.array([batch_size, vocab_size], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_softmax_kernel(config),
+    batch_add(
+        ctx,
+        get_softmax_kernel(ctx),
         params,
         [logits.buffer, probs.buffer],
         batch_size,
@@ -547,10 +484,7 @@ def softmax(
 
 
 def flash_attention(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     Q: GPUBuffer2D,
     K: GPUBuffer2D,
     V: GPUBuffer2D,
@@ -585,10 +519,10 @@ def flash_attention(
     """
 
     # Validate head_dim against config
-    if head_dim > config.flash_attn_max_head_dim:
+    if head_dim > ctx.config.flash_attn_max_head_dim:
         raise ValueError(
             f"head_dim {head_dim} exceeds maximum supported by config: "
-            f"{config.flash_attn_max_head_dim}. "
+            f"{ctx.config.flash_attn_max_head_dim}. "
             f"Increase flash_attn_max_head_dim in GPUConfig or use smaller head_dim."
         )
 
@@ -617,21 +551,18 @@ def flash_attention(
             seq_len,
             n_heads,
             head_dim,
-            config.flash_attn_bc,
-            config.flash_attn_br,
+            ctx.config.flash_attn_bc,
+            ctx.config.flash_attn_br,
         ],
         dtype=np.uint32,
     )
 
-    Br = config.flash_attn_br
+    Br = ctx.config.flash_attn_br
     num_q_blocks = (seq_len + Br - 1) // Br
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_flash_attention_kernel(config),
+    batch_add(
+        ctx,
+        get_flash_attention_kernel(ctx),
         params,
         [
             Q,
@@ -648,10 +579,7 @@ def flash_attention(
 
 
 def attention(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     Q: GPUBuffer2D,
     K: GPUBuffer2D,
     V: GPUBuffer2D,
@@ -698,12 +626,9 @@ def attention(
 
     params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_attention_kernel(config),
+    batch_add(
+        ctx,
+        get_attention_kernel(ctx),
         params,
         [Q, K, V, output],
         workgroups_x=seq_len,

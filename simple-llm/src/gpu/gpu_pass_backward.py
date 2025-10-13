@@ -16,17 +16,14 @@ from .gpu_kernels import (
     get_matmul_backward_b_kernel,
 )
 from .gpu_ops import (
-    add_compute_to_batch,
+    batch_add,
     validate_buffer_shape_1d,
     validate_buffer_shape_2d,
 )
 from .gpu_types import (
-    BatchState,
     GPUBuffer1D,
     GPUBuffer2D,
-    GPUConfig,
-    GPUDevice,
-    PipelineCache,
+    GPUContext,
 )
 
 # ============================================================================
@@ -45,10 +42,7 @@ MUTATION SEMANTICS:
 
 
 def matmul_backward_a(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     grad_C: GPUBuffer2D,
     B: GPUBuffer2D,
     grad_A: GPUBuffer2D,
@@ -74,17 +68,14 @@ def matmul_backward_a(
     if N != N2:
         raise ValueError(f"Dimension mismatch: grad_C.shape[1]={N} != B.shape[1]={N2}")
 
-    TILE_SIZE = config.matmul_tile_size
+    TILE_SIZE = ctx.config.matmul_tile_size
 
     validate_buffer_shape_2d(grad_A, (M, K), "grad_A")
 
     params = np.array([M, K, N], dtype=np.uint32)
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_matmul_backward_a_kernel(config),
+    batch_add(
+        ctx,
+        get_matmul_backward_a_kernel(ctx),
         params,
         [grad_C, B, grad_A],
         (K + TILE_SIZE - 1) // TILE_SIZE,
@@ -94,10 +85,7 @@ def matmul_backward_a(
 
 
 def matmul_backward_b(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     A: GPUBuffer2D,
     grad_C: GPUBuffer2D,
     grad_B: GPUBuffer2D,
@@ -125,14 +113,11 @@ def matmul_backward_b(
 
     validate_buffer_shape_2d(grad_B, (K, N), "grad_B")
 
-    TILE_SIZE = config.matmul_tile_size
+    TILE_SIZE = ctx.config.matmul_tile_size
     params = np.array([M, K, N], dtype=np.uint32)
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_matmul_backward_b_kernel(config),
+    batch_add(
+        ctx,
+        get_matmul_backward_b_kernel(ctx),
         params,
         [A, grad_C, grad_B],
         (N + TILE_SIZE - 1) // TILE_SIZE,
@@ -142,10 +127,7 @@ def matmul_backward_b(
 
 
 def embedding_backward(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     input_ids: GPUBuffer1D,
     grad_output: GPUBuffer2D,
     grad_embedding: GPUBuffer2D,
@@ -181,17 +163,14 @@ def embedding_backward(
     validate_buffer_shape_1d(input_ids, total_tokens, "input_ids")
     validate_buffer_shape_2d(grad_output, (total_tokens, embedding_dim), "grad_output")
 
-    temp_i32 = gpu_buffer_2d_create(device, vocab_size, embedding_dim)
-    gpu_buffer_zerofy(device, temp_i32)
+    temp_i32 = gpu_buffer_2d_create(ctx, vocab_size, embedding_dim)
+    gpu_buffer_zerofy(ctx, temp_i32)
 
     params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_embedding_backward_kernel(config),
+    batch_add(
+        ctx,
+        get_embedding_backward_kernel(ctx),
         params,
         [input_ids, grad_output, temp_i32],
         (total_tokens + 255) // 256,
@@ -201,12 +180,9 @@ def embedding_backward(
 
     convert_params = np.array([vocab_size * embedding_dim], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_embedding_backward_convert_kernel(config),
+    batch_add(
+        ctx,
+        get_embedding_backward_convert_kernel(ctx),
         convert_params,
         [temp_i32, grad_embedding],
         (vocab_size * embedding_dim + 255) // 256,
@@ -214,10 +190,7 @@ def embedding_backward(
 
 
 def dropout_backward(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     grad_output: GPUBuffer2D,
     mask: GPUBuffer2D,
     grad_input: GPUBuffer2D,
@@ -246,12 +219,9 @@ def dropout_backward(
     total_size = rows * cols
     params = np.array([total_size, keep_prob], dtype=np.float32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_dropout_backward_kernel(config),
+    batch_add(
+        ctx,
+        get_dropout_backward_kernel(ctx),
         params,
         [grad_output, mask, grad_input],
         (total_size + 255) // 256,
@@ -259,10 +229,7 @@ def dropout_backward(
 
 
 def layernorm_backward(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     input_buf: GPUBuffer2D,
     gamma: GPUBuffer1D,
     grad_output: GPUBuffer2D,
@@ -310,18 +277,15 @@ def layernorm_backward(
     validate_buffer_shape_1d(grad_beta, size, "grad_beta")
 
     # Allocate temporary buffers for partial gradients
-    partial_grad_gamma = gpu_buffer_2d_create(device, n_elements, size)
-    partial_grad_beta = gpu_buffer_2d_create(device, n_elements, size)
+    partial_grad_gamma = gpu_buffer_2d_create(ctx, n_elements, size)
+    partial_grad_beta = gpu_buffer_2d_create(ctx, n_elements, size)
 
     # Stage 1: Compute partial gradients
     params = np.array([size, n_elements], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_layernorm_backward_kernel(config),
+    batch_add(
+        ctx,
+        get_layernorm_backward_kernel(ctx),
         params,
         [
             input_buf,
@@ -337,19 +301,16 @@ def layernorm_backward(
     # Stage 2: Reduce partial gradients
     if accumulate:
         # Use atomic accumulation kernel
-        reduction_kernel = get_layernorm_backward_reduce_accumulate_kernel(config)
+        reduction_kernel = get_layernorm_backward_reduce_accumulate_kernel(ctx)
     else:
-        gpu_buffer_zerofy(device, grad_gamma)
-        gpu_buffer_zerofy(device, grad_beta)
-        reduction_kernel = get_layernorm_backward_reduce_kernel(config)
+        gpu_buffer_zerofy(ctx, grad_gamma)
+        gpu_buffer_zerofy(ctx, grad_beta)
+        reduction_kernel = get_layernorm_backward_reduce_kernel(ctx)
 
     params_reduce = np.array([size, n_elements], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
+    batch_add(
+        ctx,
         reduction_kernel,
         params_reduce,
         [partial_grad_gamma, partial_grad_beta, grad_gamma, grad_beta],
@@ -358,10 +319,7 @@ def layernorm_backward(
 
 
 def gelu_backward(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     input_buf: GPUBuffer2D,
     grad_output: GPUBuffer2D,
     grad_input: GPUBuffer2D,
@@ -390,12 +348,9 @@ def gelu_backward(
 
     total_size = input_buf.size
     params = np.array([total_size], dtype=np.uint32)
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_gelu_backward_kernel(config),
+    batch_add(
+        ctx,
+        get_gelu_backward_kernel(ctx),
         params,
         [input_buf, grad_output, grad_input],
         (total_size + 255) // 256,
@@ -403,10 +358,7 @@ def gelu_backward(
 
 
 def bias_backward(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     grad_output: GPUBuffer2D,
     grad_bias: GPUBuffer1D,
     accumulate: bool = False,
@@ -440,17 +392,14 @@ def bias_backward(
 
     # Zero accumulation buffer only if not accumulating
     if not accumulate:
-        gpu_buffer_zerofy(device, grad_bias)
+        gpu_buffer_zerofy(ctx, grad_bias)
 
     total_size = n_elements * dim
     params = np.array([total_size, dim], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_bias_backward_kernel(config),
+    batch_add(
+        ctx,
+        get_bias_backward_kernel(ctx),
         params,
         [grad_output, grad_bias],
         (dim + 255) // 256,
@@ -458,10 +407,7 @@ def bias_backward(
 
 
 def attention_backward(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     grad_output: GPUBuffer2D,
     Q: GPUBuffer2D,
     K: GPUBuffer2D,
@@ -500,12 +446,9 @@ def attention_backward(
 
     params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_attention_backward_kernel(config),
+    batch_add(
+        ctx,
+        get_attention_backward_kernel(ctx),
         params,
         [grad_output, Q, K, V, O, grad_Q, grad_K, grad_V],
         seq_len,
@@ -515,10 +458,7 @@ def attention_backward(
 
 
 def flash_attention_backward(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     Q: GPUBuffer2D,
     K: GPUBuffer2D,
     V: GPUBuffer2D,
@@ -561,10 +501,10 @@ def flash_attention_backward(
     """
 
     # Validate head_dim against config
-    if head_dim > config.flash_attn_max_head_dim:
+    if head_dim > ctx.config.flash_attn_max_head_dim:
         raise ValueError(
             f"head_dim {head_dim} exceeds maximum supported by config: "
-            f"{config.flash_attn_max_head_dim}"
+            f"{ctx.config.flash_attn_max_head_dim}"
         )
 
     if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
@@ -594,21 +534,18 @@ def flash_attention_backward(
             seq_len,
             n_heads,
             head_dim,
-            config.flash_attn_bc,
-            config.flash_attn_br,
+            ctx.config.flash_attn_bc,
+            ctx.config.flash_attn_br,
         ],
         dtype=np.uint32,
     )
 
-    Br = config.flash_attn_br
+    Br = ctx.config.flash_attn_br
     num_q_blocks = (seq_len + Br - 1) // Br
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_flash_attention_backward_kernel(config),
+    batch_add(
+        ctx,
+        get_flash_attention_backward_kernel(ctx),
         params,
         [grad_O, Q, K, V, O, L, M, grad_Q, grad_K, grad_V],
         num_q_blocks,

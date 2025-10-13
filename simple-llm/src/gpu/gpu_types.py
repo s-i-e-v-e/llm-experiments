@@ -3,151 +3,19 @@
 from dataclasses import dataclass, field
 from typing import (
     Any,
-    Callable,
     Dict,
     List,
     Optional,
-    Protocol,
     Tuple,
     Union,
-    runtime_checkable,
 )
 
-# ============================================================================
-# WGPU TYPE PROTOCOLS
-# ============================================================================
+import wgpu
 
-# Type-safe protocols for WGPU objects
-# These capture the required interface without importing wgpu at type-check time
-# Previously used Any which defeated type checking
-
-
-@runtime_checkable
-class GPUBufferProtocol(Protocol):
-    """Structural type for wgpu.GPUBuffer - captures required interface"""
-
-    size: int
-    usage: int
-
-    def map_sync(self, mode: int) -> None:
-        """Map buffer for CPU access"""
-        ...
-
-    def read_mapped(self) -> memoryview:
-        """Read mapped buffer contents"""
-        ...
-
-    def write_mapped(self, data: Any) -> None:
-        """Write to mapped buffer"""
-        ...
-
-    def unmap(self) -> None:
-        """Unmap buffer after CPU access"""
-        ...
-
-    def destroy(self) -> None:
-        """Explicitly destroy buffer"""
-        ...
-
-
-@runtime_checkable
-class GPUQueueProtocol(Protocol):
-    """Structural type for wgpu.GPUQueue"""
-
-    def submit(self, command_buffers: Any) -> None:
-        """Submit command buffers for execution"""
-        ...
-
-    def write_buffer(
-        self, buffer: GPUBufferProtocol, buffer_offset: int, data: Any
-    ) -> None:
-        """Write data directly to buffer"""
-        ...
-
-    def on_submitted_work_done(self, callback: Any) -> None:
-        """Register callback for work completion"""
-        ...
-
-
-@runtime_checkable
-class GPUAdapterProtocol(Protocol):
-    """Structural type for wgpu.GPUAdapter"""
-
-    def request_device_sync(self, **kwargs: Any) -> "GPUDeviceProtocol":
-        """Request device synchronously"""
-        ...
-
-    def request_adapter_info(self) -> Any:
-        """Query adapter capabilities"""
-        ...
-
-
-@runtime_checkable
-class GPULimitsProtocol(Protocol):
-    """Structural type for wgpu.GPU.Limits"""
-
-    max_compute_workgroup_size_x: int
-
-
-@runtime_checkable
-class GPUCommandEncoderProtocol(Protocol):
-    begin_compute_pass: Callable
-    copy_buffer_to_buffer: Callable
-    finish: Callable
-
-
-@runtime_checkable
-class GPUDeviceProtocol(Protocol):
-    """Structural type for wgpu.GPUDevice"""
-
-    queue: GPUQueueProtocol
-    adapter: GPUAdapterProtocol
-    limits: GPULimitsProtocol
-    adapter_info: Dict[str, str]
-
-    def create_buffer(
-        self, *, size: int, usage: int, mapped_at_creation: bool = False
-    ) -> GPUBufferProtocol:
-        """Create GPU buffer"""
-        ...
-
-    def create_buffer_with_data(self, *, data: Any, usage: int) -> GPUBufferProtocol:
-        """Create buffer initialized with data"""
-        ...
-
-    def create_shader_module(self, *, code: str) -> Any:
-        """Compile shader module from WGSL source"""
-        ...
-
-    def create_compute_pipeline(self, *, layout: Any, compute: Any) -> Any:
-        """Create compute pipeline"""
-        ...
-
-    def create_bind_group(self, *, layout: Any, entries: Any) -> Any:
-        """Create bind group for shader resources"""
-        ...
-
-    def create_command_encoder(self) -> Any:
-        """Create command encoder"""
-        ...
-
-
-# Type aliases using protocols instead of Any
-GPUDevice = GPUDeviceProtocol
-GPUBuffer = GPUBufferProtocol
-GPUAdapter = GPUAdapterProtocol
-GPUCommandEncoder = GPUCommandEncoderProtocol
-
-# Other WGPU types that don't need full protocols (internal use only)
-GPUBindGroup = Any  # wgpu.GPUBindGroup
-GPUComputePipeline = Any  # wgpu.GPUComputePipeline
-GPUShaderModule = Any  # wgpu.GPUShaderModule
 
 # ============================================================================
 # DEVICE TYPES
 # ============================================================================
-
-
 @dataclass
 class GPUConfig:
     """
@@ -287,9 +155,36 @@ class GPUConfig:
     """Epsilon for AdamW optimizer numerical stability"""
 
 
-# ============================================================================
-# BIND GROUP HELPER TYPES
-# ============================================================================
+@dataclass
+class PipelineCache:
+    """
+    Cache for compiled GPU pipelines
+    """
+
+    pipelines: Dict[str, wgpu.GPUComputePipeline] = field(default_factory=dict)
+    bind_groups: Dict[int, wgpu.GPUBindGroup] = field(default_factory=dict)
+
+
+@dataclass
+class BatchState:
+    """
+    State for batched GPU operations
+    """
+
+    encoder: Optional[wgpu.GPUCommandEncoder]
+    retained_buffers: List[wgpu.GPUBuffer] = field(
+        default_factory=list
+    )  # Now type-safe!
+    enable_profiling: bool = False
+    operation_count: int = 0
+
+
+@dataclass
+class GPUContext:
+    device: wgpu.GPUDevice
+    config: GPUConfig
+    batch_state: BatchState
+    pipeline_cache: PipelineCache
 
 
 @dataclass
@@ -301,7 +196,7 @@ class BindGroupEntry:
     """
 
     binding: int
-    buffer: GPUBuffer  # Now type-safe!
+    buffer: wgpu.GPUBuffer
     offset: int
     size: int
 
@@ -322,7 +217,7 @@ class GPUBuffer1D:
     This dataclass is immutable - do not modify fields after creation.
     """
 
-    buffer: GPUBuffer  # Now type-safe!
+    buffer: wgpu.GPUBuffer
     shape: Tuple[int]
     size: int
 
@@ -335,43 +230,13 @@ class GPUBuffer2D:
     This dataclass is immutable - do not modify fields after creation.
     """
 
-    buffer: GPUBuffer  # Now type-safe!
+    buffer: wgpu.GPUBuffer
     shape: Tuple[int, int]
     size: int
 
 
+# Used by functions that do not care about dimensions
 GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D]
-
-# ============================================================================
-# PIPELINE CACHE TYPES
-# ============================================================================
-
-
-@dataclass
-class PipelineCache:
-    """
-    Cache for compiled GPU pipelines
-    """
-
-    pipelines: Dict[str, GPUComputePipeline] = field(default_factory=dict)
-    bind_groups: Dict[int, GPUBindGroup] = field(default_factory=dict)
-
-
-# ============================================================================
-# BATCH OPERATION TYPES
-# ============================================================================
-
-
-@dataclass
-class BatchState:
-    """
-    State for batched GPU operations
-    """
-
-    encoder: Optional[GPUCommandEncoder]
-    retained_buffers: List[GPUBuffer] = field(default_factory=list)  # Now type-safe!
-    enable_profiling: bool = False
-    operation_count: int = 0
 
 
 # ============================================================================
@@ -483,3 +348,75 @@ class PerfMonitor:
     kernel_times: Dict[str, List[float]] = field(default_factory=dict)
     memory_usage: Dict[str, Any] = field(default_factory=dict)
     submission_count: int = 0
+
+
+# ============================================================================
+# KV-CACHE TYPES (for autoregressive generation)
+# ============================================================================
+
+
+@dataclass
+class KVCacheLayer:
+    """
+    KV-cache buffers for a single transformer layer.
+
+    Used during autoregressive generation to avoid recomputing
+    K and V for previously generated tokens.
+
+    Shape conventions:
+    - k_cache: [batch_size, max_seq_len, n_heads, head_dim]
+    - v_cache: [batch_size, max_seq_len, n_heads, head_dim]
+
+    During generation:
+    - Position [0:current_len] contains valid cached values
+    - Position [current_len:max_seq_len] is unused
+    """
+
+    k_cache: GPUBuffer2D  # Flattened: [batch_size * max_seq_len, n_heads * head_dim]
+    v_cache: GPUBuffer2D  # Flattened: [batch_size * max_seq_len, n_heads * head_dim]
+
+
+@dataclass
+class KVCache:
+    """
+    Complete KV-cache for all transformer layers.
+
+    Stores cached key and value tensors to accelerate autoregressive generation.
+
+    Attributes:
+        layers: KV-cache buffers for each transformer layer
+        batch_size: Number of sequences being generated in parallel
+        max_seq_len: Maximum sequence length cache can hold
+        current_len: Current number of cached tokens (0 to max_seq_len)
+        n_heads: Number of attention heads
+        head_dim: Dimension per attention head
+    """
+
+    layers: List[KVCacheLayer]
+    batch_size: int
+    max_seq_len: int
+    current_len: int  # Mutable: tracks how many positions are filled
+    n_heads: int
+    head_dim: int
+
+
+@dataclass
+class KVCacheConfig:
+    """
+    Configuration for KV-cache allocation.
+
+    Used to specify cache parameters before allocation.
+
+    Attributes:
+        batch_size: Number of parallel sequences to cache
+        max_seq_len: Maximum sequence length to support
+        n_layers: Number of transformer layers
+        n_heads: Number of attention heads per layer
+        head_dim: Dimension per attention head
+    """
+
+    batch_size: int
+    max_seq_len: int
+    n_layers: int
+    n_heads: int
+    head_dim: int

@@ -5,10 +5,8 @@ from typing import Dict, Optional
 import wgpu
 
 from .gpu_types import (
-    GPUAdapter,
-    GPUComputePipeline,
     GPUConfig,
-    GPUDevice,
+    GPUContext,
     KernelTimeStats,
     PerfMonitor,
     PerfStats,
@@ -22,7 +20,7 @@ __all__ = ["wgpu"]
 # ============================================================================
 
 
-def device_create() -> GPUDevice:
+def device_create() -> wgpu.GPUDevice:
     """
     Create a new WGPU device
 
@@ -51,7 +49,7 @@ def device_create() -> GPUDevice:
         raise RuntimeError(f"WGPU initialization failed: {e}")
 
 
-def pipeline_cache_create(device: GPUDevice) -> PipelineCache:
+def pipeline_cache_create(device: wgpu.GPUDevice) -> PipelineCache:
     """Create a new pipeline cache.
 
     Returns:
@@ -60,7 +58,7 @@ def pipeline_cache_create(device: GPUDevice) -> PipelineCache:
     return PipelineCache()
 
 
-def device_limits_query(device: GPUDevice) -> Dict[str, int]:
+def device_limits_query(device: wgpu.GPUDevice) -> Dict[str, int]:
     """Query device capabilities for kernel optimization.
 
     Returns default limits if device query fails, ensuring code
@@ -138,11 +136,10 @@ def select_optimal_tile_size(
 
 
 def pipeline_tuned_create(
-    device: GPUDevice,
-    pipeline_cache: PipelineCache,
+    ctx: GPUContext,
     kernel_code: str,
     tune_params: Optional[Dict[str, int]] = None,
-) -> GPUComputePipeline:
+) -> wgpu.GPUComputePipeline:
     """Create pipeline with device-specific tuning.
 
     Args:
@@ -154,19 +151,19 @@ def pipeline_tuned_create(
         Compiled compute pipeline
     """
     # NOTE: limits must be used in the tuning
-    limits = device_limits_query(device)
+    limits = device_limits_query(ctx.device)
 
     tuned_code = kernel_code
     if tune_params:
         for key, value in tune_params.items():
             tuned_code = tuned_code.replace(f"{{{key}}}", str(value))
 
-    return pipeline_get_or_create(device, pipeline_cache, tuned_code)
+    return pipeline_get_or_create(ctx, tuned_code)
 
 
 def pipeline_get_or_create(
-    device: GPUDevice, pipeline_cache: PipelineCache, shader_code: str
-) -> GPUComputePipeline:
+    ctx: GPUContext, shader_code: str
+) -> wgpu.GPUComputePipeline:
     """Cache compute pipelines to avoid recompilation.
 
     Uses SHA256 hash of shader code to avoid collisions.
@@ -183,18 +180,18 @@ def pipeline_get_or_create(
 
     shader_hash = hashlib.sha256(shader_code.encode("utf-8")).hexdigest()
 
-    if shader_hash not in pipeline_cache.pipelines:
-        shader_module = device.create_shader_module(code=shader_code)
-        pipeline = device.create_compute_pipeline(
+    if shader_hash not in ctx.pipeline_cache.pipelines:
+        shader_module = ctx.device.create_shader_module(code=shader_code)
+        pipeline = ctx.device.create_compute_pipeline(
             layout="auto",
             compute={
                 "module": shader_module,
                 "entry_point": "main",
             },
         )
-        pipeline_cache.pipelines[shader_hash] = pipeline
+        ctx.pipeline_cache.pipelines[shader_hash] = pipeline
 
-    return pipeline_cache.pipelines[shader_hash]
+    return ctx.pipeline_cache.pipelines[shader_hash]
 
 
 # ============================================================================
@@ -204,7 +201,9 @@ def pipeline_get_or_create(
 """GPU configuration and auto-tuning"""
 
 
-def device_config_auto_detect(adapter: GPUAdapter, device: GPUDevice) -> GPUConfig:
+def device_config_auto_detect(
+    adapter: wgpu.GPUAdapter, device: wgpu.GPUDevice
+) -> GPUConfig:
     """
     Auto-detect GPU capabilities and return optimized configuration.
 
@@ -229,7 +228,7 @@ def device_config_auto_detect(adapter: GPUAdapter, device: GPUDevice) -> GPUConf
     # ========================================================================
     # Detect optimal workgroup size
     # ========================================================================
-    max_workgroup_size_x = limits.max_compute_workgroup_size_x
+    max_workgroup_size_x = limits["max_compute_workgroup_size_x"]
 
     if max_workgroup_size_x >= 512:
         default_wg = 256  # Conservative: avoid register spilling
@@ -343,7 +342,7 @@ def device_config_auto_detect(adapter: GPUAdapter, device: GPUDevice) -> GPUConf
     )
 
 
-def device_config_create(device: GPUDevice) -> GPUConfig:
+def device_config_create(device: wgpu.GPUDevice) -> GPUConfig:
     """
     Create GPU configuration tuned for specific device.
 

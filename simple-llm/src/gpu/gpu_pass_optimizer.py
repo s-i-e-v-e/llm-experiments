@@ -10,15 +10,13 @@ from .gpu_kernels import (
     get_gradient_norm_kernel,
     get_gradient_norm_reduce_kernel,
     get_reduce_sum_kernel,
+    get_transpose_kernel,
 )
-from .gpu_ops import add_compute_to_batch, create_command_batch, submit_batch
+from .gpu_ops import batch_add, batch_begin, batch_commit
 from .gpu_types import (
-    BatchState,
     GPUBuffer1D,
     GPUBuffer2D,
-    GPUConfig,
-    GPUDevice,
-    PipelineCache,
+    GPUContext,
 )
 
 # ============================================================================
@@ -27,10 +25,7 @@ from .gpu_types import (
 
 
 def __adamw_update(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     gradients: Union[GPUBuffer1D, GPUBuffer2D],
     weights: Union[GPUBuffer1D, GPUBuffer2D],
     m: Union[GPUBuffer1D, GPUBuffer2D],
@@ -68,12 +63,9 @@ def __adamw_update(
         dtype=np.float32,
     )
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_adamw_kernel(config),
+    batch_add(
+        ctx,
+        get_adamw_kernel(ctx),
         params,
         [gradients, weights, m, v],
         (total_size + 255) // 256,
@@ -81,10 +73,7 @@ def __adamw_update(
 
 
 def adamw_update_2d(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     gradients: GPUBuffer2D,
     weights: GPUBuffer2D,
     m: GPUBuffer2D,
@@ -97,10 +86,7 @@ def adamw_update_2d(
     step: int,
 ) -> None:
     __adamw_update(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
+        ctx,
         gradients,
         weights,
         m,
@@ -115,10 +101,7 @@ def adamw_update_2d(
 
 
 def adamw_update_1d(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     gradients: GPUBuffer1D,
     weights: GPUBuffer1D,
     m: GPUBuffer1D,
@@ -131,10 +114,7 @@ def adamw_update_1d(
     step: int,
 ) -> None:
     __adamw_update(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
+        ctx,
         gradients,
         weights,
         m,
@@ -149,10 +129,7 @@ def adamw_update_1d(
 
 
 def gradient_clip(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     gradients: GPUBuffer2D,
     max_norm: float,
     total_norm: float,
@@ -179,12 +156,9 @@ def gradient_clip(
         dtype=np.float32,
     )
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_gradient_clip_kernel(config),
+    batch_add(
+        ctx,
+        get_gradient_clip_kernel(ctx),
         params,
         [gradients],
         (total_size + 255) // 256,
@@ -192,10 +166,7 @@ def gradient_clip(
 
 
 def buffer_fill(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     buffer: GPUBuffer2D,
     value: float,
 ) -> None:
@@ -218,12 +189,9 @@ def buffer_fill(
         dtype=np.float32,
     )
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_buffer_fill_kernel(config),
+    batch_add(
+        ctx,
+        get_buffer_fill_kernel(ctx),
         params,
         [buffer],
         (total_size + 255) // 256,
@@ -231,10 +199,7 @@ def buffer_fill(
 
 
 def reduce_sum(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     input_buffer: GPUBuffer2D,
     output_buffer: GPUBuffer1D,
 ) -> None:
@@ -259,12 +224,9 @@ def reduce_sum(
         dtype=np.float32,
     )
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_reduce_sum_kernel(config),
+    batch_add(
+        ctx,
+        get_reduce_sum_kernel(ctx),
         params,
         [input_buffer, output_buffer],
         (total_size + 255) // 256,
@@ -272,10 +234,7 @@ def reduce_sum(
 
 
 def __compute_gradient_norm(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     gradients: List[GPUBuffer2D],
     reduction_workspace: GPUBuffer1D,
 ) -> GPUBuffer1D:
@@ -308,12 +267,9 @@ def __compute_gradient_norm(
         # Write partial sums to offset in pre-allocated workspace
         params = np.array([size, current_offset], dtype=np.uint32)
 
-        add_compute_to_batch(
-            device,
-            config,
-            pipeline_cache,
-            batch_state,
-            get_gradient_norm_kernel(config),
+        batch_add(
+            ctx,
+            get_gradient_norm_kernel(ctx),
             params,
             [grad_buf, reduction_workspace],
             num_workgroups,
@@ -323,15 +279,12 @@ def __compute_gradient_norm(
         total_partials += num_workgroups
 
     # Phase 2: Final reduction over all partials
-    global_norm_buf = gpu_buffer_1d_create(device, 1)
+    global_norm_buf = gpu_buffer_1d_create(ctx, 1)
     reduce_params = np.array([total_partials], dtype=np.uint32)
 
-    add_compute_to_batch(
-        device,
-        config,
-        pipeline_cache,
-        batch_state,
-        get_gradient_norm_reduce_kernel(config),
+    batch_add(
+        ctx,
+        get_gradient_norm_reduce_kernel(ctx),
         reduce_params,
         [reduction_workspace, global_norm_buf],
         1,
@@ -341,10 +294,7 @@ def __compute_gradient_norm(
 
 
 def gradient_clip_with_norm(
-    device: GPUDevice,
-    config: GPUConfig,
-    pipeline_cache: PipelineCache,
-    batch_state: BatchState,
+    ctx: GPUContext,
     gradients: List[GPUBuffer2D],
     max_norm: float,
     reduction_workspace: GPUBuffer1D,
@@ -360,30 +310,72 @@ def gradient_clip_with_norm(
         gradients: List of all gradient buffers to clip
         max_norm: Maximum allowed gradient norm
     """
-    total_norm_buf = __compute_gradient_norm(
-        device, config, pipeline_cache, batch_state, gradients, reduction_workspace
-    )
+    total_norm_buf = __compute_gradient_norm(ctx, gradients, reduction_workspace)
 
-    submit_batch(device, batch_state)
+    batch_commit(ctx)
 
     norm_array = np.array([], dtype=np.float32)
-    gpu_buffer_1d_read(device, total_norm_buf, norm_array)
+    gpu_buffer_1d_read(ctx, total_norm_buf, norm_array)
     total_norm = float(norm_array[0])
 
-    batch_state = create_command_batch(device, config)
+    batch_begin(ctx)
 
     for grad_buf in gradients:
         size = grad_buf.shape[0] * grad_buf.shape[1]
         params = np.array([size, max_norm, total_norm], dtype=np.float32)
 
-        add_compute_to_batch(
-            device,
-            config,
-            pipeline_cache,
-            batch_state,
-            get_gradient_clip_kernel(config),
+        batch_add(
+            ctx,
+            get_gradient_clip_kernel(ctx),
             params,
             [grad_buf],
             (size + 255) // 256,
         )
-    submit_batch(device, batch_state)
+    batch_commit(ctx)
+
+
+def transpose(
+    ctx: GPUContext,
+    input_buf: GPUBuffer2D,
+    output: GPUBuffer2D,
+) -> None:
+    """
+    Transposes a 2D matrix using tiled algorithm with bank conflict avoidance.
+    Used for various operations requiring transposed matrices.
+
+    Args:
+        pipeline_cache: Pipeline cache for kernel compilation
+        batch_state: Batch state
+        input_buf: Input matrix [rows, cols]
+        output: Output matrix [cols, rows]
+
+    Raises:
+        ValueError: If buffer shapes incompatible for transpose
+    """
+    rows, cols = input_buf.shape
+
+    if rows <= 0 or cols <= 0:
+        raise ValueError(f"Invalid input shape: ({rows}, {cols})")
+
+    if output.shape != (cols, rows):
+        raise ValueError(
+            f"Output shape {output.shape} doesn't match transposed "
+            f"input shape ({cols}, {rows})"
+        )
+
+    tile_size = ctx.config.matmul_tile_size  # Reuse matmul tile size
+
+    params = np.array([rows, cols], dtype=np.uint32)
+
+    workgroups_x = (cols + tile_size - 1) // tile_size
+    workgroups_y = (rows + tile_size - 1) // tile_size
+
+    batch_add(
+        ctx,
+        get_transpose_kernel(ctx),
+        params,
+        [input_buf, output],
+        workgroups_x,
+        workgroups_y,
+        1,
+    )

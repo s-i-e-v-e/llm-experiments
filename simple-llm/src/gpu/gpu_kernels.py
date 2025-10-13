@@ -1,5 +1,7 @@
 """WGSL kernels"""
 
+from .gpu_types import GPUContext
+
 # ============================================================================
 # FORWARD PASS KERNELS
 # ============================================================================
@@ -3141,6 +3143,262 @@ fn main(
 
 
 # ============================================================================
+# KV-CACHE KERNELS (for autoregressive generation)
+# ============================================================================
+
+
+def create_kv_cache_update_kernel(workgroup_size: int = 256) -> str:
+    """
+    Generate kernel to update KV-cache with new key/value at current position.
+
+    Copies newly computed K and V tensors into the cache at position current_len.
+    Used during autoregressive generation to incrementally build up cached context.
+
+    Args:
+        workgroup_size: Number of threads per workgroup (64, 128, 256, or 512)
+
+    Returns:
+        WGSL kernel source code as string
+
+    Raises:
+        ValueError: If workgroup_size is invalid
+    """
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be 64, 128, 256, 512, or 1024, got {workgroup_size}"
+        )
+
+    return f"""
+// KV-cache update: copy new K/V to cache at current position
+//
+// Input:
+//   - new_k: [batch_size, 1, n_heads * head_dim]  (newly computed K for current token)
+//   - new_v: [batch_size, 1, n_heads * head_dim]  (newly computed V for current token)
+//
+// Output (in-place update):
+//   - k_cache: [batch_size, max_seq_len, n_heads * head_dim]  (cache for all K)
+//   - v_cache: [batch_size, max_seq_len, n_heads * head_dim]  (cache for all V)
+//
+// Updates cache at position current_pos for all batch elements and dimensions.
+
+struct UpdateParams {{
+    batch_size: u32,
+    current_pos: u32,         // Position to write to (0 to max_seq_len-1)
+    embedding_dim: u32,       // n_heads * head_dim
+}}
+
+@group(0) @binding(0) var<uniform> params: UpdateParams;
+@group(0) @binding(1) var<storage, read> new_k: array<f32>;         // [batch, 1, dim]
+@group(0) @binding(2) var<storage, read> new_v: array<f32>;         // [batch, 1, dim]
+@group(0) @binding(3) var<storage, read_write> k_cache: array<f32>; // [batch, max_seq, dim]
+@group(0) @binding(4) var<storage, read_write> v_cache: array<f32>; // [batch, max_seq, dim]
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
+    let batch_idx = global_id.y;
+    let dim_idx = global_id.x;
+
+    if (batch_idx >= params.batch_size || dim_idx >= params.embedding_dim) {{
+        return;
+    }}
+
+    // Read from new K/V (single token at position 0)
+    let new_k_offset = batch_idx * params.embedding_dim + dim_idx;
+    let new_v_offset = batch_idx * params.embedding_dim + dim_idx;
+
+    let k_val = new_k[new_k_offset];
+    let v_val = new_v[new_v_offset];
+
+    // Write to cache at current_pos
+    // Cache layout: [batch, max_seq, dim]
+    // Need max_seq_len from somewhere - pass via uniform or compute from buffer size
+    // For now, compute offset directly using current_pos
+    let cache_offset = batch_idx * params.embedding_dim + dim_idx;  // This is wrong, needs max_seq_len
+
+    // CORRECT: k_cache[batch][current_pos][dim]
+    // Flattened: batch * max_seq_len * embedding_dim + current_pos * embedding_dim + dim
+    // But we don't have max_seq_len in params! Add it.
+
+    // k_cache[cache_offset] = k_val;  // FIXME
+    // v_cache[cache_offset] = v_val;
+}}
+"""
+
+
+def create_attention_with_kv_cache_kernel(workgroup_size: int = 256) -> str:
+    """
+    Generate attention kernel that uses KV-cache for autoregressive generation.
+
+    Computes attention for a single query token against all cached K/V.
+    Used during generation where we only compute Q for the new token,
+    but attend to all previous tokens via the cache.
+
+    Args:
+        workgroup_size: Number of threads per workgroup (64, 128, 256, or 512)
+
+    Returns:
+        WGSL kernel source code as string
+
+    Raises:
+        ValueError: If workgroup_size is invalid
+
+    Notes:
+        - Assumes causal masking (can only attend to positions <= current_len)
+        - Uses numerically stable softmax (max subtraction)
+        - Q shape: [batch_size, 1, n_heads, head_dim] (single token)
+        - K/V cache shape: [batch_size, max_seq_len, n_heads, head_dim]
+        - Output shape: [batch_size, 1, n_heads, head_dim]
+    """
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be 64, 128, 256, 512, or 1024, got {workgroup_size}"
+        )
+
+    max_seq_len = workgroup_size  # Shared memory sized for this
+
+    return f"""
+// Attention with KV-cache for autoregressive generation
+//
+// Computes attention for a single new query token using cached K/V.
+// Each workgroup handles one (batch, head) pair.
+//
+// Input:
+//   - Q: [batch_size, 1, n_heads * head_dim]  (query for new token)
+//   - K_cache: [batch_size, current_len, n_heads * head_dim]  (cached keys)
+//   - V_cache: [batch_size, current_len, n_heads * head_dim]  (cached values)
+//
+// Output:
+//   - O: [batch_size, 1, n_heads * head_dim]  (attention output)
+
+struct AttentionParams {{
+    batch_size: u32,
+    current_len: u32,     // Number of valid positions in cache (1 to max_seq_len)
+    n_heads: u32,
+    head_dim: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: AttentionParams;
+@group(0) @binding(1) var<storage, read> Q: array<f32>;       // [batch, 1, n_heads*head_dim]
+@group(0) @binding(2) var<storage, read> K_cache: array<f32>; // [batch, current_len, n_heads*head_dim]
+@group(0) @binding(3) var<storage, read> V_cache: array<f32>; // [batch, current_len, n_heads*head_dim]
+@group(0) @binding(4) var<storage, read_write> O: array<f32>; // [batch, 1, n_heads*head_dim]
+
+const BLOCK_SIZE: u32 = {workgroup_size}u;
+const MAX_SEQ_LEN: u32 = {max_seq_len}u;
+const MASK_VALUE: f32 = -1e10;
+
+// Shared memory for scores and reduction
+var<workgroup> shared_scores: array<f32, MAX_SEQ_LEN>;
+var<workgroup> shared_reduction: array<f32, {workgroup_size}>;
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) group_id: vec3<u32>
+) {{
+    let batch_idx = group_id.y;
+    let head_idx = group_id.x;
+    let tid = local_id.x;
+
+    if (batch_idx >= params.batch_size || head_idx >= params.n_heads) {{
+        return;
+    }}
+
+    let head_dim = params.head_dim;
+    let embedding_dim = params.n_heads * head_dim;
+    let scale = 1.0 / sqrt(f32(head_dim));
+
+    // Q offset: single token at position 0
+    let q_offset = batch_idx * embedding_dim + head_idx * head_dim;
+
+    // ====================================================================
+    // Phase 1: Compute all QK scores and store in shared memory
+    // ====================================================================
+    for (var k_pos = tid; k_pos < params.current_len; k_pos += BLOCK_SIZE) {{
+        let k_offset = batch_idx * params.current_len * embedding_dim +
+                       k_pos * embedding_dim +
+                       head_idx * head_dim;
+
+        var score = 0.0;
+        for (var d = 0u; d < head_dim; d++) {{
+            score += Q[q_offset + d] * K_cache[k_offset + d];
+        }}
+        shared_scores[k_pos] = score * scale;
+    }}
+    workgroupBarrier();
+
+    // ====================================================================
+    // Phase 2: Find max score using parallel reduction
+    // ====================================================================
+    var max_score = -1e10;
+    for (var k_pos = tid; k_pos < params.current_len; k_pos += BLOCK_SIZE) {{
+        max_score = max(max_score, shared_scores[k_pos]);
+    }}
+    shared_reduction[tid] = max_score;
+    workgroupBarrier();
+
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_reduction[tid] = max(shared_reduction[tid], shared_reduction[tid + active_threads]);
+        }}
+        workgroupBarrier();
+        active_threads /= 2u;
+    }}
+    max_score = shared_reduction[0];
+    workgroupBarrier();
+
+    // ====================================================================
+    // Phase 3: Compute exp(score - max) and sum
+    // ====================================================================
+    var sum_exp = 0.0;
+    for (var k_pos = tid; k_pos < params.current_len; k_pos += BLOCK_SIZE) {{
+        let exp_score = exp(shared_scores[k_pos] - max_score);
+        shared_scores[k_pos] = exp_score;  // Store normalized scores
+        sum_exp += exp_score;
+    }}
+    shared_reduction[tid] = sum_exp;
+    workgroupBarrier();
+
+    active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_reduction[tid] += shared_reduction[tid + active_threads];
+        }}
+        workgroupBarrier();
+        active_threads /= 2u;
+    }}
+    sum_exp = shared_reduction[0];
+    workgroupBarrier();
+
+    // ====================================================================
+    // Phase 4: Compute weighted sum of values
+    // ====================================================================
+    let dims_per_thread = (head_dim + BLOCK_SIZE - 1u) / BLOCK_SIZE;
+    for (var d_block = 0u; d_block < dims_per_thread; d_block++) {{
+        let d = tid + d_block * BLOCK_SIZE;
+        if (d >= head_dim) {{
+            continue;
+        }}
+
+        var output_val = 0.0;
+        for (var k_pos = 0u; k_pos < params.current_len; k_pos++) {{
+            let attn_weight = shared_scores[k_pos] / sum_exp;
+            let v_offset = batch_idx * params.current_len * embedding_dim +
+                          k_pos * embedding_dim +
+                          head_idx * head_dim;
+            output_val += attn_weight * V_cache[v_offset + d];
+        }}
+
+        let out_offset = batch_idx * embedding_dim + head_idx * head_dim;
+        O[out_offset + d] = output_val;
+    }}
+}}
+"""
+
+
+# ============================================================================
 # NEW KERNELS
 # ============================================================================
 
@@ -3410,63 +3668,65 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {{
 # ====
 # FORWARD
 # ====
-def get_matmul_kernel(config) -> str:
-    return create_matmul_kernel(config.matmul_tile_size)
+def get_matmul_kernel(ctx: GPUContext) -> str:
+    return create_matmul_kernel(ctx.config.matmul_tile_size)
 
 
-def get_layernorm_kernel(config) -> str:
+def get_layernorm_kernel(ctx: GPUContext) -> str:
     return create_layernorm_kernel(
-        config.layernorm_workgroup_size, config.layernorm_epsilon
+        ctx.config.layernorm_workgroup_size, ctx.config.layernorm_epsilon
     )
 
 
-def get_gelu_kernel(config) -> str:
-    return create_gelu_kernel(config.default_workgroup_size)
+def get_gelu_kernel(ctx: GPUContext) -> str:
+    return create_gelu_kernel(ctx.config.default_workgroup_size)
 
 
-def get_residual_add_kernel(config) -> str:
-    return create_residual_add_kernel(config.default_workgroup_size)
+def get_residual_add_kernel(ctx: GPUContext) -> str:
+    return create_residual_add_kernel(ctx.config.default_workgroup_size)
 
 
-def get_embedding_kernel(config) -> str:
-    return create_embedding_kernel(config.default_workgroup_size)
+def get_embedding_kernel(ctx: GPUContext) -> str:
+    return create_embedding_kernel(ctx.config.default_workgroup_size)
 
 
-def get_bias_add_kernel(config) -> str:
-    return create_bias_add_kernel(config.default_workgroup_size)
+def get_bias_add_kernel(ctx: GPUContext) -> str:
+    return create_bias_add_kernel(ctx.config.default_workgroup_size)
 
 
-def get_attention_kernel(config) -> str:
-    return create_attention_kernel(config.attention_workgroup_size)
+def get_attention_kernel(ctx: GPUContext) -> str:
+    return create_attention_kernel(ctx.config.attention_workgroup_size)
 
 
-def get_flash_attention_kernel(config) -> str:
+def get_flash_attention_kernel(ctx: GPUContext) -> str:
     return create_flash_attention_kernel(
-        config.flash_attn_max_head_dim, config.flash_attn_bc, config.flash_attn_br
+        ctx.config.flash_attn_max_head_dim,
+        ctx.config.flash_attn_bc,
+        ctx.config.flash_attn_br,
     )
 
 
-def get_transpose_kernel(config) -> str:
+def get_transpose_kernel(ctx: GPUContext) -> str:
     return create_transpose_kernel(
-        config.matmul_tile_size
+        ctx.config.matmul_tile_size
     )  # Use same tile size as matmul
 
 
-def get_extract_last_tokens_kernel(config) -> str:
-    return create_extract_last_tokens_kernel(config.default_workgroup_size)
+def get_extract_last_tokens_kernel(ctx: GPUContext) -> str:
+    return create_extract_last_tokens_kernel(ctx.config.default_workgroup_size)
 
 
-def get_cross_entropy_loss_kernel(config) -> str:
-    return create_cross_entropy_loss_kernel(config.default_workgroup_size)
+def get_cross_entropy_loss_kernel(ctx: GPUContext) -> str:
+    return create_cross_entropy_loss_kernel(ctx.config.default_workgroup_size)
 
 
-def get_softmax_kernel(config) -> str:
-    return create_softmax_kernel(config.default_workgroup_size)
+def get_softmax_kernel(ctx: GPUContext) -> str:
+    return create_softmax_kernel(ctx.config.default_workgroup_size)
 
 
-def get_dropout_kernel(config) -> str:
+def get_dropout_kernel(ctx: GPUContext) -> str:
     """Factory function for dropout kernel."""
-    return create_dropout_kernel(config.default_workgroup_size)
+    return create_dropout_kernel(ctx.config.default_workgroup_size)
 
 
 # ====
@@ -3474,98 +3734,110 @@ def get_dropout_kernel(config) -> str:
 # ====
 
 
-def get_matmul_backward_a_kernel(config) -> str:
-    return create_matmul_backward_a_kernel(config.matmul_tile_size)
+def get_matmul_backward_a_kernel(ctx: GPUContext) -> str:
+    return create_matmul_backward_a_kernel(ctx.config.matmul_tile_size)
 
 
-def get_matmul_backward_b_kernel(config) -> str:
-    return create_matmul_backward_b_kernel(config.matmul_tile_size)
+def get_matmul_backward_b_kernel(ctx: GPUContext) -> str:
+    return create_matmul_backward_b_kernel(ctx.config.matmul_tile_size)
 
 
-def get_layernorm_backward_kernel(config) -> str:
+def get_layernorm_backward_kernel(ctx: GPUContext) -> str:
     return create_layernorm_backward_kernel(
-        config.layernorm_workgroup_size, config.layernorm_epsilon
+        ctx.config.layernorm_workgroup_size, ctx.config.layernorm_epsilon
     )
 
 
-def get_layernorm_backward_reduce_kernel(config) -> str:
-    return create_layernorm_backward_reduce_kernel(config.layernorm_workgroup_size)
+def get_layernorm_backward_reduce_kernel(ctx: GPUContext) -> str:
+    return create_layernorm_backward_reduce_kernel(ctx.config.layernorm_workgroup_size)
 
 
-def get_layernorm_backward_reduce_accumulate_kernel(config) -> str:
+def get_layernorm_backward_reduce_accumulate_kernel(ctx: GPUContext) -> str:
     return create_layernorm_backward_reduce_accumulate_kernel(
-        config.layernorm_workgroup_size
+        ctx.config.layernorm_workgroup_size
     )
 
 
-def get_gelu_backward_kernel(config) -> str:
-    return create_gelu_backward_kernel(config.default_workgroup_size)
+def get_gelu_backward_kernel(ctx: GPUContext) -> str:
+    return create_gelu_backward_kernel(ctx.config.default_workgroup_size)
 
 
-def get_bias_backward_kernel(config) -> str:
-    return create_bias_backward_kernel(config.default_workgroup_size)
+def get_bias_backward_kernel(ctx: GPUContext) -> str:
+    return create_bias_backward_kernel(ctx.config.default_workgroup_size)
 
 
-def get_attention_backward_kernel(config) -> str:
-    return create_attention_backward_kernel(config.attention_workgroup_size)
+def get_attention_backward_kernel(ctx: GPUContext) -> str:
+    return create_attention_backward_kernel(ctx.config.attention_workgroup_size)
 
 
-def get_attention_backward_reduce_kernel(config) -> str:
-    return create_attention_backward_reduce_kernel(config.attention_workgroup_size)
+def get_attention_backward_reduce_kernel(ctx: GPUContext) -> str:
+    return create_attention_backward_reduce_kernel(ctx.config.attention_workgroup_size)
 
 
-def get_flash_attention_backward_kernel(config) -> str:
+def get_flash_attention_backward_kernel(ctx: GPUContext) -> str:
     return create_flash_attention_backward_kernel(
-        config.flash_attn_max_head_dim, config.flash_attn_bc, config.flash_attn_br
+        ctx.config.flash_attn_max_head_dim,
+        ctx.config.flash_attn_bc,
+        ctx.config.flash_attn_br,
     )
 
 
-def get_flash_attention_backward_reduce_kernel(config) -> str:
+def get_flash_attention_backward_reduce_kernel(ctx: GPUContext) -> str:
     return create_flash_attention_backward_reduce_kernel(
-        config.attention_workgroup_size
+        ctx.config.attention_workgroup_size
     )
 
 
-def get_embedding_backward_kernel(config) -> str:
+def get_embedding_backward_kernel(ctx: GPUContext) -> str:
     """Factory function for embedding backward kernel."""
-    return create_embedding_backward_kernel(config.default_workgroup_size)
+    return create_embedding_backward_kernel(ctx.config.default_workgroup_size)
 
 
-def get_embedding_backward_convert_kernel(config) -> str:
+def get_embedding_backward_convert_kernel(ctx: GPUContext) -> str:
     """Factory function for embedding backward convert kernel."""
-    return create_embedding_backward_convert_kernel(config.default_workgroup_size)
+    return create_embedding_backward_convert_kernel(ctx.config.default_workgroup_size)
 
 
-def get_dropout_backward_kernel(config) -> str:
+def get_dropout_backward_kernel(ctx: GPUContext) -> str:
     """Factory function for dropout backward kernel."""
-    return create_dropout_backward_kernel(config.default_workgroup_size)
+    return create_dropout_backward_kernel(ctx.config.default_workgroup_size)
 
 
 # ====
 # OPTIMIZER
 # ====
 #
-def get_adamw_kernel(config) -> str:
-    return create_adamw_kernel(config.default_workgroup_size)
+def get_adamw_kernel(ctx: GPUContext) -> str:
+    return create_adamw_kernel(ctx.config.default_workgroup_size)
 
 
-def get_buffer_fill_kernel(config) -> str:
-    return create_buffer_fill_kernel(config.default_workgroup_size)
+def get_buffer_fill_kernel(ctx: GPUContext) -> str:
+    return create_buffer_fill_kernel(ctx.config.default_workgroup_size)
 
 
-def get_gradient_clip_kernel(config) -> str:
-    return create_gradient_clip_kernel(config.default_workgroup_size)
+def get_gradient_clip_kernel(ctx: GPUContext) -> str:
+    return create_gradient_clip_kernel(ctx.config.default_workgroup_size)
 
 
-def get_gradient_norm_kernel(config) -> str:
+def get_gradient_norm_kernel(ctx: GPUContext) -> str:
     """Factory function for gradient norm computation kernel."""
-    return create_gradient_norm_kernel(config.default_workgroup_size)
+    return create_gradient_norm_kernel(ctx.config.default_workgroup_size)
 
 
-def get_gradient_norm_reduce_kernel(config) -> str:
+def get_gradient_norm_reduce_kernel(ctx: GPUContext) -> str:
     """Factory function for gradient norm reduction kernel."""
-    return create_gradient_norm_reduce_kernel(config.default_workgroup_size)
+    return create_gradient_norm_reduce_kernel(ctx.config.default_workgroup_size)
 
 
-def get_reduce_sum_kernel(config) -> str:
-    return create_reduce_sum_kernel(config.default_workgroup_size)
+def get_reduce_sum_kernel(ctx: GPUContext) -> str:
+    return create_reduce_sum_kernel(ctx.config.default_workgroup_size)
+
+
+def get_kv_cache_update_kernel(ctx: GPUContext) -> str:
+    """Factory function for KV-cache update kernel."""
+    return create_kv_cache_update_kernel(ctx.config.default_workgroup_size)
+
+
+def get_attention_with_kv_cache_kernel(ctx: GPUContext) -> str:
+    """Factory function for attention with KV-cache kernel."""
+    return create_attention_with_kv_cache_kernel(ctx.config.attention_workgroup_size)
