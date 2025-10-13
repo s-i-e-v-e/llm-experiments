@@ -2,7 +2,6 @@ import numpy as np
 
 from .gpu_buffer import gpu_buffer_2d_create, gpu_buffer_zerofy
 from .gpu_kernels import (
-    get_attention_backward_kernel,
     get_bias_backward_kernel,
     get_dropout_backward_kernel,
     get_embedding_backward_convert_kernel,
@@ -403,57 +402,6 @@ def bias_backward(
         params,
         [grad_output, grad_bias],
         (dim + 255) // 256,
-    )
-
-
-def attention_backward(
-    ctx: GPUContext,
-    grad_output: GPUBuffer2D,
-    Q: GPUBuffer2D,
-    K: GPUBuffer2D,
-    V: GPUBuffer2D,
-    O: GPUBuffer2D,
-    grad_Q: GPUBuffer2D,
-    grad_K: GPUBuffer2D,
-    grad_V: GPUBuffer2D,
-    batch_size: int,
-    seq_len: int,
-    n_heads: int,
-    head_dim: int,
-) -> None:
-    """
-    Attention backward pass - ATOMIC-FREE version
-
-    Each workgroup handles ONE query position completely, avoiding race conditions.
-    """
-    if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
-        raise ValueError(
-            f"Invalid dimensions: batch_size={batch_size}, seq_len={seq_len}, "
-            f"n_heads={n_heads}, head_dim={head_dim}"
-        )
-
-    embedding_dim = n_heads * head_dim
-    total_tokens = batch_size * seq_len
-
-    validate_buffer_shape_2d(grad_output, (total_tokens, embedding_dim), "grad_output")
-    validate_buffer_shape_2d(Q, (total_tokens, embedding_dim), "Q")
-    validate_buffer_shape_2d(K, (total_tokens, embedding_dim), "K")
-    validate_buffer_shape_2d(V, (total_tokens, embedding_dim), "V")
-    validate_buffer_shape_2d(O, (total_tokens, embedding_dim), "O")
-    validate_buffer_shape_2d(grad_Q, (total_tokens, embedding_dim), "grad_Q")
-    validate_buffer_shape_2d(grad_K, (total_tokens, embedding_dim), "grad_K")
-    validate_buffer_shape_2d(grad_V, (total_tokens, embedding_dim), "grad_V")
-
-    params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
-
-    batch_add(
-        ctx,
-        get_attention_backward_kernel(ctx),
-        params,
-        [grad_output, Q, K, V, O, grad_Q, grad_K, grad_V],
-        seq_len,
-        n_heads,
-        batch_size,
     )
 
 

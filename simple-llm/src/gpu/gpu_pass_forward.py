@@ -1,7 +1,6 @@
 import numpy as np
 
 from .gpu_kernels import (
-    get_attention_kernel,
     get_bias_add_kernel,
     get_cross_entropy_loss_kernel,
     get_dropout_kernel,
@@ -575,63 +574,4 @@ def flash_attention(
             n_heads,
         ],
         batch_size,
-    )
-
-
-def attention(
-    ctx: GPUContext,
-    Q: GPUBuffer2D,
-    K: GPUBuffer2D,
-    V: GPUBuffer2D,
-    output: GPUBuffer2D,
-    batch_size: int,
-    seq_len: int,
-    n_heads: int,
-    head_dim: int,
-) -> None:
-    """Multi-head self-attention with causal masking
-
-    Computes scaled dot-product attention for each head, with causal masking
-    to prevent attending to future positions.
-
-    Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
-        Q: Query matrix (batch_size * seq_len, n_heads * head_dim)
-        K: Key matrix (batch_size * seq_len, n_heads * head_dim)
-        V: Value matrix (batch_size * seq_len, n_heads * head_dim)
-        output: Output matrix (batch_size * seq_len, n_heads * head_dim)
-        batch_size: Batch size
-        seq_len: Sequence length (no upper limit)
-        n_heads: Number of attention heads
-        head_dim: Dimension per head (no upper limit)
-
-    Raises:
-        ValueError: If buffer shapes don't match or dimensions invalid
-    """
-
-    if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
-        raise ValueError(
-            f"Invalid dimensions: batch_size={batch_size}, seq_len={seq_len}, "
-            f"n_heads={n_heads}, head_dim={head_dim}"
-        )
-
-    embedding_dim = n_heads * head_dim
-    total_tokens = batch_size * seq_len
-
-    validate_buffer_shape_2d(Q, (total_tokens, embedding_dim), "Q")
-    validate_buffer_shape_2d(K, (total_tokens, embedding_dim), "K")
-    validate_buffer_shape_2d(V, (total_tokens, embedding_dim), "V")
-    validate_buffer_shape_2d(output, (total_tokens, embedding_dim), "output")
-
-    params = np.array([batch_size, seq_len, n_heads, head_dim], dtype=np.uint32)
-
-    batch_add(
-        ctx,
-        get_attention_kernel(ctx),
-        params,
-        [Q, K, V, output],
-        workgroups_x=seq_len,
-        workgroups_y=n_heads,
-        workgroups_z=batch_size,
     )

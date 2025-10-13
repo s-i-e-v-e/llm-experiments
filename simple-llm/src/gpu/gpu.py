@@ -35,7 +35,6 @@ from .gpu_kv_cache import (
 )
 from .gpu_ops import batch_add, batch_begin, batch_commit
 from .gpu_pass_backward import (
-    attention_backward,
     bias_backward,
     flash_attention_backward,
     gelu_backward,
@@ -44,7 +43,6 @@ from .gpu_pass_backward import (
     matmul_backward_b,
 )
 from .gpu_pass_forward import (
-    attention,
     bias_add,
     cross_entropy_loss,
     embedding,
@@ -119,7 +117,6 @@ __all__ = [
     # Forward
     "matmul",
     "embedding",
-    "attention",
     "layernorm",
     "gelu",
     "softmax",
@@ -134,7 +131,6 @@ __all__ = [
     "layernorm_backward",
     "gelu_backward",
     "bias_backward",
-    "attention_backward",
     "flash_attention_backward",
     # Ops
     "batch_begin",
