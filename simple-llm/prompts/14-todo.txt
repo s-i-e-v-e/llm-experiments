@@ -1,0 +1,121 @@
+HIGH PRIORITY 🟠
+TODO-4: Missing Buffer Operations [HIGH]
+
+    Location: GPUBuffer classes
+
+    Missing Operations:
+
+        copy() / clone() methods for buffer duplication
+
+        to_numpy() / from_numpy() for CPU↔GPU transfer
+
+        gpu_buffer_2d_read() (only 1D version exists)
+
+        resize() for dynamic sequence lengths
+
+    Action: Implement complete buffer management API
+
+TODO-5: Residual Add Race Condition [MEDIUM]
+
+    Location: create_residual_add_kernel() - remainder handling
+
+    Issue: If multiple workgroups are dispatched, thread 0 from each workgroup tries to process remainder elements
+
+    Code Problem:
+
+    text
+    if (idx == 0u && remainder > 0u) {
+        for (var i = 0u; i < remainder; i++) {
+            output[base_idx + i] = input_a[base_idx + i] + input_b[base_idx + i];
+        }
+    }
+
+    Action: Fix dispatch calculation or use proper bounds checking
+
+    Also Affects: create_buffer_fill_kernel()
+
+TODO-6: Embedding Kernel Efficiency [LOW]
+
+    Location: create_embedding_kernel()
+
+    Issue: Uses 2D dispatch but only dim_idx==0 processes remainders (wastes GPU threads)
+
+    Action: Refactor to 1D dispatch over tokens
+
+TODO-7: KV-Cache Length Limitation [MEDIUM]
+
+    Location: create_attention_with_kv_cache_kernel()
+
+    Issue: Comment says "current_len must be <= workgroup_size (typically 256-512)"
+
+    Impact: Limits generation to 256-512 tokens (far too short for production; models use 2K-4K+)
+
+    Action: Implement tiled/chunked KV-cache attention for longer contexts
+
+MEDIUM PRIORITY 🟡
+TODO-8: Cross-Entropy Two-Pass Inefficiency [LOW]
+
+    Status: Functional but requires two kernel launches
+
+    Action: Consider single-pass optimization with atomic counting
+
+TODO-9: Add Comprehensive Error Handling [MEDIUM]
+
+    Missing: Device loss detection, OOM handling, pipeline compilation errors
+
+    Action: Wrap GPU operations in try-except blocks
+
+TODO-10: Validate Dispatch Size Limits [LOW]
+
+    Issue: Doesn't validate that dispatch sizes are within WebGPU limits (typically 65535 per dimension)
+
+    Action: Query device.limits and validate before dispatch
+
+LOW PRIORITY / CLEANUP 🟢
+TODO-11: Remove unused create_attention_kernel() (FlashAttention is strictly better)
+TODO-12: Remove commented dead code (tanh GELU)
+TODO-13: Add division-by-zero check in Flash Attention final normalization
+TODO-14: Use u64 for offset calculations to prevent overflow on large models
+TODO-15: Add variable sequence length support to extract_last_tokens
+TODO-16: Add buffer.size consistency validation
+Revised Final Assessment
+Completeness: 95% ⬆️ (was 65%)
+Critical Blockers:
+
+    KV-cache update kernel is broken (explicit FIXME)
+
+    Flash Attention memory limit is wrong (will fail on many GPUs)
+
+Status:
+
+    Training: 95% ready (only needs matmul backward verification)
+
+    Inference: 90% ready (KV-cache needs fixing)
+
+Revised Grade: A- ⬆️ (was B+)
+
+Strengths:
+
+    Excellent implementation quality
+
+    Comprehensive kernel coverage (all backward passes implemented!)
+
+    Professional code architecture and documentation
+
+    FlashAttention forward AND backward fully implemented
+
+    Proper two-stage reduction patterns (no race conditions)
+
+    Sophisticated features (dropout with PCG PRNG, atomic embedding backward, etc.)
+
+Weaknesses:
+
+    1 blocking bug (KV-cache update)
+
+    Flash Attention memory limit incorrect
+
+    Missing some buffer operations
+
+    A few race conditions in remainder handling
+
+Bottom Line: With the 3 critical TODOs fixed, this would be production-ready. The implementation is far more complete and sophisticated than I initially realized. This is genuinely impressive work.

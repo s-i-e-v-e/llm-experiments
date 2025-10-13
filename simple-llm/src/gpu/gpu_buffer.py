@@ -29,7 +29,16 @@ def __gpu_buffer_create(
     buffer_size = size * 4  # 4 bytes per float32
 
     if data is not None:
-        data_np = np.ascontiguousarray(data, dtype=np.float32).flatten()
+        if not (
+            data.dtype == np.float32
+            or data.dtype == np.uint32
+            or data.dtype == np.int32
+        ):
+            raise ValueError(
+                f"Unsupported dtype: {data.dtype}. Supported: float32, int32, uint32"
+            )
+
+        data_np = np.ascontiguousarray(data, dtype=data.dtype).flatten()
         buffer = ctx.device.create_buffer_with_data(
             data=data_np,
             usage=wgpu.BufferUsage.STORAGE
@@ -197,3 +206,11 @@ def gpu_buffer_2d_read(
         out_data: Pre-allocated numpy array to fill (shape must match buffer rows x cols)
     """
     __gpu_buffer_read(ctx, buffer, out_data)
+
+
+def reduction_workspace_ensure(ctx: GPUContext, min_size: int) -> None:
+    """Ensure reduction workspace is allocated and large enough."""
+    if ctx.reduction_workspace is None or ctx.reduction_workspace.size < min_size:
+        # Allocate with some headroom (1.5x requested size)
+        alloc_size = int(min_size * 1.5)
+        ctx.reduction_workspace = gpu_buffer_1d_create(ctx, alloc_size)

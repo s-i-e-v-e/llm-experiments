@@ -143,7 +143,6 @@ def pipeline_tuned_create(
     """Create pipeline with device-specific tuning.
 
     Args:
-        pipeline_cache: Pipeline cache for caching compiled shaders
         kernel_code: WGSL kernel source with optional {param} placeholders
         tune_params: Optional dictionary of parameter substitutions
 
@@ -170,7 +169,6 @@ def pipeline_get_or_create(
     Previously used Python hash() which can collide for different shaders.
 
     Args:
-        pipeline_cache: Pipeline cache state
         shader_code: WGSL shader source code
 
     Returns:

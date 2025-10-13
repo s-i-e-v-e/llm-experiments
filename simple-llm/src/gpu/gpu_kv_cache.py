@@ -139,25 +139,12 @@ def kv_cache_update(
         - Caller must increment cache.current_len after updating all layers
         - new_k and new_v should have shape [batch_size, 1, embedding_dim]
           representing the single new token being generated
-
-    Example:
-        ```
-        # During generation loop:
-        for layer_idx in range(n_layers):
-            # Compute Q, K, V for new token
-            k_new = matmul(ln_out, layer.wk, ...)
-            v_new = matmul(ln_out, layer.wv, ...)
-
-            # Update cache
-            kv_cache_update(ctx, cache, layer_idx, k_new, v_new)
-
-        # After all layers updated
-        cache.current_len += 1
-        ```
     """
+    # Validate layer index
     if layer_idx < 0 or layer_idx >= len(cache.layers):
         raise ValueError(f"layer_idx {layer_idx} out of range [0, {len(cache.layers)})")
 
+    # Check cache not full
     if cache.current_len >= cache.max_seq_len:
         raise ValueError(
             f"Cache is full: current_len={cache.current_len}, "
@@ -166,36 +153,34 @@ def kv_cache_update(
 
     embedding_dim = cache.n_heads * cache.head_dim
 
-    # Validate new K/V shapes: [batch_size, 1, embedding_dim]
+    # Validate new KV shapes: [batch_size, 1, embedding_dim]
     expected_rows = cache.batch_size * 1  # Single token
     validate_buffer_shape_2d(new_k, (expected_rows, embedding_dim), "new_k")
     validate_buffer_shape_2d(new_v, (expected_rows, embedding_dim), "new_v")
 
     layer_cache = cache.layers[layer_idx]
 
-    # FIXME: Kernel needs to be fixed to handle max_seq_len properly
-    # Current kernel signature is incomplete
-    # For now, we'll prepare parameters but this will fail at runtime
-
+    # Kernel parameters: batch_size, current_pos, embedding_dim, max_seq_len
     params = np.array(
         [
-            cache.batch_size,
-            cache.current_len,  # Position to write to
-            embedding_dim,
-            cache.max_seq_len,  # FIXME: Kernel needs this in struct
+            cache.batch_size,  # Batch size
+            cache.current_len,  # Position to write to (0 to max_seq_len-1)
+            embedding_dim,  # n_heads * head_dim
+            cache.max_seq_len,  # Maximum sequence length cache can hold
         ],
         dtype=np.uint32,
     )
 
     # Dispatch kernel to copy new_k and new_v to cache at current_len
+    # Kernel uses 2D dispatch: (embedding_dim, batch_size)
     batch_add(
         ctx,
         get_kv_cache_update_kernel(ctx),
         params,
         [new_k, new_v, layer_cache.k_cache, layer_cache.v_cache],
-        (embedding_dim + 255) // 256,  # workgroups_x: one per dimension
-        cache.batch_size,  # workgroups_y: one per batch element
-        1,
+        workgroups_x=(embedding_dim + 255) // 256,  # One per dimension
+        workgroups_y=cache.batch_size,  # One per batch element
+        workgroups_z=1,
     )
 
 
@@ -217,6 +202,12 @@ def attention_with_kv_cache(
     During autoregressive generation, only the query for the new token
     needs to be computed. Keys and values for all previous tokens are
     retrieved from the cache.
+
+    **LIMITATION**: current_len must be <= workgroup_size (typically 256-512).
+    For longer sequences during generation:
+    - Use FlashAttention for prefill phase (first token with full context)
+    - Use this function for decode phase (subsequent tokens)
+    - Or implement tiled KV-cache attention (not yet available)
 
     Args:
         ctx: GPU context

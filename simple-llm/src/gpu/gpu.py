@@ -36,6 +36,7 @@ from .gpu_kv_cache import (
 from .gpu_ops import batch_add, batch_begin, batch_commit
 from .gpu_pass_backward import (
     bias_backward,
+    embedding_backward,
     flash_attention_backward,
     gelu_backward,
     layernorm_backward,
@@ -131,6 +132,7 @@ __all__ = [
     "layernorm_backward",
     "gelu_backward",
     "bias_backward",
+    "embedding_backward",
     "flash_attention_backward",
     # Ops
     "batch_begin",

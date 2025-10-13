@@ -44,6 +44,24 @@ class GPUConfig:
     - 16x16 = 2KB shared memory per tile
     """
 
+    matmul_items_per_thread: int = 4
+    """
+    Items per thread for matrix multiplication (register blocking).
+
+    Controls how many output elements each thread computes.
+    Higher values = more register usage but fewer threads needed.
+
+    Optimal values:
+    - Constrained register GPUs: 1 or 2
+    - Normal GPUs: 4 (default)
+    - High register count GPUs: 4 or 8
+
+    Constraints:
+    - Must be 1, 2, or 4
+    - items_per_thread=4 means each thread computes 4x4=16 output elements
+    - Total registers per thread: ~items_per_thread² accumulators
+    """
+
     # ========================================================================
     # FLASHATTENTION PARAMETERS
     # ========================================================================
@@ -91,6 +109,8 @@ class GPUConfig:
     # WORKGROUP SIZES
     # ========================================================================
 
+    max_workgroup_storage_size: int = 16384  # WebGPU guaranteed minimum (16 KB)
+
     default_workgroup_size: int = 256
     """Default workgroup size for simple kernels (e.g., GELU, residual add)"""
 
@@ -100,6 +120,32 @@ class GPUConfig:
     attention_workgroup_size: int = 256
     """Workgroup size for attention operations"""
 
+    optimizer_workgroup_size: int = 256
+    """
+    Workgroup size for optimizer kernels (AdamW, gradient clipping).
+
+    Optimizer kernels are compute-intensive and benefit from larger
+    workgroups on high-end GPUs.
+
+    Optimal values:
+    - Low-end GPUs: 128 or 256
+    - Mid-range GPUs: 256
+    - High-end GPUs: 512
+    """
+
+    reduction_workgroup_size: int = 256
+    """
+    Workgroup size for reduction kernels (bias backward, softmax, gradient norm).
+
+    Reduction kernels use shared memory and benefit from workgroup tuning.
+
+    Optimal values:
+    - Small reductions (< 1024 elements): 128
+    - Medium reductions: 256
+    - Large reductions: 512
+
+    Must be power of 2.
+    """
     # ========================================================================
     # MEMORY LIMITS
     # ========================================================================
@@ -155,52 +201,6 @@ class GPUConfig:
     """Epsilon for AdamW optimizer numerical stability"""
 
 
-@dataclass
-class PipelineCache:
-    """
-    Cache for compiled GPU pipelines
-    """
-
-    pipelines: Dict[str, wgpu.GPUComputePipeline] = field(default_factory=dict)
-    bind_groups: Dict[int, wgpu.GPUBindGroup] = field(default_factory=dict)
-
-
-@dataclass
-class BatchState:
-    """
-    State for batched GPU operations
-    """
-
-    encoder: Optional[wgpu.GPUCommandEncoder]
-    retained_buffers: List[wgpu.GPUBuffer] = field(
-        default_factory=list
-    )  # Now type-safe!
-    enable_profiling: bool = False
-    operation_count: int = 0
-
-
-@dataclass
-class GPUContext:
-    device: wgpu.GPUDevice
-    config: GPUConfig
-    batch_state: BatchState
-    pipeline_cache: PipelineCache
-
-
-@dataclass
-class BindGroupEntry:
-    """
-    Type-safe bind group entry specification
-
-    This dataclass is immutable - do not modify fields after creation.
-    """
-
-    binding: int
-    buffer: wgpu.GPUBuffer
-    offset: int
-    size: int
-
-
 # ============================================================================
 # GPU BUFFER TYPES
 # ============================================================================
@@ -237,6 +237,51 @@ class GPUBuffer2D:
 
 # Used by functions that do not care about dimensions
 GPUBufferAny = Union[GPUBuffer1D, GPUBuffer2D]
+
+
+@dataclass
+class PipelineCache:
+    """
+    Cache for compiled GPU pipelines
+    """
+
+    pipelines: Dict[str, wgpu.GPUComputePipeline] = field(default_factory=dict)
+    bind_groups: Dict[int, wgpu.GPUBindGroup] = field(default_factory=dict)
+
+
+@dataclass
+class BatchState:
+    """
+    State for batched GPU operations
+    """
+
+    encoder: Optional[wgpu.GPUCommandEncoder]
+    retained_buffers: List[wgpu.GPUBuffer] = field(default_factory=list)
+    enable_profiling: bool = False
+    operation_count: int = 0
+
+
+@dataclass
+class GPUContext:
+    device: wgpu.GPUDevice
+    config: GPUConfig
+    batch_state: BatchState
+    pipeline_cache: PipelineCache
+    reduction_workspace: Optional[GPUBuffer1D] = None  # NEW: Shared workspace
+
+
+@dataclass
+class BindGroupEntry:
+    """
+    Type-safe bind group entry specification
+
+    This dataclass is immutable - do not modify fields after creation.
+    """
+
+    binding: int
+    buffer: wgpu.GPUBuffer
+    offset: int
+    size: int
 
 
 # ============================================================================

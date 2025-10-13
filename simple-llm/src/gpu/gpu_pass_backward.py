@@ -1,12 +1,14 @@
 import numpy as np
 
-from .gpu_buffer import gpu_buffer_2d_create, gpu_buffer_zerofy
+from .gpu_buffer import gpu_buffer_zerofy
 from .gpu_kernels import (
     get_bias_backward_kernel,
+    get_bias_backward_reduce_kernel,
     get_dropout_backward_kernel,
-    get_embedding_backward_convert_kernel,
     get_embedding_backward_kernel,
+    get_embedding_backward_reduce_kernel,
     get_flash_attention_backward_kernel,
+    get_flash_attention_backward_reduce_kernel,
     get_gelu_backward_kernel,
     get_layernorm_backward_kernel,
     get_layernorm_backward_reduce_accumulate_kernel,
@@ -49,8 +51,6 @@ def matmul_backward_a(
     """Compute gradient w.r.t. A: grad_A = grad_C @ B^T.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         grad_C: Gradient of loss w.r.t. C (M, N)
         B: Forward pass B matrix (K, N)
         grad_A: Output gradient w.r.t. A (M, K)
@@ -71,7 +71,7 @@ def matmul_backward_a(
 
     validate_buffer_shape_2d(grad_A, (M, K), "grad_A")
 
-    params = np.array([M, K, N], dtype=np.uint32)
+    params = np.array([M, N, K], dtype=np.uint32)
     batch_add(
         ctx,
         get_matmul_backward_a_kernel(ctx),
@@ -92,8 +92,6 @@ def matmul_backward_b(
     """Compute gradient w.r.t. B: grad_B = A^T @ grad_C.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         A: Forward pass A matrix (M, K)
         grad_C: Gradient of loss w.r.t. C (M, N)
         grad_B: Output gradient w.r.t. B (K, N)
@@ -130,61 +128,81 @@ def embedding_backward(
     input_ids: GPUBuffer1D,
     grad_output: GPUBuffer2D,
     grad_embedding: GPUBuffer2D,
+    reduction_workspace: GPUBuffer2D,
     batch_size: int,
     seq_len: int,
 ) -> None:
-    """Embedding backward pass with atomic accumulation.
+    """
+    Embedding backward pass using workspace pattern.
 
     Two-stage process:
-    1. Accumulate gradients as i32 using atomics (handles race conditions)
-    2. Convert i32 back to f32
+    1. Copy grad_output to workspace (flat indexing, parallelized)
+    2. Reduce workspace to grad_embedding (2D dispatch: vocab × dim)
 
     Args:
-        device: GPU device
-        config: GPU configuration
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
+        ctx: GPU context
         input_ids: Input token IDs [batch_size*seq_len]
         grad_output: Gradient w.r.t. embeddings [batch_size*seq_len, embedding_dim]
         grad_embedding: Output gradient w.r.t. embedding table [vocab_size, embedding_dim]
+        reduction_workspace: Workspace [batch_size*seq_len, embedding_dim]
         batch_size: Batch size
         seq_len: Sequence length
 
     Raises:
         ValueError: If buffer shapes don't match
     """
+    import numpy as np
+
+    from .gpu_buffer import gpu_buffer_zerofy
+    from .gpu_ops import batch_add, validate_buffer_shape_1d, validate_buffer_shape_2d
+
     total_tokens, embedding_dim = grad_output.shape
     vocab_size, embedding_dim2 = grad_embedding.shape
 
     if embedding_dim != embedding_dim2:
         raise ValueError(f"Embedding dim mismatch: {embedding_dim} != {embedding_dim2}")
 
+    if total_tokens != batch_size * seq_len:
+        raise ValueError(
+            f"Total tokens {total_tokens} != batch_size*seq_len {batch_size * seq_len}"
+        )
+
     validate_buffer_shape_1d(input_ids, total_tokens, "input_ids")
     validate_buffer_shape_2d(grad_output, (total_tokens, embedding_dim), "grad_output")
+    validate_buffer_shape_2d(
+        reduction_workspace, (total_tokens, embedding_dim), "reduction_workspace"
+    )
 
-    temp_i32 = gpu_buffer_2d_create(ctx, vocab_size, embedding_dim)
-    gpu_buffer_zerofy(ctx, temp_i32)
+    # Zero the output buffer
+    gpu_buffer_zerofy(ctx, grad_embedding)
 
-    params = np.array([batch_size, seq_len, embedding_dim], dtype=np.uint32)
+    # Stage 1: Copy grad_output to workspace (FLAT indexing, parallel over all elements)
+    total_elements = total_tokens * embedding_dim
+    stage1_params = np.array([total_tokens, embedding_dim, 0, 0], dtype=np.uint32)
 
     batch_add(
         ctx,
         get_embedding_backward_kernel(ctx),
-        params,
-        [input_ids, grad_output, temp_i32],
-        (total_tokens + 255) // 256,
-        (embedding_dim + 255) // 256,
+        stage1_params,
+        [grad_output, reduction_workspace],
+        (total_elements + 255) // 256,  # FIXED: Flat indexing over all elements
+        1,
         1,
     )
 
-    convert_params = np.array([vocab_size * embedding_dim], dtype=np.uint32)
+    # Stage 2: Reduce workspace to embedding gradients (2D dispatch: vocab_id × dim_idx)
+    stage2_params = np.array(
+        [total_tokens, embedding_dim, vocab_size, 0], dtype=np.uint32
+    )
 
     batch_add(
         ctx,
-        get_embedding_backward_convert_kernel(ctx),
-        convert_params,
-        [temp_i32, grad_embedding],
-        (vocab_size * embedding_dim + 255) // 256,
+        get_embedding_backward_reduce_kernel(ctx),
+        stage2_params,
+        [input_ids, reduction_workspace, grad_embedding],
+        vocab_size,  # FIXED: workgroup_id.x = vocab_id
+        embedding_dim,  # FIXED: workgroup_id.y = dim_idx
+        1,
     )
 
 
@@ -198,10 +216,6 @@ def dropout_backward(
     """Dropout backward using saved mask.
 
     Args:
-        device: GPU device
-        config: GPU configuration
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         grad_output: Gradient w.r.t. output [rows, cols]
         mask: Mask from forward pass [rows, cols]
         grad_input: Output gradient w.r.t. input [rows, cols]
@@ -235,29 +249,32 @@ def layernorm_backward(
     grad_input: GPUBuffer2D,
     grad_gamma: GPUBuffer1D,
     grad_beta: GPUBuffer1D,
+    reduction_workspace_gamma: GPUBuffer2D,
+    reduction_workspace_beta: GPUBuffer2D,
     accumulate: bool = False,
 ) -> None:
     """
-    Backward pass for layer normalization
+    Backward pass for layer normalization using workspace pattern.
 
     Uses two-stage reduction to avoid race conditions:
-    - Stage 1: Each workgroup computes partial gamma/beta gradients
+    - Stage 1: Each workgroup computes partial gamma/beta gradients → workspace
     - Stage 2: Reduction kernel sums partial gradients into final result
 
     Example:
         # Gradient accumulation (multiple mini-batches)
-        layernorm_backward(cache, state, x1, gamma, grad_out1, grad_in1, grad_g, grad_b, accumulate=False)
-        layernorm_backward(cache, state, x2, gamma, grad_out2, grad_in2, grad_g, grad_b, accumulate=True)
+        layernorm_backward(ctx, x1, gamma, grad_out1, grad_in1, grad_g, grad_b, ws_g, ws_b, accumulate=False)
+        layernorm_backward(ctx, x2, gamma, grad_out2, grad_in2, grad_g, grad_b, ws_g, ws_b, accumulate=True)
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
+        ctx: GPU context
         input_buf: Input from forward pass (n_elements, size)
         gamma: Scale parameters from forward pass (size,)
         grad_output: Gradient of loss w.r.t. output (n_elements, size)
         grad_input: Output gradient w.r.t. input (n_elements, size)
         grad_gamma: Output gradient w.r.t. gamma (size,)
         grad_beta: Output gradient w.r.t. beta (size,)
+        reduction_workspace_gamma: Workspace for partial gamma gradients (n_elements, size)
+        reduction_workspace_beta: Workspace for partial beta gradients (n_elements, size)
         accumulate: If False (default), zeros grad_gamma/grad_beta before operation.
                    If True, accumulates into existing values.
 
@@ -274,10 +291,12 @@ def layernorm_backward(
     validate_buffer_shape_2d(grad_input, (n_elements, size), "grad_input")
     validate_buffer_shape_1d(grad_gamma, size, "grad_gamma")
     validate_buffer_shape_1d(grad_beta, size, "grad_beta")
-
-    # Allocate temporary buffers for partial gradients
-    partial_grad_gamma = gpu_buffer_2d_create(ctx, n_elements, size)
-    partial_grad_beta = gpu_buffer_2d_create(ctx, n_elements, size)
+    validate_buffer_shape_2d(
+        reduction_workspace_gamma, (n_elements, size), "reduction_workspace_gamma"
+    )
+    validate_buffer_shape_2d(
+        reduction_workspace_beta, (n_elements, size), "reduction_workspace_beta"
+    )
 
     # Stage 1: Compute partial gradients
     params = np.array([size, n_elements], dtype=np.uint32)
@@ -291,8 +310,8 @@ def layernorm_backward(
             gamma,
             grad_output,
             grad_input,
-            partial_grad_gamma,
-            partial_grad_beta,
+            reduction_workspace_gamma,
+            reduction_workspace_beta,
         ],
         n_elements,
     )
@@ -312,8 +331,8 @@ def layernorm_backward(
         ctx,
         reduction_kernel,
         params_reduce,
-        [partial_grad_gamma, partial_grad_beta, grad_gamma, grad_beta],
-        (size + 255) // 256,
+        [reduction_workspace_gamma, reduction_workspace_beta, grad_gamma, grad_beta],
+        size,
     )
 
 
@@ -326,8 +345,6 @@ def gelu_backward(
     """Backward pass for GELU activation
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         input_buf: Input from forward pass
         grad_output: Gradient of loss w.r.t. output
         grad_input: Output gradient w.r.t. input
@@ -360,24 +377,26 @@ def bias_backward(
     ctx: GPUContext,
     grad_output: GPUBuffer2D,
     grad_bias: GPUBuffer1D,
+    reduction_workspace: GPUBuffer1D,
     accumulate: bool = False,
 ) -> None:
     """
-    Backward pass for bias - sum gradients over batch
+    Backward pass for bias - sum gradients over batch using two-stage reduction.
+
+    Stage 1: Each workgroup computes partial sums for bias dimensions
+    Stage 2: Reduce all partials to final gradient
 
     Example:
         # Gradient accumulation (multiple mini-batches)
-        bias_backward(cache, state, grad_out1, grad_bias, accumulate=False)  # First batch
-        bias_backward(cache, state, grad_out2, grad_bias, accumulate=True)   # Accumulate
-        bias_backward(cache, state, grad_out3, grad_bias, accumulate=True)   # Accumulate
+        bias_backward(ctx, grad_out1, grad_bias, workspace, accumulate=False)
+        bias_backward(ctx, grad_out2, grad_bias, workspace, accumulate=True)
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
+        ctx: GPU context
         grad_output: Gradient of loss w.r.t. output (n_elements, dim)
         grad_bias: Output gradient w.r.t. bias (dim,)
-        accumulate: If False (default), zeros grad_bias before operation.
-                   If True, accumulates into existing grad_bias values.
+        reduction_workspace: Workspace for partial reductions
+        accumulate: If False, zeros grad_bias before operation
 
     Raises:
         ValueError: If buffer shapes don't match
@@ -393,15 +412,33 @@ def bias_backward(
     if not accumulate:
         gpu_buffer_zerofy(ctx, grad_bias)
 
-    total_size = n_elements * dim
-    params = np.array([total_size, dim], dtype=np.uint32)
+    # Stage 1: Compute partial sums
+    workgroup_size = 256
+    num_workgroups = (n_elements + workgroup_size - 1) // workgroup_size
+    total_partials = num_workgroups * dim
+
+    # Validate workspace size
+    validate_buffer_shape_1d(reduction_workspace, total_partials, "reduction_workspace")
+
+    params = np.array([n_elements, dim], dtype=np.uint32)
 
     batch_add(
         ctx,
         get_bias_backward_kernel(ctx),
         params,
-        [grad_output, grad_bias],
-        (dim + 255) // 256,
+        [grad_output, reduction_workspace],
+        num_workgroups,
+    )
+
+    # Stage 2: Reduce partials to final gradient
+    reduce_params = np.array([num_workgroups, dim], dtype=np.uint32)
+
+    batch_add(
+        ctx,
+        get_bias_backward_reduce_kernel(ctx),
+        reduce_params,
+        [reduction_workspace, grad_bias],
+        dim,  # One workgroup per bias dimension
     )
 
 
@@ -415,6 +452,8 @@ def flash_attention_backward(
     M: GPUBuffer1D,
     grad_O: GPUBuffer2D,
     grad_Q: GPUBuffer2D,
+    grad_K_workspace: GPUBuffer2D,
+    grad_V_workspace: GPUBuffer2D,
     grad_K: GPUBuffer2D,
     grad_V: GPUBuffer2D,
     batch_size: int,
@@ -423,22 +462,25 @@ def flash_attention_backward(
     head_dim: int,
 ) -> None:
     """
-    Recomputes attention weights from saved statistics (L, M) to avoid
-    materializing full attention matrix.
+    Compute gradients for flash attention using two-stage reduction.
+
+    Stage 1: Each Q-block computes partial grad_K and grad_V contributions
+    Stage 2: Reduce all partials to final gradients
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
-        grad_O: Gradient w.r.t. output [batch_size*seq_len, n_heads*head_dim]
+        ctx: GPU context
         Q: Query from forward pass [batch_size*seq_len, n_heads*head_dim]
         K: Key from forward pass [batch_size*seq_len, n_heads*head_dim]
         V: Value from forward pass [batch_size*seq_len, n_heads*head_dim]
         O: Output from forward pass [batch_size*seq_len, n_heads*head_dim]
         L: Softmax normalization from forward [batch_size*seq_len*n_heads]
         M: Max values from forward [batch_size*seq_len*n_heads]
-        grad_Q: Gradient w.r.t. Q [batch_size*seq_len, n_heads*head_dim]
-        grad_K: Gradient w.r.t. K [batch_size*seq_len, n_heads*head_dim]
-        grad_V: Gradient w.r.t. V [batch_size*seq_len, n_heads*head_dim]
+        grad_O: Gradient w.r.t. output [batch_size*seq_len, n_heads*head_dim]
+        grad_Q: Output gradient w.r.t. Q [batch_size*seq_len, n_heads*head_dim]
+        grad_K_workspace: Workspace for partial grad_K [num_q_blocks*batch_size*seq_len, n_heads*head_dim]
+        grad_V_workspace: Workspace for partial grad_V [num_q_blocks*batch_size*seq_len, n_heads*head_dim]
+        grad_K: Output gradient w.r.t. K [batch_size*seq_len, n_heads*head_dim]
+        grad_V: Output gradient w.r.t. V [batch_size*seq_len, n_heads*head_dim]
         batch_size: Batch size
         seq_len: Sequence length
         n_heads: Number of attention heads
@@ -447,12 +489,13 @@ def flash_attention_backward(
     Raises:
         ValueError: If buffer shapes don't match or dimensions invalid
     """
+    config = ctx.config
 
     # Validate head_dim against config
-    if head_dim > ctx.config.flash_attn_max_head_dim:
+    if head_dim > config.flash_attn_max_head_dim:
         raise ValueError(
             f"head_dim {head_dim} exceeds maximum supported by config: "
-            f"{ctx.config.flash_attn_max_head_dim}"
+            f"{config.flash_attn_max_head_dim}"
         )
 
     if batch_size <= 0 or seq_len <= 0 or n_heads <= 0 or head_dim <= 0:
@@ -476,27 +519,62 @@ def flash_attention_backward(
     validate_buffer_shape_2d(grad_K, (total_tokens, embedding_dim), "grad_K")
     validate_buffer_shape_2d(grad_V, (total_tokens, embedding_dim), "grad_V")
 
-    params = np.array(
+    Br = config.flash_attn_br
+    num_q_blocks = (seq_len + Br - 1) // Br
+
+    # Validate workspace shapes
+    workspace_tokens = num_q_blocks * total_tokens
+    validate_buffer_shape_2d(
+        grad_K_workspace, (workspace_tokens, embedding_dim), "grad_K_workspace"
+    )
+    validate_buffer_shape_2d(
+        grad_V_workspace, (workspace_tokens, embedding_dim), "grad_V_workspace"
+    )
+
+    # Stage 1: Compute partial gradients per Q-block
+    # Each Q-block writes to its dedicated workspace slice
+    for q_block_idx in range(num_q_blocks):
+        params = np.array(
+            [
+                batch_size,
+                seq_len,
+                n_heads,
+                head_dim,
+                config.flash_attn_bc,
+                config.flash_attn_br,
+                q_block_idx,  # Current Q-block index for workspace offset
+            ],
+            dtype=np.uint32,
+        )
+
+        batch_add(
+            ctx,
+            get_flash_attention_backward_kernel(ctx),
+            params,
+            [grad_O, Q, K, V, O, L, M, grad_Q, grad_K_workspace, grad_V_workspace],
+            1,  # Process one Q-block at a time
+            n_heads,
+            batch_size,
+        )
+
+    # Stage 2: Reduce workspace partials to final gradients
+    reduce_params = np.array(
         [
             batch_size,
             seq_len,
             n_heads,
             head_dim,
-            ctx.config.flash_attn_bc,
-            ctx.config.flash_attn_br,
+            num_q_blocks,
         ],
         dtype=np.uint32,
     )
 
-    Br = ctx.config.flash_attn_br
-    num_q_blocks = (seq_len + Br - 1) // Br
-
     batch_add(
         ctx,
-        get_flash_attention_backward_kernel(ctx),
-        params,
-        [grad_O, Q, K, V, O, L, M, grad_Q, grad_K, grad_V],
-        num_q_blocks,
-        n_heads,
-        batch_size,
+        get_flash_attention_backward_reduce_kernel(ctx),
+        reduce_params,
+        [grad_K_workspace, grad_V_workspace, grad_K, grad_V],
+        total_tokens,  # One workgroup per token position
+        1,
+        1,
     )

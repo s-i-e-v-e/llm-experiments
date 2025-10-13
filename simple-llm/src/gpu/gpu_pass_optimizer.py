@@ -43,8 +43,6 @@ def __adamw_update(
     Uses decoupled weight decay (AdamW variant).
 
     Args:
-        pipeline_cache: Pipeline cache for compute pipelines
-        batch_state: Current batch state with encoder
         gradients: Gradient buffer
         weights: Weight buffer
         m: First moment buffer
@@ -142,8 +140,6 @@ def gradient_clip(
         If total_norm > max_norm, scales all gradients by max_norm/total_norm.
 
     Args:
-        pipeline_cache: Pipeline cache for compute pipelines
-        batch_state: Current batch state with encoder
         gradients: Gradient buffer to clip in-place
         max_norm: Maximum allowed gradient norm
         total_norm: Pre-computed global norm of all gradients
@@ -176,8 +172,6 @@ def buffer_fill(
     Useful for initializing buffers to zeros or specific values.
 
     Args:
-        pipeline_cache: Pipeline cache for compute pipelines
-        batch_state: Current batch state with encoder
         buffer: Buffer to fill
         value: Value to fill with
     """
@@ -211,8 +205,6 @@ def reduce_sum(
         may need second pass or CPU-side final sum.
 
     Args:
-        pipeline_cache: Pipeline cache for compute pipelines
-        batch_state: Current batch state with encoder
         input_buffer: Input buffer to reduce
         output_buffer: Output buffer for partial sums [num_workgroups]
     """
@@ -245,10 +237,7 @@ def __compute_gradient_norm(
     2. Reduce all partials to single global norm
 
     Args:
-        device: GPU device
-        config: GPU configuration
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
+
         gradients: List of all gradient buffers (GPUBuffer2D)
 
     Returns:
@@ -302,10 +291,7 @@ def gradient_clip_with_norm(
     """Clip gradients by computing and using global norm.
 
     Args:
-        device: GPU device
-        config: GPU configuration
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
+
         buffer_pool: Buffer pool for temporary allocations
         gradients: List of all gradient buffers to clip
         max_norm: Maximum allowed gradient norm

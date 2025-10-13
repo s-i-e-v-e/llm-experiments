@@ -173,7 +173,6 @@ def __uniform_buffer_create(
     using it (typically after queue submission completes). No explicit cleanup needed.
 
     Args:
-        pipeline_cache: Pipeline cache state
         data: Numpy array of parameter data
 
     Returns:
@@ -212,7 +211,6 @@ def __bind_group_create(
     """Internal: Create bind group using type-safe entries.
 
     Args:
-        pipeline_cache: Pipeline cache state
         pipeline: Compute pipeline
         entries: Bind group entry specifications
 
@@ -265,8 +263,6 @@ def batch_add(
     Internal: Add compute operation to batch encoder.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         kernel_code: WGSL kernel source
         params: Parameter array
         buffers: GPU buffers to bind

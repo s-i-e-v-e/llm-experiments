@@ -7,20 +7,8 @@ from .gpu_types import GPUContext
 # ============================================================================
 
 
-def create_matmul_kernel(tile_size: int = 16, items_per_thread: int = 4) -> str:
-    """
-    Generate matmul kernel with configurable tile size and register blocking
-
-    Args:
-        tile_size: Tile dimension for shared memory (must be power of 2, typically 8, 16, or 32)
-        items_per_thread: Number of output elements per thread (1, 2, or 4)
-
-    Returns:
-        WGSL kernel source code as string
-
-    Raises:
-        ValueError: If tile_size or items_per_thread is invalid
-    """
+def create_matmul_kernel(tile_size: int, items_per_thread: int) -> str:
+    """Generate matmul kernel with configurable tile size and register blocking"""
     if tile_size <= 0 or (tile_size & (tile_size - 1)) != 0:
         raise ValueError(f"tile_size must be power of 2, got {tile_size}")
     if tile_size > 32:
@@ -29,16 +17,18 @@ def create_matmul_kernel(tile_size: int = 16, items_per_thread: int = 4) -> str:
         raise ValueError(f"items_per_thread must be 1, 2, or 4, got {items_per_thread}")
 
     workgroup_dim = tile_size // (items_per_thread if items_per_thread > 1 else 1)
+    num_threads = workgroup_dim * workgroup_dim
+    tile_elements = tile_size * tile_size
+    elements_per_thread_load = tile_elements // num_threads
 
     return f"""
 // Optimized tiled matrix multiplication: C = A @ B
 // Tile size: {tile_size}x{tile_size}, Items per thread: {items_per_thread}x{items_per_thread}
-// Each thread computes {items_per_thread * items_per_thread} output elements
 
 struct MatmulParams {{
-    M: u32,
-    K: u32,
-    N: u32,
+    M: u32,  // Rows of A
+    K: u32,  // Cols of A / Rows of B
+    N: u32,  // Cols of B
 }}
 
 @group(0) @binding(0) var<uniform> params: MatmulParams;
@@ -46,38 +36,49 @@ struct MatmulParams {{
 @group(0) @binding(2) var<storage, read> B: array<f32>;
 @group(0) @binding(3) var<storage, read_write> C: array<f32>;
 
+
 const TILE_SIZE: u32 = {tile_size}u;
 const ITEMS_PER_THREAD: u32 = {items_per_thread}u;
+const WORKGROUP_DIM: u32 = {workgroup_dim}u;
+const NUM_THREADS: u32 = {num_threads}u;
+const ELEMENTS_PER_THREAD_LOAD: u32 = {elements_per_thread_load}u;
 
-var<workgroup> tile_A: array<f32, {tile_size * tile_size}>;
-var<workgroup> tile_B: array<f32, {tile_size * tile_size}>;
+var<workgroup> tile_A: array<f32, {tile_elements}>;
+var<workgroup> tile_B: array<f32, {tile_elements}>;
 
-@compute @workgroup_size({workgroup_dim}, {workgroup_dim})
+@compute @workgroup_size({workgroup_dim}, {workgroup_dim}, 1)
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>,
-    @builtin(local_invocation_id) local_id: vec3<u32>
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
 ) {{
     let local_row = local_id.y;
     let local_col = local_id.x;
+    let thread_id = local_row * WORKGROUP_DIM + local_col;
 
-    // Each thread computes ITEMS_PER_THREAD x ITEMS_PER_THREAD outputs
-    let base_row = global_id.y * ITEMS_PER_THREAD;
-    let base_col = global_id.x * ITEMS_PER_THREAD;
+    let base_row = workgroup_id.y * TILE_SIZE;
+    let base_col = workgroup_id.x * TILE_SIZE;
 
-    // Accumulator registers
+    // Initialize accumulator
     var acc: array<f32, {items_per_thread * items_per_thread}>;
-    for (var i = 0u; i < {items_per_thread * items_per_thread}u; i++) {{
+    for (var i = 0u; i < ITEMS_PER_THREAD * ITEMS_PER_THREAD; i++) {{
         acc[i] = 0.0;
     }}
 
+    // Number of tiles in K dimension
     let num_tiles = (params.K + TILE_SIZE - 1u) / TILE_SIZE;
 
+    // Loop over K dimension tiles
     for (var t = 0u; t < num_tiles; t++) {{
-        // Load A tile - each thread loads ITEMS_PER_THREAD elements
-        for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-            let a_row = base_row + i;
-            let a_col = t * TILE_SIZE + local_col;
-            let tile_idx = (local_row * ITEMS_PER_THREAD + i) * TILE_SIZE + local_col;
+        // Load A tile - ALL threads cooperatively load
+        for (var idx = 0u; idx < ELEMENTS_PER_THREAD_LOAD; idx++) {{
+            let tile_idx = thread_id * ELEMENTS_PER_THREAD_LOAD + idx;
+            let tile_row = tile_idx / TILE_SIZE;
+            let tile_col = tile_idx % TILE_SIZE;
+
+            // FIXED: Global indices for A matrix
+            let a_row = base_row + tile_row;
+            let a_col = t * TILE_SIZE + tile_col;
 
             if (a_row < params.M && a_col < params.K) {{
                 tile_A[tile_idx] = A[a_row * params.K + a_col];
@@ -86,11 +87,15 @@ fn main(
             }}
         }}
 
-        // Load B tile - each thread loads ITEMS_PER_THREAD elements
-        for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-            let b_row = t * TILE_SIZE + local_row;
-            let b_col = base_col + i;
-            let tile_idx = local_row * TILE_SIZE + (local_col * ITEMS_PER_THREAD + i);
+        // Load B tile - ALL threads cooperatively load
+        for (var idx = 0u; idx < ELEMENTS_PER_THREAD_LOAD; idx++) {{
+            let tile_idx = thread_id * ELEMENTS_PER_THREAD_LOAD + idx;
+            let tile_row = tile_idx / TILE_SIZE;
+            let tile_col = tile_idx % TILE_SIZE;
+
+            // FIXED: Global indices for B matrix
+            let b_row = t * TILE_SIZE + tile_row;
+            let b_col = base_col + tile_col;
 
             if (b_row < params.K && b_col < params.N) {{
                 tile_B[tile_idx] = B[b_row * params.N + b_col];
@@ -117,9 +122,9 @@ fn main(
 
     // Write results
     for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-        let out_row = base_row + i;
+        let out_row = base_row + local_row * ITEMS_PER_THREAD + i;
         for (var j = 0u; j < ITEMS_PER_THREAD; j++) {{
-            let out_col = base_col + j;
+            let out_col = base_col + local_col * ITEMS_PER_THREAD + j;
             if (out_row < params.M && out_col < params.N) {{
                 C[out_row * params.N + out_col] = acc[i * ITEMS_PER_THREAD + j];
             }}
@@ -129,7 +134,7 @@ fn main(
 """
 
 
-def create_layernorm_kernel(workgroup_size: int = 256, epsilon: float = 1e-5) -> str:
+def create_layernorm_kernel(workgroup_size: int, epsilon: float) -> str:
     """
     Generate layer normalization kernel with configurable workgroup size
 
@@ -244,7 +249,7 @@ fn main(
 """
 
 
-def create_gelu_kernel(workgroup_size: int = 256) -> str:
+def create_gelu_kernel(workgroup_size: int) -> str:
     """
     Generate GELU activation kernel with configurable workgroup size
 
@@ -309,7 +314,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
-def create_residual_add_kernel(workgroup_size: int = 256) -> str:
+def create_residual_add_kernel(workgroup_size: int) -> str:
     """
     Generate residual addition kernel with configurable workgroup size
 
@@ -376,9 +381,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
-def create_embedding_kernel(workgroup_size: int = 256) -> str:
+def create_embedding_kernel(workgroup_size: int) -> str:
     """
     Generate embedding lookup kernel with configurable workgroup size
+
+    FIXED: Now uses 1D dispatch and loops over all dimensions for each token.
+    Each thread processes one token and all its embedding dimensions.
 
     Args:
         workgroup_size: Number of threads per workgroup (64, 128, 256, or 512)
@@ -396,7 +404,8 @@ def create_embedding_kernel(workgroup_size: int = 256) -> str:
 
     return f"""
 // Embedding lookup with positional encoding
-// Uses 2D dispatch to parallelize across both tokens and embedding dimensions
+// FIXED: 1D dispatch with per-token processing of all dimensions
+// Each thread handles one token and processes all embedding dimensions
 
 struct EmbedParams {{
     batch_size: u32,
@@ -413,51 +422,34 @@ struct EmbedParams {{
 @compute @workgroup_size({workgroup_size}, 1, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
     let token_idx = global_id.x;  // Which token (batch * seq_len)
-    let dim_idx = global_id.y;     // Which dimension element
-
     let total_tokens = params.batch_size * params.seq_len;
-    let D = params.embedding_dim;
-    let vec4_per_token = D / 4u;
-    let remainder = D % 4u;
 
     if (token_idx >= total_tokens) {{
         return;
     }}
 
+    // Compute sequence position for positional encoding
     let seq_idx = token_idx % params.seq_len;
+
+    // Look up token ID
     let token_id = input_ids[token_idx];
 
-    let emb_offset = token_id * D;
-    let pos_offset = seq_idx * D;
-    let out_offset = token_idx * D;
+    // Compute offsets
+    let emb_offset = token_id * params.embedding_dim;
+    let pos_offset = seq_idx * params.embedding_dim;
+    let out_offset = token_idx * params.embedding_dim;
 
-    // Process 4 dimensions at a time
-    if (dim_idx < vec4_per_token) {{
-        let base_d = dim_idx * 4u;
-
-        output[out_offset + base_d] =
-            embedding_table[emb_offset + base_d] + pos_encoding[pos_offset + base_d];
-        output[out_offset + base_d + 1u] =
-            embedding_table[emb_offset + base_d + 1u] + pos_encoding[pos_offset + base_d + 1u];
-        output[out_offset + base_d + 2u] =
-            embedding_table[emb_offset + base_d + 2u] + pos_encoding[pos_offset + base_d + 2u];
-        output[out_offset + base_d + 3u] =
-            embedding_table[emb_offset + base_d + 3u] + pos_encoding[pos_offset + base_d + 3u];
-    }}
-
-    // Handle remainder dimensions
-    if (dim_idx == 0u && remainder > 0u) {{
-        let base_d = vec4_per_token * 4u;
-        for (var i = 0u; i < remainder; i++) {{
-            output[out_offset + base_d + i] =
-                embedding_table[emb_offset + base_d + i] + pos_encoding[pos_offset + base_d + i];
-        }}
+    // Process ALL dimensions for this token
+    // Each thread handles one complete token embedding
+    for (var d = 0u; d < params.embedding_dim; d++) {{
+        output[out_offset + d] = embedding_table[emb_offset + d] +
+                                  pos_encoding[pos_offset + d];
     }}
 }}
 """
 
 
-def create_bias_add_kernel(workgroup_size: int = 256) -> str:
+def create_bias_add_kernel(workgroup_size: int) -> str:
     """
     Generate bias addition kernel with configurable workgroup size
 
@@ -505,15 +497,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 
 
 def create_flash_attention_kernel(
-    head_dim: int = 64, Bc: int = 32, Br: int = 32
+    head_dim: int, Bc: int, Br: int, max_workgroup_storage: int
 ) -> str:
     """
     Generate FlashAttention kernel with configurable parameters
 
     Args:
-        head_dim: Dimension per attention head (64, 128, or 256)
-        Bc: Block size for K/V (columns) - typically 16, 32, or 64
-        Br: Block size for Q (rows) - typically 16, 32, or 64
+        head_dim: Dimension per attention head (16, 32, , 64, 128, or 256)
+        Bc: Block size for K/V (columns) - typically 8, 16, 32, or 64
+        Br: Block size for Q (rows) - typically 8, 16, 32, or 64
+        max_workgroup_storage: Maximum workgroup storage size in bytes (default 16384)
 
     Returns:
         WGSL kernel source code as string
@@ -521,8 +514,8 @@ def create_flash_attention_kernel(
     Raises:
         ValueError: If parameters are invalid or exceed workgroup memory limits
     """
-    if head_dim not in [64, 128, 256]:
-        raise ValueError(f"head_dim must be 64, 128, or 256, got {head_dim}")
+    if head_dim not in [16, 32, 64, 128, 256]:
+        raise ValueError(f"head_dim must be 16, 32, 64, 128, or 256, got {head_dim}")
 
     if Bc <= 0 or (Bc & (Bc - 1)) != 0:
         raise ValueError(f"Bc must be power of 2, got {Bc}")
@@ -539,7 +532,7 @@ def create_flash_attention_kernel(
     vj_size = Bc * head_dim
     sij_size = Br * Bc
     pij_size = Br * Bc
-    oi_size = Br * head_dim  # Moved to shared memory
+    oi_size = Br * head_dim
     mi_size = Br
     li_size = Br
     mi_old_size = Br
@@ -557,19 +550,22 @@ def create_flash_attention_kernel(
     )
     total_workgroup_bytes = total_workgroup_f32 * 4
 
-    if total_workgroup_bytes > 65536:
+    # CHANGED: Use dynamic limit instead of hardcoded 65536
+    if total_workgroup_bytes > max_workgroup_storage:
         raise ValueError(
-            f"Workgroup memory {total_workgroup_bytes} bytes exceeds 64KB limit. "
-            f"Try smaller head_dim, Bc, or Br values."
+            f"Workgroup memory {total_workgroup_bytes} bytes exceeds "
+            f"device limit of {max_workgroup_storage} bytes. "
+            f"Try smaller head_dim, Bc, or Br values. "
+            f"Current config: head_dim={head_dim}, Bc={Bc}, Br={Br}"
         )
 
     return f"""
 // FlashAttention: Memory-efficient attention using tiling and online softmax
-// Based on: Dao et al. 2022 - \"FlashAttention: Fast and Memory-Efficient Exact Attention\"
+// Based on: Dao et al. 2022 - "FlashAttention: Fast and Memory-Efficient Exact Attention"
 // Optimized version with parallelized initialization and softmax
 //
 // Parameters: head_dim={head_dim}, Bc={Bc}, Br={Br}
-// Workgroup memory: {total_workgroup_bytes} bytes
+// Workgroup memory: {total_workgroup_bytes} bytes (limit: {max_workgroup_storage})
 // Threads per workgroup: {threads_per_workgroup}
 
 struct FlashAttentionParams {{
@@ -579,6 +575,7 @@ struct FlashAttentionParams {{
     head_dim: u32,
     Bc: u32,
     Br: u32,
+    num_q_blocks: u32,
 }}
 
 @group(0) @binding(0) var<uniform> params: FlashAttentionParams;
@@ -757,7 +754,8 @@ fn main(
                       global_row * embedding_dim +
                       head_idx * d + d_idx;
 
-        O[o_offset] = Oi[row * HEAD_DIM + d_idx] / li[row];
+        O[o_offset] = Oi[row * HEAD_DIM + d_idx] / max(li[row], 1e-8);
+
     }}
 
     // Write statistics
@@ -772,7 +770,7 @@ fn main(
 """
 
 
-def create_transpose_kernel(tile_size: int = 16) -> str:
+def create_transpose_kernel(tile_size: int) -> str:
     """
     Generate matrix transpose kernel with bank conflict avoidance
 
@@ -842,7 +840,7 @@ fn main(
 """
 
 
-def create_extract_last_tokens_kernel(workgroup_size: int = 256) -> str:
+def create_extract_last_tokens_kernel(workgroup_size: int) -> str:
     """
     Generate kernel to extract last token from each sequence
 
@@ -893,7 +891,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
-def create_softmax_kernel(workgroup_size: int = 256) -> str:
+def create_softmax_kernel(workgroup_size: int) -> str:
     """
     Generate standalone softmax kernel for inference/generation
 
@@ -998,7 +996,7 @@ fn main(
 """
 
 
-def create_cross_entropy_loss_kernel(workgroup_size: int = 256) -> str:
+def create_cross_entropy_loss_kernel(workgroup_size: int) -> str:
     """
     Generate unified cross-entropy loss and gradient kernel with masking support.
 
@@ -1155,7 +1153,7 @@ fn main(
 """
 
 
-def create_gradient_normalization_kernel(workgroup_size: int = 256) -> str:
+def create_gradient_normalization_kernel(workgroup_size: int) -> str:
     """
     Generate kernel to normalize gradients by valid token count.
 
@@ -1202,111 +1200,110 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 # ============================================================================
 # BACKWARD PASS KERNELS
 # ============================================================================
-def create_matmul_backward_a_kernel(
-    tile_size: int = 16, items_per_thread: int = 4
-) -> str:
-    """
-    Generate backward matmul kernel for gradient w.r.t. A
-
-    Args:
-        tile_size: Tile dimension (must be power of 2, typically 8, 16, or 32)
-        items_per_thread: Number of output elements per thread (1, 2, or 4)
-
-    Returns:
-        WGSL kernel source code as string
-
-    Raises:
-        ValueError: If tile_size or items_per_thread is invalid
-    """
+def create_matmul_backward_a_kernel(tile_size: int, items_per_thread: int) -> str:
+    """Generate backward A kernel: grad_A = grad_C @ B^T"""
     if tile_size <= 0 or (tile_size & (tile_size - 1)) != 0:
         raise ValueError(f"tile_size must be power of 2, got {tile_size}")
-
     if tile_size > 32:
         raise ValueError(f"tile_size too large: {tile_size}. Maximum is 32.")
-
     if items_per_thread not in [1, 2, 4]:
         raise ValueError(f"items_per_thread must be 1, 2, or 4, got {items_per_thread}")
 
     workgroup_dim = tile_size // (items_per_thread if items_per_thread > 1 else 1)
+    num_threads = workgroup_dim * workgroup_dim
+    tile_elements = tile_size * tile_size
+    elements_per_thread_load = tile_elements // num_threads
 
     return f"""
-// Backward pass for matmul: compute gradient w.r.t. A
-// Given: dL/dC, B
-// Compute: dL/dA = dL/dC @ B^T
-// Tile size: {tile_size}x{tile_size}, Items per thread: {items_per_thread}x{items_per_thread}
+// Backward pass for A: grad_A = grad_C @ B^T
 
-struct MatmulParams {{
+struct BackwardAParams {{
     M: u32,
-    K: u32,
     N: u32,
+    K: u32,
 }}
 
-@group(0) @binding(0) var<uniform> params: MatmulParams;
-@group(0) @binding(1) var<storage, read> grad_C: array<f32>;  // (M, N)
-@group(0) @binding(2) var<storage, read> B: array<f32>;       // (K, N)
-@group(0) @binding(3) var<storage, read_write> grad_A: array<f32>;  // (M, K)
+@group(0) @binding(0) var<uniform> params: BackwardAParams;
+@group(0) @binding(1) var<storage, read> grad_C: array<f32>;
+@group(0) @binding(2) var<storage, read> B: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_A: array<f32>;
 
 const TILE_SIZE: u32 = {tile_size}u;
 const ITEMS_PER_THREAD: u32 = {items_per_thread}u;
+const WORKGROUP_DIM: u32 = {workgroup_dim}u;
+const NUM_THREADS: u32 = {num_threads}u;
+const ELEMENTS_PER_THREAD_LOAD: u32 = {elements_per_thread_load}u;
 
-var<workgroup> tile_grad: array<f32, {tile_size * tile_size}>;
-var<workgroup> tile_B: array<f32, {tile_size * tile_size}>;
+var<workgroup> tile_grad_C: array<f32, {tile_elements}>;
+var<workgroup> tile_B: array<f32, {tile_elements}>;
 
 @compute @workgroup_size({workgroup_dim}, {workgroup_dim}, 1)
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>,
-    @builtin(local_invocation_id) local_id: vec3<u32>
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
 ) {{
     let local_row = local_id.y;
     let local_col = local_id.x;
+    let thread_id = local_row * WORKGROUP_DIM + local_col;
 
-    let base_row = global_id.y * ITEMS_PER_THREAD;  // M dimension
-    let base_col = global_id.x * ITEMS_PER_THREAD;  // K dimension
+    let base_row = workgroup_id.y * TILE_SIZE;
+    let base_col = workgroup_id.x * TILE_SIZE;
 
-    // Accumulator registers
     var acc: array<f32, {items_per_thread * items_per_thread}>;
-    for (var i = 0u; i < {items_per_thread * items_per_thread}u; i++) {{
+    for (var i = 0u; i < ITEMS_PER_THREAD * ITEMS_PER_THREAD; i++) {{
         acc[i] = 0.0;
     }}
 
     let num_tiles = (params.N + TILE_SIZE - 1u) / TILE_SIZE;
 
     for (var t = 0u; t < num_tiles; t++) {{
-        // Load grad_C tile - each thread loads ITEMS_PER_THREAD elements
-        for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-            let g_row = base_row + i;
-            let g_col = t * TILE_SIZE + local_col;
-            let tile_idx = (local_row * ITEMS_PER_THREAD + i) * TILE_SIZE + local_col;
+        // Load grad_C tile
+        for (var idx = 0u; idx < ELEMENTS_PER_THREAD_LOAD; idx++) {{
+            let tile_idx = thread_id * ELEMENTS_PER_THREAD_LOAD + idx;
+            let tile_row = tile_idx / TILE_SIZE;
+            let tile_col = tile_idx % TILE_SIZE;
 
-            if (g_row < params.M && g_col < params.N) {{
-                tile_grad[tile_idx] = grad_C[g_row * params.N + g_col];
+            let gc_row = base_row + tile_row;
+            let gc_col = t * TILE_SIZE + tile_col;
+
+            if (gc_row < params.M && gc_col < params.N) {{
+                tile_grad_C[tile_idx] = grad_C[gc_row * params.N + gc_col];
             }} else {{
-                tile_grad[tile_idx] = 0.0;
+                tile_grad_C[tile_idx] = 0.0;
             }}
         }}
 
-        // Load B^T tile (transpose on-the-fly) - each thread loads ITEMS_PER_THREAD elements
-        for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-            let b_row = t * TILE_SIZE + local_row;
-            let b_col = base_col + i;
-            let tile_idx = local_row * TILE_SIZE + (local_col * ITEMS_PER_THREAD + i);
+        // Load B tile and store it TRANSPOSED in shared memory
+        // So that tile_B[row][col] contains B^T[row][col] = B[col][row]
+        for (var idx = 0u; idx < ELEMENTS_PER_THREAD_LOAD; idx++) {{
+            let tile_idx = thread_id * ELEMENTS_PER_THREAD_LOAD + idx;
+            let tile_row = tile_idx / TILE_SIZE;
+            let tile_col = tile_idx % TILE_SIZE;
 
-            if (b_row < params.N && b_col < params.K) {{
-                tile_B[tile_idx] = B[b_col * params.N + b_row];
+            // We want tile_B to contain B^T[t*TILE+row, base_col+col]
+            // Which equals B[base_col+col, t*TILE+row]
+            let b_row = base_col + tile_col;  // Note the swap
+            let b_col = t * TILE_SIZE + tile_row;  // Note the swap
+
+            if (b_row < params.K && b_col < params.N) {{
+                // Store transposed: tile_B[row][col] = B[col][row]
+                tile_B[tile_row * TILE_SIZE + tile_col] = B[b_row * params.N + b_col];
             }} else {{
-                tile_B[tile_idx] = 0.0;
+                tile_B[tile_row * TILE_SIZE + tile_col] = 0.0;
             }}
         }}
 
         workgroupBarrier();
 
-        // Compute partial results
+        // Compute: grad_A += grad_C @ B^T
         for (var k = 0u; k < TILE_SIZE; k++) {{
             for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-                let grad_val = tile_grad[(local_row * ITEMS_PER_THREAD + i) * TILE_SIZE + k];
+                let gc_val = tile_grad_C[(local_row * ITEMS_PER_THREAD + i) * TILE_SIZE + k];
                 for (var j = 0u; j < ITEMS_PER_THREAD; j++) {{
+                    // Access B^T: tile_B[k][local_col * IPT + j]
                     let b_val = tile_B[k * TILE_SIZE + (local_col * ITEMS_PER_THREAD + j)];
-                    acc[i * ITEMS_PER_THREAD + j] += grad_val * b_val;
+                    acc[i * ITEMS_PER_THREAD + j] += gc_val * b_val;
                 }}
             }}
         }}
@@ -1316,9 +1313,9 @@ fn main(
 
     // Write results
     for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-        let out_row = base_row + i;
+        let out_row = base_row + local_row * ITEMS_PER_THREAD + i;
         for (var j = 0u; j < ITEMS_PER_THREAD; j++) {{
-            let out_col = base_col + j;
+            let out_col = base_col + local_col * ITEMS_PER_THREAD + j;
             if (out_row < params.M && out_col < params.K) {{
                 grad_A[out_row * params.K + out_col] = acc[i * ITEMS_PER_THREAD + j];
             }}
@@ -1328,112 +1325,112 @@ fn main(
 """
 
 
-def create_matmul_backward_b_kernel(
-    tile_size: int = 16, items_per_thread: int = 4
-) -> str:
-    """
-    Generate backward matmul kernel for gradient w.r.t. B
-
-    Args:
-        tile_size: Tile dimension (must be power of 2, typically 8, 16, or 32)
-        items_per_thread: Number of output elements per thread (1, 2, or 4)
-
-    Returns:
-        WGSL kernel source code as string
-
-    Raises:
-        ValueError: If tile_size or items_per_thread is invalid
-    """
+def create_matmul_backward_b_kernel(tile_size: int, items_per_thread: int) -> str:
+    """Generate backward B kernel: grad_B = A^T @ grad_C"""
     if tile_size <= 0 or (tile_size & (tile_size - 1)) != 0:
         raise ValueError(f"tile_size must be power of 2, got {tile_size}")
-
     if tile_size > 32:
         raise ValueError(f"tile_size too large: {tile_size}. Maximum is 32.")
-
     if items_per_thread not in [1, 2, 4]:
         raise ValueError(f"items_per_thread must be 1, 2, or 4, got {items_per_thread}")
 
     workgroup_dim = tile_size // (items_per_thread if items_per_thread > 1 else 1)
+    num_threads = workgroup_dim * workgroup_dim
+    tile_elements = tile_size * tile_size
+    elements_per_thread_load = tile_elements // num_threads
 
     return f"""
-// Backward pass for matmul: compute gradient w.r.t. B
-// Given: A, dL/dC
-// Compute: dL/dB = A^T @ dL/dC
+// Backward pass for B: grad_B = A^T @ grad_C
 // Tile size: {tile_size}x{tile_size}, Items per thread: {items_per_thread}x{items_per_thread}
 
-struct MatmulParams {{
-    M: u32,
-    K: u32,
-    N: u32,
+struct BackwardBParams {{
+    M: u32,  // Rows of A
+    K: u32,  // Cols of A / Cols of grad_B
+    N: u32,  // Cols of grad_C
 }}
 
-@group(0) @binding(0) var<uniform> params: MatmulParams;
-@group(0) @binding(1) var<storage, read> A: array<f32>;       // (M, K)
-@group(0) @binding(2) var<storage, read> grad_C: array<f32>;  // (M, N)
-@group(0) @binding(3) var<storage, read_write> grad_B: array<f32>;  // (K, N)
+@group(0) @binding(0) var<uniform> params: BackwardBParams;
+@group(0) @binding(1) var<storage, read> A: array<f32>;
+@group(0) @binding(2) var<storage, read> grad_C: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_B: array<f32>;
 
 const TILE_SIZE: u32 = {tile_size}u;
 const ITEMS_PER_THREAD: u32 = {items_per_thread}u;
+const WORKGROUP_DIM: u32 = {workgroup_dim}u;
+const NUM_THREADS: u32 = {num_threads}u;
+const ELEMENTS_PER_THREAD_LOAD: u32 = {elements_per_thread_load}u;
 
-var<workgroup> tile_A: array<f32, {tile_size * tile_size}>;
-var<workgroup> tile_grad: array<f32, {tile_size * tile_size}>;
+var<workgroup> tile_A: array<f32, {tile_elements}>;
+var<workgroup> tile_grad_C: array<f32, {tile_elements}>;
 
 @compute @workgroup_size({workgroup_dim}, {workgroup_dim}, 1)
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>,
-    @builtin(local_invocation_id) local_id: vec3<u32>
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
 ) {{
     let local_row = local_id.y;
     let local_col = local_id.x;
+    let thread_id = local_row * WORKGROUP_DIM + local_col;
 
-    let base_row = global_id.y * ITEMS_PER_THREAD;  // K dimension
-    let base_col = global_id.x * ITEMS_PER_THREAD;  // N dimension
+    let base_row = workgroup_id.y * TILE_SIZE;
+    let base_col = workgroup_id.x * TILE_SIZE;
 
-    // Accumulator registers
+    // Initialize accumulator
     var acc: array<f32, {items_per_thread * items_per_thread}>;
-    for (var i = 0u; i < {items_per_thread * items_per_thread}u; i++) {{
+    for (var i = 0u; i < ITEMS_PER_THREAD * ITEMS_PER_THREAD; i++) {{
         acc[i] = 0.0;
     }}
 
+    // Number of tiles in M dimension
     let num_tiles = (params.M + TILE_SIZE - 1u) / TILE_SIZE;
 
+    // Loop over M dimension tiles
     for (var t = 0u; t < num_tiles; t++) {{
-        // Load A^T tile (transpose on-the-fly) - each thread loads ITEMS_PER_THREAD elements
-        // This loads a tile of A into tile_A with a layout ready for matmul.
-        for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-            let a_row = t * TILE_SIZE + local_row;
-            let a_col = base_row + i;
-            let tile_idx = (local_row * ITEMS_PER_THREAD + i) * TILE_SIZE + local_col;
+        // Load A^T tile (transpose on-the-fly) - ALL threads cooperatively load
+        for (var idx = 0u; idx < ELEMENTS_PER_THREAD_LOAD; idx++) {{
+            let tile_idx = thread_id * ELEMENTS_PER_THREAD_LOAD + idx;
+            let tile_row = tile_idx / TILE_SIZE;
+            let tile_col = tile_idx % TILE_SIZE;
+
+            // FIXED: Global indices for A matrix (transposed access)
+            // We want A^T[tile_row, tile_col] = A[tile_col, tile_row] in global coords
+            let a_row = t * TILE_SIZE + tile_col;  // Swap for transpose
+            let a_col = base_row + tile_row;  // Swap for transpose
 
             if (a_row < params.M && a_col < params.K) {{
-                // Note: The indexing here loads A transposed into tile_A
                 tile_A[tile_idx] = A[a_row * params.K + a_col];
             }} else {{
                 tile_A[tile_idx] = 0.0;
             }}
         }}
 
-        // Load grad_C tile - each thread loads ITEMS_PER_THREAD elements
-        for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-            let g_row = t * TILE_SIZE + local_row;
-            let g_col = base_col + i;
-            let tile_idx = local_row * TILE_SIZE + (local_col * ITEMS_PER_THREAD + i);
+        // Load grad_C tile - ALL threads cooperatively load
+        for (var idx = 0u; idx < ELEMENTS_PER_THREAD_LOAD; idx++) {{
+            let tile_idx = thread_id * ELEMENTS_PER_THREAD_LOAD + idx;
+            let tile_row = tile_idx / TILE_SIZE;
+            let tile_col = tile_idx % TILE_SIZE;
 
-            if (g_row < params.M && g_col < params.N) {{
-                tile_grad[tile_idx] = grad_C[g_row * params.N + g_col];
+            // FIXED: Global indices for grad_C matrix
+            let gc_row = t * TILE_SIZE + tile_row;
+            let gc_col = base_col + tile_col;
+
+            if (gc_row < params.M && gc_col < params.N) {{
+                tile_grad_C[tile_idx] = grad_C[gc_row * params.N + gc_col];
             }} else {{
-                tile_grad[tile_idx] = 0.0;
+                tile_grad_C[tile_idx] = 0.0;
             }}
         }}
 
         workgroupBarrier();
 
+        // Compute partial results
         for (var k = 0u; k < TILE_SIZE; k++) {{
             for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
                 let a_val = tile_A[(local_row * ITEMS_PER_THREAD + i) * TILE_SIZE + k];
                 for (var j = 0u; j < ITEMS_PER_THREAD; j++) {{
-                    let grad_val = tile_grad[k * TILE_SIZE + (local_col * ITEMS_PER_THREAD + j)];
-                    acc[i * ITEMS_PER_THREAD + j] += a_val * grad_val;
+                    let gc_val = tile_grad_C[k * TILE_SIZE + (local_col * ITEMS_PER_THREAD + j)];
+                    acc[i * ITEMS_PER_THREAD + j] += a_val * gc_val;
                 }}
             }}
         }}
@@ -1443,9 +1440,9 @@ fn main(
 
     // Write results
     for (var i = 0u; i < ITEMS_PER_THREAD; i++) {{
-        let out_row = base_row + i;
+        let out_row = base_row + local_row * ITEMS_PER_THREAD + i;
         for (var j = 0u; j < ITEMS_PER_THREAD; j++) {{
-            let out_col = base_col + j;
+            let out_col = base_col + local_col * ITEMS_PER_THREAD + j;
             if (out_row < params.K && out_col < params.N) {{
                 grad_B[out_row * params.N + out_col] = acc[i * ITEMS_PER_THREAD + j];
             }}
@@ -1455,9 +1452,7 @@ fn main(
 """
 
 
-def create_layernorm_backward_kernel(
-    workgroup_size: int = 256, epsilon: float = 1e-5
-) -> str:
+def create_layernorm_backward_kernel(workgroup_size: int, epsilon: float) -> str:
     """
     Generate layer normalization backward kernel - Stage 1
 
@@ -1636,7 +1631,7 @@ fn main(
 """
 
 
-def create_layernorm_backward_reduce_kernel(workgroup_size: int = 256) -> str:
+def create_layernorm_backward_reduce_kernel(workgroup_size: int) -> str:
     """
     Generate layer normalization backward reduction kernel - Stage 2
 
@@ -1727,7 +1722,7 @@ fn main(
 
 
 def create_layernorm_backward_reduce_accumulate_kernel(
-    workgroup_size: int = 256,
+    workgroup_size: int,
 ) -> str:
     """
     Generate layer normalization backward reduction kernel - Stage 2 (ACCUMULATE MODE)
@@ -1822,7 +1817,7 @@ fn main(
 """
 
 
-def create_gelu_backward_kernel(workgroup_size: int = 256) -> str:
+def create_gelu_backward_kernel(workgroup_size: int) -> str:
     """
     Generate GELU activation backward kernel
 
@@ -1884,9 +1879,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
-def create_bias_backward_kernel(workgroup_size: int = 256) -> str:
+def create_bias_backward_kernel(workgroup_size: int) -> str:
     """
-    Generate bias backward kernel
+    Each workgroup computes partial sum for a subset of rows for one bias dimension.
+    Multiple workgroups may process the same bias dimension.
 
     Args:
         workgroup_size: Number of threads per workgroup (64, 128, 256, or 512)
@@ -1903,17 +1899,100 @@ def create_bias_backward_kernel(workgroup_size: int = 256) -> str:
         )
 
     return f"""
-// Backward pass for bias addition
-// Gradient w.r.t. bias is sum over batch dimension
-// Uses parallel reduction for efficiency
+// Bias Backward - STAGE 1: Compute partial sums
+// Each workgroup computes partial sum over a subset of batch elements
+// Output: workspace[workgroup_id, dim]
 
 struct BiasParams {{
-    size: u32,
+    n_elements: u32,
     dim: u32,
 }}
 
 @group(0) @binding(0) var<uniform> params: BiasParams;
 @group(0) @binding(1) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(2) var<storage, read_write> workspace: array<f32>;
+
+const BLOCK_SIZE: u32 = {workgroup_size}u;
+
+var<workgroup> shared_data: array<f32, {workgroup_size}>;
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>
+) {{
+    let workgroup_idx = workgroup_id.x;
+    let tid = local_id.x;
+    let total_workgroups = num_workgroups.x;
+
+    // Compute how many elements this workgroup processes
+    let elements_per_workgroup = (params.n_elements + total_workgroups - 1u) / total_workgroups;
+    let start_element = workgroup_idx * elements_per_workgroup;
+    let end_element = min(start_element + elements_per_workgroup, params.n_elements);
+
+    // Each workgroup processes all dimensions
+    for (var dim_idx = 0u; dim_idx < params.dim; dim_idx++) {{
+        // Parallel sum across assigned elements for this dimension
+        var sum = 0.0;
+        for (var elem = start_element + tid; elem < end_element; elem += BLOCK_SIZE) {{
+            sum += grad_output[elem * params.dim + dim_idx];
+        }}
+        shared_data[tid] = sum;
+        workgroupBarrier();
+
+        // Tree reduction within workgroup
+        var active_threads = BLOCK_SIZE / 2u;
+        while (active_threads > 0u) {{
+            if (tid < active_threads) {{
+                shared_data[tid] += shared_data[tid + active_threads];
+            }}
+            workgroupBarrier();
+            active_threads >>= 1u;
+        }}
+
+        // Thread 0 writes partial result to workspace
+        if (tid == 0u) {{
+            let workspace_idx = workgroup_idx * params.dim + dim_idx;
+            workspace[workspace_idx] = shared_data[0];
+        }}
+        workgroupBarrier();
+    }}
+}}
+"""
+
+
+def create_bias_backward_reduce_kernel(workgroup_size: int) -> str:
+    """
+    Reduces partial sums from all workgroups to final gradient.
+    One workgroup per bias dimension.
+
+    Args:
+        workgroup_size: Number of threads per workgroup (64, 128, 256, or 512)
+
+    Returns:
+        WGSL kernel source code as string
+
+    Raises:
+        ValueError: If workgroup_size is invalid
+    """
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be 64, 128, 256, 512, or 1024, got {workgroup_size}"
+        )
+
+    return f"""
+// Bias Backward - STAGE 2: Reduce partial sums
+// Each workgroup reduces all partial sums for one bias dimension
+
+struct ReduceParams {{
+    num_workgroups: u32,
+    dim: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: ReduceParams;
+@group(0) @binding(1) var<storage, read> workspace: array<f32>;
 @group(0) @binding(2) var<storage, read_write> grad_bias: array<f32>;
 
 const BLOCK_SIZE: u32 = {workgroup_size}u;
@@ -1926,19 +2005,18 @@ fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) workgroup_id: vec3<u32>
 ) {{
-    let col = workgroup_id.x;  // One workgroup per bias dimension
+    let dim_idx = workgroup_id.x;
     let tid = local_id.x;
 
-    if (col >= params.dim) {{
+    if (dim_idx >= params.dim) {{
         return;
     }}
 
-    let n_rows = params.size / params.dim;
-
-    // Parallel sum across rows
+    // Sum all partial results for this dimension
     var sum = 0.0;
-    for (var row = tid; row < n_rows; row += BLOCK_SIZE) {{
-        sum += grad_output[row * params.dim + col];
+    for (var wg = tid; wg < params.num_workgroups; wg += BLOCK_SIZE) {{
+        let workspace_idx = wg * params.dim + dim_idx;
+        sum += workspace[workspace_idx];
     }}
     shared_data[tid] = sum;
     workgroupBarrier();
@@ -1953,27 +2031,28 @@ fn main(
         active_threads >>= 1u;
     }}
 
-    // Thread 0 writes result
+    // Thread 0 writes final result
     if (tid == 0u) {{
-        grad_bias[col] = shared_data[0];
+        grad_bias[dim_idx] = shared_data[0];
     }}
 }}
 """
 
 
 def create_flash_attention_backward_kernel(
-    head_dim: int = 64, Bc: int = 32, Br: int = 32
+    head_dim: int, Bc: int, Br: int, max_workgroup_storage: int
 ) -> str:
     """
     Generate FlashAttention backward kernel - Stage 1
 
     Memory-efficient backward pass using tiling and recomputation.
-    Outputs partial gradients for K/V that must be reduced in stage 2.
+    Outputs partial gradients for KV that must be reduced in stage 2.
 
     Args:
-        head_dim: Dimension per attention head (64, 128, or 256)
+        head_dim: Dimension per attention head (16, 32, 64, 128, or 256)
         Bc: Block size for K/V (columns) - typically 16, 32, or 64
         Br: Block size for Q (rows) - typically 16, 32, or 64
+        max_workgroup_storage: Maximum workgroup storage size in bytes (default 16384)
 
     Returns:
         WGSL kernel source code as string
@@ -1981,8 +2060,8 @@ def create_flash_attention_backward_kernel(
     Raises:
         ValueError: If parameters are invalid or exceed workgroup memory limits
     """
-    if head_dim not in [64, 128, 256]:
-        raise ValueError(f"head_dim must be 64, 128, or 256, got {head_dim}")
+    if head_dim not in [16, 32, 64, 128, 256]:
+        raise ValueError(f"head_dim must be 16, 32, 64, 128, or 256, got {head_dim}")
 
     if Bc <= 0 or (Bc & (Bc - 1)) != 0:
         raise ValueError(f"Bc must be power of 2, got {Bc}")
@@ -2020,19 +2099,21 @@ def create_flash_attention_backward_kernel(
     )
     total_workgroup_bytes = total_workgroup_f32 * 4
 
-    if total_workgroup_bytes > 65536:
+    # CHANGED: Use dynamic limit instead of hardcoded 65536
+    if total_workgroup_bytes > max_workgroup_storage:
         raise ValueError(
-            f"Workgroup memory {total_workgroup_bytes} bytes exceeds 64KB limit. "
-            f"Try smaller head_dim, Bc, or Br values."
+            f"Workgroup memory {total_workgroup_bytes} bytes exceeds "
+            f"device limit of {max_workgroup_storage} bytes. "
+            f"Try smaller head_dim, Bc, or Br values. "
+            f"Current config: head_dim={head_dim}, Bc={Bc}, Br={Br}"
         )
 
     return f"""
-// FlashAttention Backward Pass - STAGE 1
-// Fully parallelized, outputs partial gradients for K/V
-//
-// Parameters: head_dim={head_dim}, Bc={Bc}, Br={Br}
-// Workgroup memory: {total_workgroup_bytes} bytes
-// Threads per workgroup: {threads_per_workgroup}
+    // FlashAttention Backward Pass - STAGE 1
+    // Fully parallelized, outputs partial gradients for KV
+    // Parameters: head_dim={head_dim}, Bc={Bc}, Br={Br}
+    // Workgroup memory: {total_workgroup_bytes} bytes (limit: {max_workgroup_storage})
+    // Threads per workgroup: {threads_per_workgroup}
 
 struct FlashAttentionBackwardParams {{
     batch_size: u32,
@@ -2041,19 +2122,20 @@ struct FlashAttentionBackwardParams {{
     head_dim: u32,
     Bc: u32,
     Br: u32,
+    q_block_idx: u32,
 }}
 
 @group(0) @binding(0) var<uniform> params: FlashAttentionBackwardParams;
-@group(0) @binding(1) var<storage, read> Q: array<f32>;
-@group(0) @binding(2) var<storage, read> K: array<f32>;
-@group(0) @binding(3) var<storage, read> V: array<f32>;
-@group(0) @binding(4) var<storage, read> O: array<f32>;
-@group(0) @binding(5) var<storage, read> L: array<f32>;
-@group(0) @binding(6) var<storage, read> M: array<f32>;
-@group(0) @binding(7) var<storage, read> grad_O: array<f32>;
+@group(0) @binding(1) var<storage, read> grad_O: array<f32>;
+@group(0) @binding(2) var<storage, read> Q: array<f32>;
+@group(0) @binding(3) var<storage, read> K: array<f32>;
+@group(0) @binding(4) var<storage, read> V: array<f32>;
+@group(0) @binding(5) var<storage, read> O: array<f32>;
+@group(0) @binding(6) var<storage, read> L: array<f32>;
+@group(0) @binding(7) var<storage, read> M: array<f32>;
 @group(0) @binding(8) var<storage, read_write> grad_Q: array<f32>;
-@group(0) @binding(9) var<storage, read_write> partial_grad_K: array<f32>;  // [batch*head*block_row, N, head_dim]
-@group(0) @binding(10) var<storage, read_write> partial_grad_V: array<f32>; // [batch*head*block_row, N, head_dim]
+@group(0) @binding(9) var<storage, read_write> grad_K_workspace: array<f32>;
+@group(0) @binding(10) var<storage, read_write> grad_V_workspace: array<f32>;
 
 const Bc: u32 = {Bc}u;
 const Br: u32 = {Br}u;
@@ -2080,7 +2162,6 @@ fn main(
 ) {{
     let batch_idx = workgroup_id.z;
     let head_idx = workgroup_id.y;
-    let block_row = workgroup_id.x;
     let tid = local_id.x;
 
     if (batch_idx >= params.batch_size) {{
@@ -2092,6 +2173,8 @@ fn main(
     let embedding_dim = params.n_heads * d;
     let scale = 1.0 / sqrt(f32(d));
 
+    // Use q_block_idx from params instead of workgroup_id.x
+    let block_row = params.q_block_idx;
     let q_start = block_row * Br;
     let q_end = min(q_start + Br, N);
     let actual_Br = q_end - q_start;
@@ -2100,10 +2183,9 @@ fn main(
         return;
     }}
 
-    // Compute workgroup index for partial outputs
-    let wg_idx = batch_idx * params.n_heads * ((N + Br - 1u) / Br) +
-                 head_idx * ((N + Br - 1u) / Br) + block_row;
-    let partial_base = wg_idx * N * d;
+    // Compute workspace offset for this Q-block
+    let total_tokens = params.batch_size * N;
+    let workspace_offset = params.q_block_idx * total_tokens * embedding_dim;
 
     // Load Q, grad_O, and O blocks (parallelized)
     for (var i = tid; i < actual_Br * d; i += THREADS) {{
@@ -2242,7 +2324,7 @@ fn main(
         }}
         workgroupBarrier();
 
-        // Write PARTIAL dK = dS^T @ Q (parallelized, no race)
+        // Write PARTIAL dK to workspace = dS^T @ Q (parallelized, no race)
         for (var i = tid; i < actual_Bc * d; i += THREADS) {{
             let col = i / d;
             let d_idx = i % d;
@@ -2253,11 +2335,14 @@ fn main(
             }}
 
             let global_kv = kv_start + col;
-            let partial_offset = partial_base + global_kv * d + d_idx;
-            partial_grad_K[partial_offset] = sum;
+            let workspace_idx = workspace_offset +
+                               batch_idx * N * embedding_dim +
+                               global_kv * embedding_dim +
+                               head_idx * d + d_idx;
+            grad_K_workspace[workspace_idx] = sum;
         }}
 
-        // Write PARTIAL dV = P^T @ dO (parallelized, no race)
+        // Write PARTIAL dV to workspace = P^T @ dO (parallelized, no race)
         for (var i = tid; i < actual_Bc * d; i += THREADS) {{
             let col = i / d;
             let d_idx = i % d;
@@ -2268,8 +2353,11 @@ fn main(
             }}
 
             let global_kv = kv_start + col;
-            let partial_offset = partial_base + global_kv * d + d_idx;
-            partial_grad_V[partial_offset] = sum;
+            let workspace_idx = workspace_offset +
+                               batch_idx * N * embedding_dim +
+                               global_kv * embedding_dim +
+                               head_idx * d + d_idx;
+            grad_V_workspace[workspace_idx] = sum;
         }}
 
         workgroupBarrier();
@@ -2291,11 +2379,12 @@ fn main(
 """
 
 
-def create_flash_attention_backward_reduce_kernel(workgroup_size: int = 256) -> str:
+def create_flash_attention_backward_reduce_kernel(workgroup_size: int) -> str:
     """
     Generate FlashAttention backward reduction kernel - Stage 2
 
-    Reduces partial grad_K and grad_V from all Q blocks.
+    Reduces partial grad_K and grad_V from all Q blocks into final gradients.
+    Each workgroup processes one (token, dimension) pair.
 
     Args:
         workgroup_size: Number of threads per workgroup (64, 128, 256, or 512)
@@ -2313,91 +2402,55 @@ def create_flash_attention_backward_reduce_kernel(workgroup_size: int = 256) -> 
 
     return f"""
 // FlashAttention Backward - STAGE 2: Reduce partial gradients
-// Reduces partial_grad_K and partial_grad_V across all Q blocks
-//
-// Input: partial_grad_K[batch*head*block_row, N, head_dim]
-// Output: grad_K[batch, N, n_heads, head_dim]
+// Reduces grad_K_workspace and grad_V_workspace across all Q blocks
 
 struct ReduceParams {{
     batch_size: u32,
     seq_len: u32,
     n_heads: u32,
     head_dim: u32,
-    Br: u32,  // Q block size from forward pass
+    num_q_blocks: u32,
 }}
 
 @group(0) @binding(0) var<uniform> params: ReduceParams;
-@group(0) @binding(1) var<storage, read> partial_grad_K: array<f32>;
-@group(0) @binding(2) var<storage, read> partial_grad_V: array<f32>;
+@group(0) @binding(1) var<storage, read> grad_K_workspace: array<f32>;
+@group(0) @binding(2) var<storage, read> grad_V_workspace: array<f32>;
 @group(0) @binding(3) var<storage, read_write> grad_K: array<f32>;
 @group(0) @binding(4) var<storage, read_write> grad_V: array<f32>;
-
-const BLOCK_SIZE: u32 = {workgroup_size}u;
-
-var<workgroup> shared_K: array<f32, {workgroup_size}>;
-var<workgroup> shared_V: array<f32, {workgroup_size}>;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
-    @builtin(workgroup_id) workgroup_id: vec3<u32>
 ) {{
-    // Dispatch: (head_dim, seq_len*n_heads, batch_size)
-    let batch_idx = workgroup_id.z;
-    let head_seq_idx = workgroup_id.y;
-    let dim_idx = workgroup_id.x;
-    let tid = local_id.x;
+    let total_tokens = params.batch_size * params.seq_len;
+    let embedding_dim = params.n_heads * params.head_dim;
+    let global_idx = global_id.x;
 
-    let head_idx = head_seq_idx / params.seq_len;
-    let kv_pos = head_seq_idx % params.seq_len;
-
-    if (batch_idx >= params.batch_size || head_idx >= params.n_heads ||
-        kv_pos >= params.seq_len || dim_idx >= params.head_dim) {{
+    // Each thread processes one (token, dim) position
+    if global_idx >= total_tokens * embedding_dim {{
         return;
     }}
 
-    let embedding_dim = params.n_heads * params.head_dim;
-    let num_q_blocks = (params.seq_len + params.Br - 1u) / params.Br;
+    let token_idx = global_idx / embedding_dim;
+    let dim_idx = global_idx % embedding_dim;
 
-    // Sum partial gradients across all Q blocks
-    var grad_K_sum = 0.0;
-    var grad_V_sum = 0.0;
+    // Reduce across all Q-blocks
+    var sum_grad_K: f32 = 0.0;
+    var sum_grad_V: f32 = 0.0;
 
-    for (var block_row = tid; block_row < num_q_blocks; block_row += BLOCK_SIZE) {{
-        let wg_idx = batch_idx * params.n_heads * num_q_blocks +
-                     head_idx * num_q_blocks + block_row;
-        let partial_base = wg_idx * params.seq_len * params.head_dim;
-        let partial_offset = partial_base + kv_pos * params.head_dim + dim_idx;
+    for (var q_block: u32 = 0u; q_block < params.num_q_blocks; q_block = q_block + 1u) {{
+        let workspace_offset = q_block * total_tokens * embedding_dim;
+        let workspace_idx = workspace_offset + token_idx * embedding_dim + dim_idx;
 
-        grad_K_sum += partial_grad_K[partial_offset];
-        grad_V_sum += partial_grad_V[partial_offset];
+        sum_grad_K = sum_grad_K + grad_K_workspace[workspace_idx];
+        sum_grad_V = sum_grad_V + grad_V_workspace[workspace_idx];
     }}
 
-    shared_K[tid] = grad_K_sum;
-    shared_V[tid] = grad_V_sum;
-    workgroupBarrier();
-
-    // Tree reduction
-    var active_threads = BLOCK_SIZE / 2u;
-    while (active_threads > 0u) {{
-        if (tid < active_threads) {{
-            shared_K[tid] += shared_K[tid + active_threads];
-            shared_V[tid] += shared_V[tid + active_threads];
-        }}
-        workgroupBarrier();
-        active_threads >>= 1u;
-    }}
-
-    // Thread 0 writes result
-    if (tid == 0u) {{
-        let output_offset = batch_idx * params.seq_len * embedding_dim +
-                           kv_pos * embedding_dim +
-                           head_idx * params.head_dim + dim_idx;
-
-        grad_K[output_offset] = shared_K[0];
-        grad_V[output_offset] = shared_V[0];
-    }}
+    // Write final reduced gradients
+    let output_idx = token_idx * embedding_dim + dim_idx;
+    grad_K[output_idx] = sum_grad_K;
+    grad_V[output_idx] = sum_grad_V;
 }}
 """
 
@@ -2405,7 +2458,7 @@ fn main(
 # ============================================================================
 # OPTIMIZER KERNELS
 # ============================================================================
-def create_adamw_kernel(workgroup_size: int = 256) -> str:
+def create_adamw_kernel(workgroup_size: int) -> str:
     """
     Generate AdamW optimizer kernel with configurable workgroup size
 
@@ -2488,7 +2541,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
-def create_gradient_clip_kernel(workgroup_size: int = 256) -> str:
+def create_gradient_clip_kernel(workgroup_size: int) -> str:
     """
     Generate gradient clipping kernel with global norm clipping
 
@@ -2540,7 +2593,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
-def create_buffer_fill_kernel(workgroup_size: int = 256) -> str:
+def create_buffer_fill_kernel(workgroup_size: int) -> str:
     """
     Generate buffer fill kernel to initialize buffers with a constant value
 
@@ -2599,7 +2652,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
-def create_reduce_sum_kernel(workgroup_size: int = 256) -> str:
+def create_reduce_sum_kernel(workgroup_size: int) -> str:
     """
     Generate reduction kernel to compute sum of buffer elements
 
@@ -2673,7 +2726,7 @@ fn main(
 # ============================================================================
 
 
-def create_kv_cache_update_kernel(workgroup_size: int = 256) -> str:
+def create_kv_cache_update_kernel(workgroup_size: int) -> str:
     """
     Generate kernel to update KV-cache with new key/value at current position.
 
@@ -2698,12 +2751,12 @@ def create_kv_cache_update_kernel(workgroup_size: int = 256) -> str:
 // KV-cache update: copy new K/V to cache at current position
 //
 // Input:
-//   - new_k: [batch_size, 1, n_heads * head_dim]  (newly computed K for current token)
-//   - new_v: [batch_size, 1, n_heads * head_dim]  (newly computed V for current token)
+//   - new_k: [batch_size, 1, embedding_dim]  (newly computed K for current token)
+//   - new_v: [batch_size, 1, embedding_dim]  (newly computed V for current token)
 //
 // Output (in-place update):
-//   - k_cache: [batch_size, max_seq_len, n_heads * head_dim]  (cache for all K)
-//   - v_cache: [batch_size, max_seq_len, n_heads * head_dim]  (cache for all V)
+//   - k_cache: [batch_size, max_seq_len, embedding_dim]  (cache for all K)
+//   - v_cache: [batch_size, max_seq_len, embedding_dim]  (cache for all V)
 //
 // Updates cache at position current_pos for all batch elements and dimensions.
 
@@ -2711,6 +2764,7 @@ struct UpdateParams {{
     batch_size: u32,
     current_pos: u32,         // Position to write to (0 to max_seq_len-1)
     embedding_dim: u32,       // n_heads * head_dim
+    max_seq_len: u32,         // Maximum sequence length cache can hold
 }}
 
 @group(0) @binding(0) var<uniform> params: UpdateParams;
@@ -2728,30 +2782,27 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
         return;
     }}
 
-    // Read from new K/V (single token at position 0)
-    let new_k_offset = batch_idx * params.embedding_dim + dim_idx;
-    let new_v_offset = batch_idx * params.embedding_dim + dim_idx;
-
-    let k_val = new_k[new_k_offset];
-    let v_val = new_v[new_v_offset];
+    // Read from new K/V (single token)
+    // Layout: [batch_size, 1, embedding_dim]
+    // Flattened: batch * embedding_dim + dim
+    let new_offset = batch_idx * params.embedding_dim + dim_idx;
+    let k_val = new_k[new_offset];
+    let v_val = new_v[new_offset];
 
     // Write to cache at current_pos
-    // Cache layout: [batch, max_seq, dim]
-    // Need max_seq_len from somewhere - pass via uniform or compute from buffer size
-    // For now, compute offset directly using current_pos
-    let cache_offset = batch_idx * params.embedding_dim + dim_idx;  // This is wrong, needs max_seq_len
-
-    // CORRECT: k_cache[batch][current_pos][dim]
+    // Layout: [batch_size, max_seq_len, embedding_dim]
     // Flattened: batch * max_seq_len * embedding_dim + current_pos * embedding_dim + dim
-    // But we don't have max_seq_len in params! Add it.
+    let cache_offset = batch_idx * params.max_seq_len * params.embedding_dim +
+                       params.current_pos * params.embedding_dim +
+                       dim_idx;
 
-    // k_cache[cache_offset] = k_val;  // FIXME
-    // v_cache[cache_offset] = v_val;
+    k_cache[cache_offset] = k_val;
+    v_cache[cache_offset] = v_val;
 }}
 """
 
 
-def create_attention_with_kv_cache_kernel(workgroup_size: int = 256) -> str:
+def create_attention_with_kv_cache_kernel(workgroup_size: int) -> str:
     """
     Generate attention kernel that uses KV-cache for autoregressive generation.
 
@@ -2930,81 +2981,129 @@ fn main(
 
 
 def create_embedding_backward_kernel(workgroup_size: int = 256) -> str:
-    """Generate embedding backward pass kernel with atomic accumulation."""
+    """
+    Simply copies grad_output to workspace (no race conditions).
+
+    Args:
+        workgroup_size: Number of threads per workgroup
+
+    Returns:
+        WGSL kernel source code as string
+
+    Raises:
+        ValueError: If workgroup_size is invalid
+    """
     if workgroup_size not in [64, 128, 256, 512, 1024]:
         raise ValueError(
             f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
         )
 
-    return f"""// Embedding backward: accumulate gradients to embedding table
-struct EmbedBackwardParams {{
-    batch_size: u32,
-    seq_len: u32,
+    return f"""
+// Embedding Backward - STAGE 1: Copy gradients to workspace
+
+struct Stage1Params {{
+    total_tokens: u32,
     embedding_dim: u32,
 }}
 
-@group(0) @binding(0) var<uniform> params: EmbedBackwardParams;
-@group(0) @binding(1) var<storage, read> input_ids: array<u32>;
-@group(0) @binding(2) var<storage, read> grad_output: array<f32>;
-@group(0) @binding(3) var<storage, read_write> grad_embedding: array<atomic<i32>>;
-
-// Fixed-point scale for atomic operations
-const SCALE: f32 = 65536.0;
-
-fn f32_to_i32(x: f32) -> i32 {{
-    return i32(x * SCALE);
-}}
-
-@compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
-    let token_idx = global_id.x;
-    let dim_idx = global_id.y;
-
-    let total_tokens = params.batch_size * params.seq_len;
-
-    if (token_idx >= total_tokens || dim_idx >= params.embedding_dim) {{
-        return;
-    }}
-
-    let token_id = input_ids[token_idx];
-    let grad_value = grad_output[token_idx * params.embedding_dim + dim_idx];
-
-    let emb_offset = token_id * params.embedding_dim + dim_idx;
-    atomicAdd(&grad_embedding[emb_offset], f32_to_i32(grad_value));
-}}
-"""
-
-
-def create_embedding_backward_convert_kernel(workgroup_size: int = 256) -> str:
-    """Convert atomic i32 gradients back to f32."""
-    if workgroup_size not in [64, 128, 256, 512, 1024]:
-        raise ValueError(
-            f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
-        )
-
-    return f"""// Convert atomic i32 gradients to f32
-struct ConvertParams {{
-    size: u32,
-}}
-
-@group(0) @binding(0) var<uniform> params: ConvertParams;
-@group(0) @binding(1) var<storage, read> grad_i32: array<atomic<i32>>;
-@group(0) @binding(2) var<storage, read_write> grad_f32: array<f32>;
-
-const SCALE: f32 = 65536.0;
+@group(0) @binding(0) var<uniform> params: Stage1Params;
+@group(0) @binding(1) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(2) var<storage, read_write> workspace: array<f32>;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
     let idx = global_id.x;
-    if (idx >= params.size) {{ return; }}
+    let total_size = params.total_tokens * params.embedding_dim;
 
-    let i32_val = atomicLoad(&grad_i32[idx]);
-    grad_f32[idx] = f32(i32_val) / SCALE;
+    if (idx >= total_size) {{
+        return;
+    }}
+
+    workspace[idx] = grad_output[idx];
 }}
 """
 
 
-def create_dropout_kernel(workgroup_size: int = 256) -> str:
+def create_embedding_backward_reduce_kernel(workgroup_size: int = 256) -> str:
+    """
+    For each vocab entry, sum gradients from all tokens that reference it.
+    Each workgroup processes one (vocab_id, dimension) pair.
+
+    Args:
+        workgroup_size: Number of threads per workgroup
+
+    Returns:
+        WGSL kernel source code as string
+
+    Raises:
+        ValueError: If workgroup_size is invalid
+    """
+    if workgroup_size not in [64, 128, 256, 512, 1024]:
+        raise ValueError(
+            f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
+        )
+
+    return f"""
+// Embedding Backward - STAGE 2: Reduce workspace by vocab ID
+
+struct ReduceParams {{
+    total_tokens: u32,
+    embedding_dim: u32,
+    vocab_size: u32,
+}}
+
+@group(0) @binding(0) var<uniform> params: ReduceParams;
+@group(0) @binding(1) var<storage, read> input_ids: array<u32>;
+@group(0) @binding(2) var<storage, read> workspace: array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_embedding: array<f32>;
+
+const BLOCK_SIZE: u32 = {workgroup_size}u;
+
+var<workgroup> shared_sum: array<f32, {workgroup_size}>;
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>
+) {{
+    let vocab_id = workgroup_id.x;
+    let dim_idx = workgroup_id.y;
+    let tid = local_id.x;
+
+    if (vocab_id >= params.vocab_size || dim_idx >= params.embedding_dim) {{
+        return;
+    }}
+
+    // Sum gradients from all tokens that use this vocab_id
+    var sum = 0.0;
+    for (var token_idx = tid; token_idx < params.total_tokens; token_idx += BLOCK_SIZE) {{
+        if (input_ids[token_idx] == vocab_id) {{
+            sum += workspace[token_idx * params.embedding_dim + dim_idx];
+        }}
+    }}
+    shared_sum[tid] = sum;
+    workgroupBarrier();
+
+    // Tree reduction
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_sum[tid] += shared_sum[tid + active_threads];
+        }}
+        workgroupBarrier();
+        active_threads >>= 1u;
+    }}
+
+    // Thread 0 writes final result
+    if (tid == 0u) {{
+        grad_embedding[vocab_id * params.embedding_dim + dim_idx] = shared_sum[0];
+    }}
+}}
+"""
+
+
+def create_dropout_kernel(workgroup_size: int) -> str:
     """Generate dropout kernel with PCG random number generator."""
     if workgroup_size not in [64, 128, 256, 512, 1024]:
         raise ValueError(
@@ -3052,7 +3151,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
-def create_dropout_backward_kernel(workgroup_size: int = 256) -> str:
+def create_dropout_backward_kernel(workgroup_size: int) -> str:
     """Generate dropout backward kernel."""
     if workgroup_size not in [64, 128, 256, 512, 1024]:
         raise ValueError(
@@ -3081,16 +3180,35 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
-def create_gradient_norm_kernel(workgroup_size: int = 256) -> str:
-    """Generate kernel to compute L2 norm of gradients (first pass)."""
+def create_gradient_norm_kernel(workgroup_size: int) -> str:
+    """Generate kernel to compute L2 norm of gradients (first pass).
+
+    Args:
+        workgroup_size: Number of threads per workgroup (64, 128, 256, 512, or 1024)
+
+    Returns:
+        WGSL kernel source code as string
+
+    Raises:
+        ValueError: If workgroup_size is invalid
+
+    Note:
+        Each workgroup computes partial squared norm for its assigned region.
+        Results are written to workspace at offset specified in params.
+        This enables multiple gradient buffers to write to different sections
+        of a shared workspace without overwriting each other.
+    """
     if workgroup_size not in [64, 128, 256, 512, 1024]:
         raise ValueError(
             f"workgroup_size must be in [64,128,256,512,1024], got {workgroup_size}"
         )
 
     return f"""// Compute partial squared norms for gradient clipping
+// Each workgroup processes a chunk and writes partial result to workspace
+
 struct NormParams {{
     size: u32,
+    workspace_offset: u32,
 }}
 
 @group(0) @binding(0) var<uniform> params: NormParams;
@@ -3107,10 +3225,11 @@ fn main(
     @builtin(workgroup_id) workgroup_id: vec3<u32>
 ) {{
     let tid = local_id.x;
+    let grid_size = BLOCK_SIZE * gridDim.x;
 
-    // Accumulate squared gradients
+    // Accumulate squared gradients for this thread's assigned elements
     var sum_sq = 0.0;
-    for (var i = global_id.x; i < params.size; i += BLOCK_SIZE * gridDim.x) {{
+    for (var i = global_id.x; i < params.size; i += grid_size) {{
         let g = gradients[i];
         sum_sq += g * g;
     }}
@@ -3118,7 +3237,7 @@ fn main(
     shared_data[tid] = sum_sq;
     workgroupBarrier();
 
-    // Tree reduction
+    // Tree reduction within workgroup
     var active = BLOCK_SIZE / 2u;
     while (active > 0u) {{
         if (tid < active) {{
@@ -3128,15 +3247,15 @@ fn main(
         active /= 2u;
     }}
 
-    // Write partial sum
+    // Write partial sum to workspace at correct offset
     if (tid == 0u) {{
-        partial_norms[workgroup_id.x] = shared_data[0];
+        partial_norms[params.workspace_offset + workgroup_id.x] = shared_data[0];
     }}
 }}
 """
 
 
-def create_gradient_norm_reduce_kernel(workgroup_size: int = 256) -> str:
+def create_gradient_norm_reduce_kernel(workgroup_size: int) -> str:
     """Generate kernel to reduce partial norms to global norm (second pass)."""
     if workgroup_size not in [64, 128, 256, 512, 1024]:
         raise ValueError(
@@ -3195,7 +3314,9 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {{
 # FORWARD
 # ====
 def get_matmul_kernel(ctx: GPUContext) -> str:
-    return create_matmul_kernel(ctx.config.matmul_tile_size)
+    return create_matmul_kernel(
+        ctx.config.matmul_tile_size, ctx.config.matmul_items_per_thread
+    )
 
 
 def get_layernorm_kernel(ctx: GPUContext) -> str:
@@ -3225,6 +3346,7 @@ def get_flash_attention_kernel(ctx: GPUContext) -> str:
         ctx.config.flash_attn_max_head_dim,
         ctx.config.flash_attn_bc,
         ctx.config.flash_attn_br,
+        ctx.config.max_workgroup_storage_size,
     )
 
 
@@ -3239,16 +3361,21 @@ def get_extract_last_tokens_kernel(ctx: GPUContext) -> str:
 
 
 def get_cross_entropy_loss_kernel(ctx: GPUContext) -> str:
-    return create_cross_entropy_loss_kernel(ctx.config.default_workgroup_size)
+    return create_cross_entropy_loss_kernel(ctx.config.reduction_workgroup_size)
 
 
 def get_softmax_kernel(ctx: GPUContext) -> str:
-    return create_softmax_kernel(ctx.config.default_workgroup_size)
+    return create_softmax_kernel(ctx.config.reduction_workgroup_size)
 
 
 def get_dropout_kernel(ctx: GPUContext) -> str:
     """Factory function for dropout kernel."""
     return create_dropout_kernel(ctx.config.default_workgroup_size)
+
+
+def get_gradient_normalization_kernel(ctx: GPUContext) -> str:
+    """Factory function for gradient norm computation kernel."""
+    return create_gradient_normalization_kernel(ctx.config.optimizer_workgroup_size)
 
 
 # ====
@@ -3257,11 +3384,15 @@ def get_dropout_kernel(ctx: GPUContext) -> str:
 
 
 def get_matmul_backward_a_kernel(ctx: GPUContext) -> str:
-    return create_matmul_backward_a_kernel(ctx.config.matmul_tile_size)
+    return create_matmul_backward_a_kernel(
+        ctx.config.matmul_tile_size, ctx.config.matmul_items_per_thread
+    )
 
 
 def get_matmul_backward_b_kernel(ctx: GPUContext) -> str:
-    return create_matmul_backward_b_kernel(ctx.config.matmul_tile_size)
+    return create_matmul_backward_b_kernel(
+        ctx.config.matmul_tile_size, ctx.config.matmul_items_per_thread
+    )
 
 
 def get_layernorm_backward_kernel(ctx: GPUContext) -> str:
@@ -3271,7 +3402,7 @@ def get_layernorm_backward_kernel(ctx: GPUContext) -> str:
 
 
 def get_layernorm_backward_reduce_kernel(ctx: GPUContext) -> str:
-    return create_layernorm_backward_reduce_kernel(ctx.config.layernorm_workgroup_size)
+    return create_layernorm_backward_reduce_kernel(ctx.config.reduction_workgroup_size)
 
 
 def get_layernorm_backward_reduce_accumulate_kernel(ctx: GPUContext) -> str:
@@ -3285,19 +3416,25 @@ def get_gelu_backward_kernel(ctx: GPUContext) -> str:
 
 
 def get_bias_backward_kernel(ctx: GPUContext) -> str:
-    return create_bias_backward_kernel(ctx.config.default_workgroup_size)
+    return create_bias_backward_kernel(ctx.config.reduction_workgroup_size)
+
+
+def get_bias_backward_reduce_kernel(ctx: GPUContext) -> str:
+    return create_bias_backward_reduce_kernel(ctx.config.reduction_workgroup_size)
+
 
 def get_flash_attention_backward_kernel(ctx: GPUContext) -> str:
     return create_flash_attention_backward_kernel(
         ctx.config.flash_attn_max_head_dim,
         ctx.config.flash_attn_bc,
         ctx.config.flash_attn_br,
+        ctx.config.max_workgroup_storage_size,
     )
 
 
 def get_flash_attention_backward_reduce_kernel(ctx: GPUContext) -> str:
     return create_flash_attention_backward_reduce_kernel(
-        ctx.config.attention_workgroup_size
+        ctx.config.reduction_workgroup_size
     )
 
 
@@ -3306,9 +3443,9 @@ def get_embedding_backward_kernel(ctx: GPUContext) -> str:
     return create_embedding_backward_kernel(ctx.config.default_workgroup_size)
 
 
-def get_embedding_backward_convert_kernel(ctx: GPUContext) -> str:
+def get_embedding_backward_reduce_kernel(ctx: GPUContext) -> str:
     """Factory function for embedding backward convert kernel."""
-    return create_embedding_backward_convert_kernel(ctx.config.default_workgroup_size)
+    return create_embedding_backward_reduce_kernel(ctx.config.default_workgroup_size)
 
 
 def get_dropout_backward_kernel(ctx: GPUContext) -> str:
@@ -3321,25 +3458,25 @@ def get_dropout_backward_kernel(ctx: GPUContext) -> str:
 # ====
 #
 def get_adamw_kernel(ctx: GPUContext) -> str:
-    return create_adamw_kernel(ctx.config.default_workgroup_size)
-
-
-def get_buffer_fill_kernel(ctx: GPUContext) -> str:
-    return create_buffer_fill_kernel(ctx.config.default_workgroup_size)
+    return create_adamw_kernel(ctx.config.optimizer_workgroup_size)
 
 
 def get_gradient_clip_kernel(ctx: GPUContext) -> str:
-    return create_gradient_clip_kernel(ctx.config.default_workgroup_size)
+    return create_gradient_clip_kernel(ctx.config.optimizer_workgroup_size)
 
 
 def get_gradient_norm_kernel(ctx: GPUContext) -> str:
     """Factory function for gradient norm computation kernel."""
-    return create_gradient_norm_kernel(ctx.config.default_workgroup_size)
+    return create_gradient_norm_kernel(ctx.config.optimizer_workgroup_size)
 
 
 def get_gradient_norm_reduce_kernel(ctx: GPUContext) -> str:
     """Factory function for gradient norm reduction kernel."""
     return create_gradient_norm_reduce_kernel(ctx.config.default_workgroup_size)
+
+
+def get_buffer_fill_kernel(ctx: GPUContext) -> str:
+    return create_buffer_fill_kernel(ctx.config.default_workgroup_size)
 
 
 def get_reduce_sum_kernel(ctx: GPUContext) -> str:

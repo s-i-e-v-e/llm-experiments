@@ -1,5 +1,6 @@
 import numpy as np
 
+from .gpu_buffer import gpu_buffer_1d_create
 from .gpu_kernels import (
     get_bias_add_kernel,
     get_cross_entropy_loss_kernel,
@@ -8,6 +9,7 @@ from .gpu_kernels import (
     get_extract_last_tokens_kernel,
     get_flash_attention_kernel,
     get_gelu_kernel,
+    get_gradient_normalization_kernel,
     get_layernorm_kernel,
     get_matmul_kernel,
     get_residual_add_kernel,
@@ -42,8 +44,6 @@ def matmul(
     ~1M x 1M, automatically tiles into multiple kernel launches.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         A: Input matrix (M, K)
         B: Input matrix (K, N)
         C: Output matrix (M, N)
@@ -96,8 +96,6 @@ def embedding(
 
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         embedding_table: Token embedding table (vocab_size, embedding_dim)
         pos_encoding: Positional encoding table (context_size, embedding_dim)
         input_ids: Input token IDs (batch_size * seq_len,) - stored as uint32
@@ -149,8 +147,6 @@ def layernorm(
     """Layer normalization with affine transformation
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         input_buf: Input tensor (n_elements, size)
         gamma: Scale parameters (size,)
         beta: Shift parameters (size,)
@@ -188,8 +184,6 @@ def gelu(
     """GELU activation function.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         input_buf: Input tensor
         output: Output tensor
 
@@ -225,8 +219,6 @@ def bias_add(
     Broadcasts bias over first dimension.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         input_buf: Input tensor (n_elements, dim)
         bias: Bias vector (dim,)
         output: Output tensor (n_elements, dim)
@@ -264,8 +256,6 @@ def residual_add(
     """Element-wise addition for residual connections.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         input_a: First input tensor
         input_b: Second input tensor
         output: Output tensor
@@ -305,8 +295,6 @@ def extract_last_tokens(
     Used for generation/inference to get final hidden states.
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         input_buf: Input tensor [batch_size*seq_len, embedding_dim]
         output: Output tensor [batch_size, embedding_dim]
         batch_size: Batch size
@@ -347,34 +335,33 @@ def cross_entropy_loss(
     mask: GPUBuffer1D,
     loss_output: GPUBuffer1D,
     grad_logits: GPUBuffer2D,
-) -> None:
+) -> int:
     """Combined cross-entropy loss and gradient computation with masking.
 
-    Computes both loss values and gradients in one pass for efficiency.
-    Masked (padding) tokens receive zero loss and zero gradients.
-
-    # Initialize valid_count buffer to 0 before each batch
-    # Run loss kernel with workgroups = (batch_size * seq_len, 1, 1)
-    # Run normalization kernel with workgroups = ceil(batch*seq*vocab / 256)
+    Computes both loss values and gradients with proper normalization.
+    Uses two-pass approach:
+    1. Compute loss and unnormalized gradients, count valid tokens
+    2. Normalize gradients by valid token count
 
     Args:
-        device: GPU device
-        config: GPU configuration
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
+        ctx: GPU context
         logits: Model predictions [batch_size*seq_len, vocab_size]
         targets: Target token IDs [batch_size*seq_len] - uint32
         mask: Mask for valid tokens [batch_size*seq_len] - 1=valid, 0=padding
         loss_output: Loss for each prediction [batch_size*seq_len]
         grad_logits: Gradient w.r.t. logits [batch_size*seq_len, vocab_size]
 
+    Returns:
+        int: Number of valid (non-masked) tokens
+
     Raises:
         ValueError: If buffer shapes don't match
     """
+
     batch_seq, vocab_size = logits.shape
 
     if batch_seq == 0 or vocab_size == 0:
-        raise ValueError(f"Invalid logits shape {batch_seq, vocab_size}")
+        raise ValueError(f"Invalid logits shape ({batch_seq}, {vocab_size})")
 
     validate_buffer_shape_1d(targets, batch_seq, "targets")
     validate_buffer_shape_1d(mask, batch_seq, "mask")
@@ -382,8 +369,13 @@ def cross_entropy_loss(
     validate_buffer_shape_2d(grad_logits, (batch_seq, vocab_size), "grad_logits")
     validate_buffer_shape_2d(logits, (batch_seq, vocab_size), "logits")
 
-    params = np.array([1, batch_seq, vocab_size], dtype=np.uint32)
+    # Create valid_count buffer (atomic u32)
+    valid_count_buffer = gpu_buffer_1d_create(ctx, 1, np.array([0], dtype=np.uint32))
 
+    # Pad params to 16 bytes (WebGPU requirement)
+    params = np.array([1, batch_seq, vocab_size, 0], dtype=np.uint32)
+
+    # PASS 1: Compute loss and unnormalized gradients
     batch_add(
         ctx,
         get_cross_entropy_loss_kernel(ctx),
@@ -394,9 +386,34 @@ def cross_entropy_loss(
             mask,
             loss_output,
             grad_logits,
+            valid_count_buffer,
         ],
-        (batch_seq + 255) // 256,
+        batch_seq,  # One workgroup per token
+        1,
+        1,
     )
+
+    # PASS 2: Normalize gradients by valid_count using existing kernel
+    total_elements = batch_seq * vocab_size
+    # Pad to 16 bytes
+    normalize_params = np.array([total_elements, 0, 0, 0], dtype=np.uint32)
+
+    batch_add(
+        ctx,
+        get_gradient_normalization_kernel(ctx),
+        normalize_params,
+        [grad_logits, valid_count_buffer],
+        (total_elements + 255) // 256,
+        1,
+        1,
+    )
+
+    # Read and return the valid count
+    ctx.device.queue.submit([])
+    mapped_data = ctx.device.queue.read_buffer(valid_count_buffer.buffer)
+    valid_count = int(np.frombuffer(mapped_data, dtype=np.uint32)[0])
+
+    return valid_count
 
 
 def dropout(
@@ -411,10 +428,7 @@ def dropout(
     """Apply dropout with saved mask for backward pass.
 
     Args:
-        device: GPU device
-        config: GPU configuration
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
+
         input_buf: Input tensor [rows, cols]
         output: Output tensor [rows, cols]
         mask: Mask to save for backward [rows, cols] - uint32
@@ -454,8 +468,6 @@ def softmax(
     Apply softmax to logits to get probability distribution.
 
     Args:
-        pipeline_cache: Pipeline cache for compute pipelines
-        batch_state: Current batch state with encoder
         logits: Input logits [batch_size, vocab_size]
         probs: Output probabilities [batch_size, vocab_size]
 
@@ -477,7 +489,7 @@ def softmax(
         ctx,
         get_softmax_kernel(ctx),
         params,
-        [logits.buffer, probs.buffer],
+        [logits, probs],
         batch_size,
     )
 
@@ -500,8 +512,6 @@ def flash_attention(
 
 
     Args:
-        pipeline_cache: Pipeline cache for kernel compilation
-        batch_state: Batch state
         Q: Query matrix [batch_size*seq_len, n_heads*head_dim]
         K: Key matrix [batch_size*seq_len, n_heads*head_dim]
         V: Value matrix [batch_size*seq_len, n_heads*head_dim]
@@ -544,6 +554,9 @@ def flash_attention(
     validate_buffer_shape_1d(L, stats_size, "L")
     validate_buffer_shape_1d(M, stats_size, "M")
 
+    Br = ctx.config.flash_attn_br
+    num_q_blocks = (seq_len + Br - 1) // Br
+
     params = np.array(
         [
             batch_size,
@@ -552,12 +565,10 @@ def flash_attention(
             head_dim,
             ctx.config.flash_attn_bc,
             ctx.config.flash_attn_br,
+            num_q_blocks,
         ],
         dtype=np.uint32,
     )
-
-    Br = ctx.config.flash_attn_br
-    num_q_blocks = (seq_len + Br - 1) // Br
 
     batch_add(
         ctx,
@@ -570,8 +581,8 @@ def flash_attention(
             O,
             L,
             M,
-            num_q_blocks,
-            n_heads,
         ],
-        batch_size,
+        workgroups_x=num_q_blocks,  # ← X: Q blocks
+        workgroups_y=n_heads,  # ← Y: attention heads
+        workgroups_z=batch_size,  # ← Z: batch elements
     )

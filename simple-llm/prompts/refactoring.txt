@@ -5,9 +5,9 @@ I want to refactor some source code. Let me know if you understand my instructio
 - I prefer pure data classes + functions operating on that data.
 - No object-oriented stuff.
 - No opaque dictionaries.
-- No global variables. All resources/stat must be explicitly passed as parameters.
+- No global variables. All resources/state must be explicitly passed as parameters.
 - All functions should have typing information.
-- Sometimes, state is mutable for performance reasons. Any such state variables passed in as parameters must not be returned from the function.
+- Sometimes, state is mutable for performance reasons. Ponder upon it before claiming that it definitely needs to be fixed.
 
 # REFACTORING
 
@@ -25,4 +25,4 @@ Heavily modified files should be rendered IN FULL in their own code blocks.
 
 For lightly modified files, you may render COMPLETE functions in their own code blocks. Mention the file name before the code block so that I can put the code in the correct place.
 
-You shall not render snippets of code. It is either the COMPLETE function or the COMPLETE file.
+If the change is minor (a few lines in a couple of places), then you shall render snippets of code. OTHERWISE, it is either the COMPLETE function or the COMPLETE file that must be rendered.
