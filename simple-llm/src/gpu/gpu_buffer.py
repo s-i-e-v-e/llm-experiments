@@ -1,6 +1,6 @@
 """Buffer creation and pool management"""
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import numpy as np
 import wgpu
@@ -130,7 +130,7 @@ def gpu_buffer_zerofy(ctx: GPUContext, gpu_buffer: GPUBufferAny) -> None:
 
 
 def __gpu_buffer_write(
-    ctx: GPUContext, in_data: np.ndarray, buffer: Union[GPUBuffer1D, GPUBuffer2D]
+    ctx: GPUContext, in_data: np.ndarray, buffer: GPUBufferAny
 ) -> None:
     data_f32 = np.ascontiguousarray(in_data, dtype=np.float32)
     ctx.device.queue.write_buffer(buffer.buffer, 0, data_f32.tobytes())
@@ -149,7 +149,7 @@ def gpu_buffer_2d_write(
 
 
 def __gpu_buffer_read(
-    ctx: GPUContext, buffer: Union[GPUBuffer1D, GPUBuffer2D], out_data: np.ndarray
+    ctx: GPUContext, buffer: GPUBufferAny, out_data: np.ndarray
 ) -> None:
     """Read GPU buffer to numpy array
 

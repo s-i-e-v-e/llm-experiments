@@ -1,4 +1,4 @@
-from typing import List, Union
+from typing import List
 
 import numpy as np
 
@@ -16,6 +16,7 @@ from .gpu_ops import batch_add, batch_begin, batch_commit
 from .gpu_types import (
     GPUBuffer1D,
     GPUBuffer2D,
+    GPUBufferAny,
     GPUContext,
 )
 
@@ -26,10 +27,10 @@ from .gpu_types import (
 
 def __adamw_update(
     ctx: GPUContext,
-    gradients: Union[GPUBuffer1D, GPUBuffer2D],
-    weights: Union[GPUBuffer1D, GPUBuffer2D],
-    m: Union[GPUBuffer1D, GPUBuffer2D],
-    v: Union[GPUBuffer1D, GPUBuffer2D],
+    gradients: GPUBufferAny,
+    weights: GPUBufferAny,
+    m: GPUBufferAny,
+    v: GPUBufferAny,
     lr: float,
     beta1: float,
     beta2: float,
@@ -126,11 +127,12 @@ def adamw_update_1d(
     )
 
 
-def gradient_clip(
+def __gradient_clip(
     ctx: GPUContext,
-    gradients: GPUBuffer2D,
+    gradients: GPUBufferAny,
     max_norm: float,
     total_norm: float,
+    total_size: int,
 ) -> None:
     """
     Clip gradients by global norm to prevent exploding gradients.
@@ -145,8 +147,6 @@ def gradient_clip(
         total_norm: Pre-computed global norm of all gradients
     """
 
-    total_size = gradients.shape[0] * gradients.shape[1]
-
     params = np.array(
         [float(total_size), max_norm, total_norm],
         dtype=np.float32,
@@ -158,6 +158,26 @@ def gradient_clip(
         params,
         [gradients],
         (total_size + 255) // 256,
+    )
+
+
+def gradient_clip_1d(
+    ctx: GPUContext,
+    gradients: GPUBuffer1D,
+    max_norm: float,
+    total_norm: float,
+) -> None:
+    __gradient_clip(ctx, gradients, max_norm, total_norm, gradients.size)
+
+
+def gradient_clip_2d(
+    ctx: GPUContext,
+    gradients: GPUBuffer2D,
+    max_norm: float,
+    total_norm: float,
+) -> None:
+    __gradient_clip(
+        ctx, gradients, max_norm, total_norm, gradients.shape[0] * gradients.shape[1]
     )
 
 
@@ -227,7 +247,7 @@ def reduce_sum(
 
 def __compute_gradient_norm(
     ctx: GPUContext,
-    gradients: List[GPUBuffer2D],
+    gradients: List[GPUBufferAny],  # Accept both types
     reduction_workspace: GPUBuffer1D,
 ) -> GPUBuffer1D:
     """Compute global L2 norm using pre-allocated workspace across all gradient buffers.
@@ -237,8 +257,7 @@ def __compute_gradient_norm(
     2. Reduce all partials to single global norm
 
     Args:
-
-        gradients: List of all gradient buffers (GPUBuffer2D)
+        gradients: List of all gradient buffers (GPUBuffer1D or GPUBuffer2D)
 
     Returns:
         Buffer containing single scalar with global gradient norm
@@ -250,7 +269,12 @@ def __compute_gradient_norm(
 
     # Phase 1: Per-gradient partial reductions
     for grad_buf in gradients:
-        size = grad_buf.shape[0] * grad_buf.shape[1]
+        # Handle both 1D and 2D buffers
+        if isinstance(grad_buf, GPUBuffer2D):
+            size = grad_buf.shape[0] * grad_buf.shape[1]
+        else:  # GPUBuffer1D
+            size = grad_buf.size
+
         num_workgroups = (size + 255) // 256
 
         # Write partial sums to offset in pre-allocated workspace
@@ -284,30 +308,34 @@ def __compute_gradient_norm(
 
 def gradient_clip_with_norm(
     ctx: GPUContext,
-    gradients: List[GPUBuffer2D],
+    gradients: List[GPUBufferAny],  # Accept both types
     max_norm: float,
     reduction_workspace: GPUBuffer1D,
 ) -> None:
     """Clip gradients by computing and using global norm.
 
     Args:
-
-        buffer_pool: Buffer pool for temporary allocations
-        gradients: List of all gradient buffers to clip
+        gradients: List of all gradient buffers to clip (1D or 2D)
         max_norm: Maximum allowed gradient norm
+        reduction_workspace: Pre-allocated workspace for reduction
     """
     total_norm_buf = __compute_gradient_norm(ctx, gradients, reduction_workspace)
 
     batch_commit(ctx)
 
-    norm_array = np.array([], dtype=np.float32)
+    norm_array = np.zeros(1, dtype=np.float32)
     gpu_buffer_1d_read(ctx, total_norm_buf, norm_array)
     total_norm = float(norm_array[0])
 
     batch_begin(ctx)
 
     for grad_buf in gradients:
-        size = grad_buf.shape[0] * grad_buf.shape[1]
+        # Handle both 1D and 2D buffers
+        if isinstance(grad_buf, GPUBuffer2D):
+            size = grad_buf.shape[0] * grad_buf.shape[1]
+        else:  # GPUBuffer1D
+            size = grad_buf.size
+
         params = np.array([size, max_norm, total_norm], dtype=np.float32)
 
         batch_add(
@@ -317,7 +345,6 @@ def gradient_clip_with_norm(
             [grad_buf],
             (size + 255) // 256,
         )
-    batch_commit(ctx)
 
 
 def transpose(

@@ -770,32 +770,20 @@ fn main(
 """
 
 
-def create_transpose_kernel(tile_size: int) -> str:
-    """
-    Generate matrix transpose kernel with bank conflict avoidance
+def create_transpose_kernel(tilesize: int) -> str:
+    """Generate matrix transpose kernel with bank conflict avoidance"""
+    if tilesize & (tilesize - 1) != 0:
+        raise ValueError(f"tilesize must be power of 2, got {tilesize}")
+    if tilesize > 32:
+        raise ValueError(f"tilesize too large {tilesize}. Maximum is 32.")
 
-    Args:
-        tile_size: Tile dimension (must be power of 2, typically 8, 16, or 32)
-
-    Returns:
-        WGSL kernel source code as string
-
-    Raises:
-        ValueError: If tile_size is invalid
-    """
-    if tile_size <= 0 or (tile_size & (tile_size - 1)) != 0:
-        raise ValueError(f"tile_size must be power of 2, got {tile_size}")
-
-    if tile_size > 32:
-        raise ValueError(f"tile_size too large: {tile_size}. Maximum is 32.")
-
-    # Add padding to avoid bank conflicts (tile_size + 1)
-    padded_size = tile_size * (tile_size + 1)
+    # Add padding to avoid bank conflicts: tilesize + 1
+    paddedsize = tilesize * (tilesize + 1)
 
     return f"""
 // Matrix transpose with bank conflict avoidance
 // Uses tiled approach with padding to prevent bank conflicts
-// Tile size: {tile_size}x{tile_size}, Padded stride: {tile_size + 1}
+// Tile size: {tilesize}x{tilesize}, Padded stride: {tilesize + 1}
 
 struct TransposeParams {{
     rows: u32,
@@ -806,35 +794,43 @@ struct TransposeParams {{
 @group(0) @binding(1) var<storage, read> input: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-const TILE_SIZE: u32 = {tile_size}u;
-const PADDED_STRIDE: u32 = {tile_size + 1}u;
+const TILESIZE: u32 = {tilesize}u;
+const PADDEDSTRIDE: u32 = {tilesize + 1}u;
 
 // Padded shared memory to avoid bank conflicts
-var<workgroup> tile: array<f32, {padded_size}>;
+var<workgroup> tile: array<f32, {paddedsize}>;
 
-@compute @workgroup_size({tile_size}, {tile_size}, 1)
+@compute @workgroup_size({tilesize}, {tilesize}, 1)
 fn main(
-    @builtin(global_invocation_id) global_id: vec3<u32>,
-    @builtin(local_invocation_id) local_id: vec3<u32>
+    @builtin(global_invocation_id) globalid: vec3<u32>,
+    @builtin(local_invocation_id) localid: vec3<u32>,
+    @builtin(workgroup_id) workgroupid: vec3<u32>
 ) {{
-    let row = global_id.y;
-    let col = global_id.x;
-    let local_row = local_id.y;
-    let local_col = local_id.x;
+    // Compute base tile coordinates
+    let tilerow = workgroupid.y * TILESIZE;
+    let tilecol = workgroupid.x * TILESIZE;
+
+    // Global position in input matrix
+    let row = tilerow + localid.y;
+    let col = tilecol + localid.x;
+
+    let localrow = localid.y;
+    let localcol = localid.x;
 
     // Load tile from input (coalesced reads)
     if (row < params.rows && col < params.cols) {{
-        tile[local_row * PADDED_STRIDE + local_col] = input[row * params.cols + col];
+        tile[localrow * PADDEDSTRIDE + localcol] = input[row * params.cols + col];
     }}
 
     workgroupBarrier();
 
     // Write transposed tile to output (coalesced writes)
-    let out_row = col;
-    let out_col = row;
+    // Output position: swap row/col and swap tile coords
+    let outrow = tilecol + localid.y;  // Note: tilecol (not tilerow)
+    let outcol = tilerow + localid.x;  // Note: tilerow (not tilecol)
 
-    if (out_row < params.cols && out_col < params.rows) {{
-        output[out_row * params.rows + out_col] = tile[local_col * PADDED_STRIDE + local_row];
+    if (outrow < params.cols && outcol < params.rows) {{
+        output[outrow * params.rows + outcol] = tile[localcol * PADDEDSTRIDE + localrow];
     }}
 }}
 """
@@ -2803,68 +2799,33 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 
 
 def create_attention_with_kv_cache_kernel(workgroup_size: int) -> str:
-    """
-    Generate attention kernel that uses KV-cache for autoregressive generation.
-
-    Computes attention for a single query token against all cached K/V.
-    Used during generation where we only compute Q for the new token,
-    but attend to all previous tokens via the cache.
-
-    Args:
-        workgroup_size: Number of threads per workgroup (64, 128, 256, or 512)
-
-    Returns:
-        WGSL kernel source code as string
-
-    Raises:
-        ValueError: If workgroup_size is invalid
-
-    Notes:
-        - Assumes causal masking (can only attend to positions <= current_len)
-        - Uses numerically stable softmax (max subtraction)
-        - Q shape: [batch_size, 1, n_heads, head_dim] (single token)
-        - K/V cache shape: [batch_size, max_seq_len, n_heads, head_dim]
-        - Output shape: [batch_size, 1, n_heads, head_dim]
-    """
+    """Generate attention kernel that uses KV-cache for autoregressive generation."""
     if workgroup_size not in [64, 128, 256, 512, 1024]:
         raise ValueError(
             f"workgroup_size must be 64, 128, 256, 512, or 1024, got {workgroup_size}"
         )
 
-    max_seq_len = workgroup_size  # Shared memory sized for this
+    max_seq_len = workgroup_size
 
     return f"""
 // Attention with KV-cache for autoregressive generation
-//
-// Computes attention for a single new query token using cached K/V.
-// Each workgroup handles one (batch, head) pair.
-//
-// Input:
-//   - Q: [batch_size, 1, n_heads * head_dim]  (query for new token)
-//   - K_cache: [batch_size, current_len, n_heads * head_dim]  (cached keys)
-//   - V_cache: [batch_size, current_len, n_heads * head_dim]  (cached values)
-//
-// Output:
-//   - O: [batch_size, 1, n_heads * head_dim]  (attention output)
-
 struct AttentionParams {{
     batch_size: u32,
-    current_len: u32,     // Number of valid positions in cache (1 to max_seq_len)
+    current_len: u32,
     n_heads: u32,
     head_dim: u32,
+    max_seq_len: u32,  // ADDED: Need this for proper indexing
 }}
 
 @group(0) @binding(0) var<uniform> params: AttentionParams;
-@group(0) @binding(1) var<storage, read> Q: array<f32>;       // [batch, 1, n_heads*head_dim]
-@group(0) @binding(2) var<storage, read> K_cache: array<f32>; // [batch, current_len, n_heads*head_dim]
-@group(0) @binding(3) var<storage, read> V_cache: array<f32>; // [batch, current_len, n_heads*head_dim]
-@group(0) @binding(4) var<storage, read_write> O: array<f32>; // [batch, 1, n_heads*head_dim]
+@group(0) @binding(1) var<storage, read> Q: array<f32>;
+@group(0) @binding(2) var<storage, read> K_cache: array<f32>;  // [batch*max_seq, embedding]
+@group(0) @binding(3) var<storage, read> V_cache: array<f32>;  // [batch*max_seq, embedding]
+@group(0) @binding(4) var<storage, read_write> O: array<f32>;
 
 const BLOCK_SIZE: u32 = {workgroup_size}u;
 const MAX_SEQ_LEN: u32 = {max_seq_len}u;
-const MASK_VALUE: f32 = -1e10;
 
-// Shared memory for scores and reduction
 var<workgroup> shared_scores: array<f32, MAX_SEQ_LEN>;
 var<workgroup> shared_reduction: array<f32, {workgroup_size}>;
 
@@ -2886,16 +2847,16 @@ fn main(
     let embedding_dim = params.n_heads * head_dim;
     let scale = 1.0 / sqrt(f32(head_dim));
 
-    // Q offset: single token at position 0
+    // Q offset: [batch, embedding]
     let q_offset = batch_idx * embedding_dim + head_idx * head_dim;
 
     // ====================================================================
-    // Phase 1: Compute all QK scores and store in shared memory
+    // Phase 1: Compute QK scores
     // ====================================================================
     for (var k_pos = tid; k_pos < params.current_len; k_pos += BLOCK_SIZE) {{
-        let k_offset = batch_idx * params.current_len * embedding_dim +
-                       k_pos * embedding_dim +
-                       head_idx * head_dim;
+        // FIXED: Cache is [batch * max_seq_len, embedding]
+        let cache_row = batch_idx * params.max_seq_len + k_pos;
+        let k_offset = cache_row * embedding_dim + head_idx * head_dim;
 
         var score = 0.0;
         for (var d = 0u; d < head_dim; d++) {{
@@ -2906,7 +2867,7 @@ fn main(
     workgroupBarrier();
 
     // ====================================================================
-    // Phase 2: Find max score using parallel reduction
+    // Phase 2: Find max score
     // ====================================================================
     var max_score = -1e10;
     for (var k_pos = tid; k_pos < params.current_len; k_pos += BLOCK_SIZE) {{
@@ -2927,12 +2888,12 @@ fn main(
     workgroupBarrier();
 
     // ====================================================================
-    // Phase 3: Compute exp(score - max) and sum
+    // Phase 3: Compute exp and sum
     // ====================================================================
     var sum_exp = 0.0;
     for (var k_pos = tid; k_pos < params.current_len; k_pos += BLOCK_SIZE) {{
         let exp_score = exp(shared_scores[k_pos] - max_score);
-        shared_scores[k_pos] = exp_score;  // Store normalized scores
+        shared_scores[k_pos] = exp_score;
         sum_exp += exp_score;
     }}
     shared_reduction[tid] = sum_exp;
@@ -2950,7 +2911,7 @@ fn main(
     workgroupBarrier();
 
     // ====================================================================
-    // Phase 4: Compute weighted sum of values
+    // Phase 4: Compute weighted sum of V
     // ====================================================================
     let dims_per_thread = (head_dim + BLOCK_SIZE - 1u) / BLOCK_SIZE;
     for (var d_block = 0u; d_block < dims_per_thread; d_block++) {{
@@ -2962,9 +2923,11 @@ fn main(
         var output_val = 0.0;
         for (var k_pos = 0u; k_pos < params.current_len; k_pos++) {{
             let attn_weight = shared_scores[k_pos] / sum_exp;
-            let v_offset = batch_idx * params.current_len * embedding_dim +
-                          k_pos * embedding_dim +
-                          head_idx * head_dim;
+
+            // FIXED: Same cache indexing as K
+            let cache_row = batch_idx * params.max_seq_len + k_pos;
+            let v_offset = cache_row * embedding_dim + head_idx * head_dim;
+
             output_val += attn_weight * V_cache[v_offset + d];
         }}
 
@@ -2980,7 +2943,7 @@ fn main(
 # ============================================================================
 
 
-def create_embedding_backward_kernel(workgroup_size: int = 256) -> str:
+def create_embedding_backward_kernel(workgroup_size: int) -> str:
     """
     Simply copies grad_output to workspace (no race conditions).
 
@@ -3024,7 +2987,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 """
 
 
-def create_embedding_backward_reduce_kernel(workgroup_size: int = 256) -> str:
+def create_embedding_backward_reduce_kernel(workgroup_size: int) -> str:
     """
     For each vocab entry, sum gradients from all tokens that reference it.
     Each workgroup processes one (vocab_id, dimension) pair.
@@ -3197,6 +3160,9 @@ def create_gradient_norm_kernel(workgroup_size: int) -> str:
         Results are written to workspace at offset specified in params.
         This enables multiple gradient buffers to write to different sections
         of a shared workspace without overwriting each other.
+
+        The kernel uses a grid-stride loop to handle cases where buffer size
+        exceeds total number of threads dispatched.
     """
     if workgroup_size not in [64, 128, 256, 512, 1024]:
         raise ValueError(
@@ -3222,14 +3188,18 @@ var<workgroup> shared_data: array<f32, {workgroup_size}>;
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
-    @builtin(workgroup_id) workgroup_id: vec3<u32>
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(num_workgroups) num_workgroups: vec3<u32>
 ) {{
     let tid = local_id.x;
-    let grid_size = BLOCK_SIZE * gridDim.x;
+    let global_idx = global_id.x;
 
-    // Accumulate squared gradients for this thread's assigned elements
+    // FIXED: Use builtin num_workgroups instead of non-existent gridDim
+    let grid_size = BLOCK_SIZE * num_workgroups.x;
+
+    // Grid-stride loop: each thread processes multiple elements
     var sum_sq = 0.0;
-    for (var i = global_id.x; i < params.size; i += grid_size) {{
+    for (var i = global_idx; i < params.size; i += grid_size) {{
         let g = gradients[i];
         sum_sq += g * g;
     }}
@@ -3238,13 +3208,13 @@ fn main(
     workgroupBarrier();
 
     // Tree reduction within workgroup
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] += shared_data[tid + active];
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] += shared_data[tid + active_threads];
         }}
         workgroupBarrier();
-        active /= 2u;
+        active_threads /= 2u;
     }}
 
     // Write partial sum to workspace at correct offset
@@ -3288,13 +3258,13 @@ fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {{
     workgroupBarrier();
 
     // Tree reduction
-    var active = BLOCK_SIZE / 2u;
-    while (active > 0u) {{
-        if (tid < active) {{
-            shared_data[tid] += shared_data[tid + active];
+    var active_threads = BLOCK_SIZE / 2u;
+    while (active_threads > 0u) {{
+        if (tid < active_threads) {{
+            shared_data[tid] += shared_data[tid + active_threads];
         }}
         workgroupBarrier();
-        active /= 2u;
+        active_threads /= 2u;
     }}
 
     // Compute sqrt of sum to get L2 norm

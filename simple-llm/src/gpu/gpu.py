@@ -36,6 +36,7 @@ from .gpu_kv_cache import (
 from .gpu_ops import batch_add, batch_begin, batch_commit
 from .gpu_pass_backward import (
     bias_backward,
+    dropout_backward,
     embedding_backward,
     flash_attention_backward,
     gelu_backward,
@@ -46,6 +47,7 @@ from .gpu_pass_backward import (
 from .gpu_pass_forward import (
     bias_add,
     cross_entropy_loss,
+    dropout,
     embedding,
     extract_last_tokens,
     flash_attention,
@@ -59,9 +61,11 @@ from .gpu_pass_optimizer import (
     adamw_update_1d,
     adamw_update_2d,
     buffer_fill,
-    gradient_clip,
+    gradient_clip_1d,
+    gradient_clip_2d,
     gradient_clip_with_norm,
     reduce_sum,
+    transpose,
 )
 from .gpu_types import (
     GPUBuffer1D,
@@ -72,6 +76,7 @@ from .gpu_types import (
     GPUModelGradients,
     GPUModelParams,
     GPUOptimizerState,
+    KVCacheConfig,
 )
 
 __all__ = [
@@ -84,6 +89,7 @@ __all__ = [
     "GPUBuffer2D",
     "GPUOptimizerState",
     "GPUContext",
+    "KVCacheConfig",
     # Device
     "device_create",
     "device_limits_query",
@@ -111,10 +117,12 @@ __all__ = [
     # Optimizer
     "adamw_update_1d",
     "adamw_update_2d",
-    "gradient_clip",
+    "gradient_clip_1d",
+    "gradient_clip_2d",
     "buffer_fill",
     "reduce_sum",
     "gradient_clip_with_norm",
+    "transpose",
     # Forward
     "matmul",
     "embedding",
@@ -126,6 +134,7 @@ __all__ = [
     "extract_last_tokens",
     "cross_entropy_loss",
     "flash_attention",
+    "dropout",
     # Backward
     "matmul_backward_a",
     "matmul_backward_b",
@@ -134,6 +143,7 @@ __all__ = [
     "bias_backward",
     "embedding_backward",
     "flash_attention_backward",
+    "dropout_backward",
     # Ops
     "batch_begin",
     "batch_add",

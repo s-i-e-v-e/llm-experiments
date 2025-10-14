@@ -183,6 +183,8 @@ def kv_cache_update(
         workgroups_z=1,
     )
 
+    cache.current_len += 1
+
 
 # ============================================================================
 # ATTENTION WITH KV-CACHE
@@ -269,6 +271,7 @@ def attention_with_kv_cache(
             cache.current_len,  # Number of valid cached positions
             cache.n_heads,
             cache.head_dim,
+            cache.max_seq_len,
         ],
         dtype=np.uint32,
     )
